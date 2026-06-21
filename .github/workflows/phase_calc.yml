@@ -1,0 +1,40 @@
+name: phase_calc
+
+# 每小時整點觸發一次。一輪 phase_calc 跨多次 job 接續完成是預期行為，
+# 不是異常——瓶頸是 HF Dataset commit 速率限制（128次/小時），不是
+# GitHub Actions 本身。詳見 handoff_phase_calc_migration_v1.md。
+on:
+  schedule:
+    - cron: '0 * * * *'
+  # 允許手動觸發（除錯/驗證用，效果與排程觸發完全相同）
+  workflow_dispatch: {}
+
+jobs:
+  run-phase-calc:
+    runs-on: ubuntu-latest
+    # GitHub Actions 單次 job 硬上限 6 小時；run_phase_calc_gha.py 內部
+    # 在 5.5 小時主動收尾，這裡的 timeout-minutes 是雙重保險，
+    # 數值故意設得比腳本內部逾時略寬，避免兩個機制互搶收尾時機。
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run phase_calc
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # HF_REPO_ID 非密鑰，有預設值（zhujun0511-AI/ai-telegram-bot-dataset）。
+          # 如未來該值需要變更，改這裡一行即可，不需動 Secrets。
+          HF_REPO_ID: zhujun0511-AI/ai-telegram-bot-dataset
+        run: python run_phase_calc_gha.py
