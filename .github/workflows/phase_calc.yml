@@ -1,5 +1,4 @@
 name: phase_calc
-
 # 每小時整點觸發一次。一輪 phase_calc 跨多次 job 接續完成是預期行為，
 # 不是異常——瓶頸是 HF Dataset commit 速率限制（128次/小時），不是
 # GitHub Actions 本身。詳見 handoff_phase_calc_migration_v1.md。
@@ -8,7 +7,6 @@ on:
     - cron: '0 * * * *'
   # 允許手動觸發（除錯/驗證用，效果與排程觸發完全相同）
   workflow_dispatch: {}
-
 jobs:
   run-phase-calc:
     runs-on: ubuntu-latest
@@ -16,19 +14,15 @@ jobs:
     # 在 5.5 小時主動收尾，這裡的 timeout-minutes 是雙重保險，
     # 數值故意設得比腳本內部逾時略寬，避免兩個機制互搶收尾時機。
     timeout-minutes: 355
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run phase_calc
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
@@ -37,4 +31,13 @@ jobs:
           # HF_REPO_ID 非密鑰，有預設值（zhujun0511-AI/ai-telegram-bot-dataset）。
           # 如未來該值需要變更，改這裡一行即可，不需動 Secrets。
           HF_REPO_ID: zhujun0511-AI/ai-telegram-bot-dataset
+          # WEBHOOK_SECRET（v2.2 新增）：與 AC/DC/LC 的 WEBHOOK_SECRET 同一把鑰匙，
+          # 用於驗證 AC /comm/send 端點呼叫，不涉及真正的 Telegram Bot token。
+          # 刻意不給 default 值，未設定時 _send_telegram_alert() 會明確記錄
+          # 日誌並跳過推送，不會靜默用舊值頂著（見 phase_calculator.py 註解）。
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          # COMM_HUB_URL（v2.2 新增）：通訊推送目標完整端點 URL（含 /comm/send 路徑），
+          # 與 DC 現有 COMM_HUB_URL 命名一致。同樣刻意不給 default 值，
+          # 理由同上——一改全改，任何一處沒設定就該明確失敗。
+          COMM_HUB_URL: ${{ secrets.COMM_HUB_URL }}
         run: python run_phase_calc_gha.py
