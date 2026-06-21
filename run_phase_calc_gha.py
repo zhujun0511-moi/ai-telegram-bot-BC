@@ -1,5 +1,5 @@
 """
-run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.0
+run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.1
 
 職責：
   取代原 HF Space app.py 的 /webhook/phase-calc 端點 + 自激發機制。
@@ -12,6 +12,14 @@ run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.0
   - HTTP 自激發（_self_trigger_phase_calc）→ 本檔案內 while 迴圈
   - 5.5 小時主動逾時收尾（GitHub Actions job 上限 6 小時，留 30 分鐘緩衝）
 
+v1.1 修復（2026-06-21）：
+  搶鎖驗證邏輯改用唯一 token 比對，取代原本的時間戳差距比對。
+  根因：pymongo 讀回的 datetime 預設不帶時區資訊（且數值為 UTC），
+  與寫入時的 EST-aware datetime 比較會產生約 4-5 小時的時區誤判，
+  導致搶鎖實際成功卻被誤判為失敗，鎖留在 is_running=True 無人釋放，
+  阻塞後續所有排程觸發。已在生產 MongoDB 上實際發生過一次
+  （2026-06-21 03:55 UTC 手動觸發測試時發現）。
+
 不改動的部分：
   - run_phase_calc_batch() 內部邏輯完全沿用 tasks/phase_calculator.py，
     本檔案只負責「怎麼呼叫它、呼叫幾次、什麼時候停」
@@ -23,6 +31,7 @@ Python 3.9 兼容。
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta
 
 import pytz
@@ -52,7 +61,14 @@ def _acquire_lock(db: PhaseCalcDB) -> bool:
 
     搶鎖邏輯（原子操作，find_one_and_update）：
       條件：is_running 不存在，或為 False，或鎖已過期（stale）
-      動作：設 is_running=True，記錄 lock_acquired_at
+      動作：設 is_running=True，記錄 lock_acquired_at（人類可讀，僅供查閱）、
+            lock_token（本次運行的唯一識別碼，用於後續驗證）
+
+    v1.1 修復：原先用「比對 lock_acquired_at 時間戳差距」判斷是否搶鎖成功，
+    但 pymongo 讀回的 datetime 預設不帶時區資訊（且數值為 UTC），與寫入時的
+    EST-aware datetime 比較會產生約 4-5 小時的時區誤判，導致搶鎖實際成功
+    但被誤判為失敗（鎖留在 True 卻無人釋放）。
+    改為唯一 token 比對，不涉及任何時間運算，徹底避開時區陷阱。
 
     返回 True = 搶鎖成功，可以開始運算
     返回 False = 上一個 job 仍在合法運行中，本次直接退出
@@ -60,8 +76,9 @@ def _acquire_lock(db: PhaseCalcDB) -> bool:
     col = db.stock_db["Phase_Calc_Progress"]
     now = datetime.now(EST_TZ)
     stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
+    token = uuid.uuid4().hex
 
-    result = col.find_one_and_update(
+    col.find_one_and_update(
         {
             "run_id": db.RUN_ID,
             "$or": [
@@ -74,24 +91,17 @@ def _acquire_lock(db: PhaseCalcDB) -> bool:
             "$set": {
                 "is_running": True,
                 "lock_acquired_at": now,
+                "lock_token": token,
             }
         },
         upsert=True,
     )
-    # find_one_and_update 預設返回更新前的文檔；只要沒有拋例外，
-    # upsert/match 任一成立即代表搶鎖成功。
-    # 唯一搶鎖失敗的情況是條件完全不匹配（is_running=True 且鎖未過期），
-    # 此時 result 不會是 None（upsert 不會在 filter 不匹配但非 upsert 情境誤建），
-    # 因此改用「再讀一次確認 lock_acquired_at 是否為本次寫入的時間」來判斷。
+    # find_one_and_update 在條件不匹配時不會執行 $set，
+    # 重新讀取後比對 lock_token 是否為本次寫入的值，
+    # 是 = 搶鎖成功（無論原本是 upsert 新建還是更新既有文檔）；
+    # 否 = 條件不匹配，鎖被別人（或仍在合法運行中的舊狀態）持有，搶鎖失敗。
     doc = col.find_one({"run_id": db.RUN_ID})
-    acquired_at = doc.get("lock_acquired_at") if doc else None
-    if acquired_at is None:
-        return False
-    # 容忍時鐘/序列化誤差，比對是否確實是本次寫入（秒級精度足夠）
-    if isinstance(acquired_at, datetime):
-        acquired_at_est = acquired_at if acquired_at.tzinfo else EST_TZ.localize(acquired_at)
-        return abs((acquired_at_est - now).total_seconds()) < 5
-    return False
+    return bool(doc) and doc.get("lock_token") == token
 
 
 def _release_lock(db: PhaseCalcDB):
