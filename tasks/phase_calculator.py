@@ -1,8 +1,27 @@
 """
-tasks/phase_calculator.py — 相位計算引擎（v2.1 bug修復）
+tasks/phase_calculator.py — 相位計算引擎（v2.2 OpenRouter 模型修復）
+
+v2.2 改動（本次新增）：
+  問題4修復：OpenRouter 板塊分類模型 100% 失敗（404 No endpoints found）
+    根因：OPENROUTER_PRIMARY_MODEL / OPENROUTER_BACKUP_MODEL 寫死在代碼裡，
+          原值 meta-llama/llama-3.3-8b-instruct:free 與 google/gemma-3-4b-it:free
+          均已從 OpenRouter 免費路由下架（gemma 官方訊息明確：免費版已不可用）
+    修復：
+      - 改為 os.getenv("AI_MODEL_SECTOR_PRIMARY", "openrouter/free") 讀取
+      - 改為 os.getenv("AI_MODEL_SECTOR_BACKUP", "meta-llama/llama-3.3-70b:free") 讀取
+      - 符合 DANGER_ZONES 規則：禁止固化在代碼裡，必須走 os.getenv() 帶 default
+      - 主模型改用 openrouter/free（OpenRouter 官方免費 router，自動避開失效模型）
+
+  新增：連續失敗 Telegram 提醒機制
+    - Phase_Calc_Progress 文檔新增 sector_fail_streak 欄位
+    - 連續 5 個 batch（主備模型皆失敗）→ 推送一次 Telegram 提醒，計數歸零
+    - 任一次成功 → 計數歸零
+    - 走 AC 的 /comm/send 轉發（與 DC 現有通訊路徑一致，core/comm_proxy.py 同款模式）
+    - 不持有 TELE_TOKEN，只需要 WEBHOOK_SECRET（GitHub Secrets 新增此項即可）
+    - WEBHOOK_SECRET 未設定或 AC 無回應時靜默跳過，不報錯、不阻塞主流程
 
 
-v2.1 改動：
+v2.1 改動（保留）：
   問題2修復：Phase_History 寫入改為 upsert
     - save_phase_events 從 insert_many 改為逐條 update_one($set, upsert=True)
     - Round 2 的 spy_phase/sector_phase 欄位現在能正確覆蓋 Round 1 已有記錄
@@ -33,9 +52,9 @@ v2.0 改動（保留）：
 
   OpenRouter 板塊查詢（僅 Round 2 起，僅 List3 之外的 ticker）：
     - 每批 phase_calc 結束後，打包本批未知 ticker 送 OpenRouter
-    - 主模型：meta-llama/llama-3.3-8b-instruct:free
-    - 備份模型：google/gemma-3-4b-it:free
-    - 兩個都失敗 → 靜默跳過，本輪 sector=None，下輪重試
+    - 主模型：env var AI_MODEL_SECTOR_PRIMARY（預設 openrouter/free）
+    - 備份模型：env var AI_MODEL_SECTOR_BACKUP（預設 meta-llama/llama-3.3-70b:free）
+    - 兩個都失敗 → 靜默跳過，本輪 sector=None，下輪重試（連續 5 batch 失敗額外觸發提醒）
     - 結果衝突（第二次查詢與第一次不同）→ 存入 Ticker_Sector_Conflicts，不覆蓋
 
 
@@ -44,23 +63,7 @@ v1.2 改動（保留）：
 
 
 Python 3.9 兼容，不用 str | None。
-
-─────────────────────────────────────────────
-遷移備註（openclaw-batch-center / ai-telegram-bot-BC，2026-06-21）
-─────────────────────────────────────────────
-本檔案從學習中心（LC）HF Space 完整複製而來，運算邏輯一字未動。
-原本由 LC app.py 的 /webhook/phase-calc 端點 + 自激發機制驅動，
-現改由本 repo 的 run_phase_calc_gha.py（GitHub Actions 入口）驅動：
-  - run_phase_calc_batch() 簽名與行為完全不變，外部呼叫方式不變
-  - PhaseCalcDB 讀寫的 MongoDB collection（Phase_History、
-    Phase_Calc_Progress、Ticker_Sector_Map、Ticker_Sector_Conflicts）
-    與 LC 共用同一個 MongoDB Atlas（StockData），確保資料連續性
-  - LC 端僅保留精簡版 PhaseCalcDB（tasks/phase_calc_db.py，唯讀查詢
-    用途，供 /status 端點顯示進度），不再保留本檔案的運算邏輯，
-    避免兩個 repo 各自維護一份重複大文件
 """
-
-
 
 
 import os
@@ -77,13 +80,9 @@ import time
 import pandas as pd
 
 
-
-
 # ─────────────────────────────────────────────
 # 常數
 # ─────────────────────────────────────────────
-
-
 
 
 HF_REPO_ID    = os.getenv("HF_REPO_ID", "zhujun0511-AI/ai-telegram-bot-dataset")
@@ -124,19 +123,16 @@ MAX_ROUND = 20
 SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLB", "XLU", "XLRE", "XLC"]
 
 
-# OpenRouter 模型（主 + 備）
-OPENROUTER_PRIMARY_MODEL = "meta-llama/llama-3.3-8b-instruct:free"
-OPENROUTER_BACKUP_MODEL  = "google/gemma-3-4b-it:free"
-OPENROUTER_API_BASE      = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1/chat/completions"
 
 
+# 連續失敗多少個 batch 觸發一次 Telegram 提醒
+SECTOR_FAIL_ALERT_THRESHOLD = 5
 
 
 # ─────────────────────────────────────────────
 # 環境變量動態讀取
 # ─────────────────────────────────────────────
-
-
 
 
 def _get_hf_token() -> str:
@@ -151,6 +147,47 @@ def _get_openrouter_key() -> str:
     return os.getenv("OPENROUTER_API_KEY", "")
 
 
+def _get_sector_primary_model() -> str:
+    """
+    板塊分類主模型（v2.2 新增，修復寫死問題）。
+    預設 openrouter/free：OpenRouter 官方免費 router，自動從目前存活的
+    免費模型中選擇，並篩選支援結構化輸出的模型，避開單一模型 404 失效問題。
+    """
+    return os.getenv("AI_MODEL_SECTOR_PRIMARY", "openrouter/free").strip()
+
+
+def _get_sector_backup_model() -> str:
+    """
+    板塊分類備用模型（v2.2 新增）。
+    預設 meta-llama/llama-3.3-70b:free（與舊版 8b 不同，8b 免費路由已確認失效）。
+    """
+    return os.getenv("AI_MODEL_SECTOR_BACKUP", "meta-llama/llama-3.3-70b:free").strip()
+
+
+def _get_comm_hub_url() -> str:
+    """
+    通訊推送目標 URL（v2.2 改用，命名與 DC 現有 COMM_HUB_URL 一致）。
+    不直接持有 TELE_TOKEN，走 AC 的 /comm/send 轉發，
+    與 DC 現有的通訊路徑同款命名（core/comm_proxy.py 同款模式）。
+    刻意不取名 AC_URL：該名稱在系統裡已用於 CW 轉發
+    /telegram/incoming 的反方向用途，沿用會製造第三種混淆來源。
+
+    刻意不給 default 值：若給 default，未來 AC 端點搬遷時容易漏改
+    GHA 這一處（不改也不會報錯，系統照常運行，問題會被掩蓋）。
+    與系統其他四處（DC/AC/CW/未來新成員）保持「同一份值，一改全改」
+    的原則一致，任何一處沒設定就應該明確失敗，而不是默默用舊值頂著。
+    """
+    return os.getenv("COMM_HUB_URL", "").strip()
+
+
+def _get_gha_webhook_secret() -> str:
+    """
+    GitHub Actions 專用 WEBHOOK_SECRET（與 AC/DC/LC 的 WEBHOOK_SECRET 同一把鑰匙）。
+    僅用於驗證 /comm/send 呼叫，不涉及真正的 Telegram Bot token。
+    """
+    return os.getenv("WEBHOOK_SECRET", "").strip()
+
+
 def _hf_headers() -> dict:
     return {
         "Authorization": f"Bearer {_get_hf_token()}",
@@ -158,13 +195,55 @@ def _hf_headers() -> dict:
     }
 
 
+# ─────────────────────────────────────────────
+# Telegram 提醒（v2.2 新增，連續失敗用）
+# 走 AC 的 /comm/send，沿用系統現有唯一 Telegram 出口（core/comm_proxy.py 同款模式）
+# 不持有 TELE_TOKEN，只需要 WEBHOOK_SECRET
+# ─────────────────────────────────────────────
+
+
+def _send_telegram_alert(text: str) -> bool:
+    """
+    推送 Telegram 提醒，走 AC /comm/send 轉發（與 DC 現有路徑一致）。
+    WEBHOOK_SECRET 未設定或 AC 無回應時靜默跳過（不報錯，不阻塞主流程），
+    僅記錄日誌，下次連續失敗達閾值時會再次嘗試。
+    """
+    secret = _get_gha_webhook_secret()
+    url    = _get_comm_hub_url()
+
+    if not secret:
+        print(f"⚠️ WEBHOOK_SECRET 未設定，提醒僅記錄日誌：{text}")
+        return False
+
+    if not url:
+        print(f"⚠️ COMM_HUB_URL 未設定，提醒僅記錄日誌：{text}")
+        return False
+
+    payload = {"content": text, "report_type": "brief"}
+    headers = {
+        "x-webhook-secret": secret,
+        "Content-Type":     "application/json",
+    }
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                print(f"✅ Telegram 提醒已送出（經 AC /comm/send）")
+                return True
+            print(f"⚠️ Telegram 提醒送出失敗（第 {attempt+1} 次）: "
+                  f"{resp.status_code} {resp.text[:150]}")
+        except Exception as e:
+            print(f"⚠️ Telegram 提醒異常（第 {attempt+1} 次）: {e}")
+        time.sleep(2)
+
+    print(f"❌ Telegram 提醒已達最大重試次數，放棄本次推送")
+    return False
 
 
 # ─────────────────────────────────────────────
 # List3 解析（複製自 cfet_backtest，禁止 import）
 # ─────────────────────────────────────────────
-
-
 
 
 def _parse_list3_line(line: str) -> Tuple[Optional[str], List[str], str]:
@@ -189,13 +268,9 @@ def _parse_list3_line(line: str) -> Tuple[Optional[str], List[str], str]:
     return sector, tickers, tier
 
 
-
-
 # ─────────────────────────────────────────────
 # OpenRouter 板塊查詢
 # ─────────────────────────────────────────────
-
-
 
 
 def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optional[str]]]:
@@ -208,10 +283,8 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
         print("⚠️ OPENROUTER_API_KEY 未設定，跳過板塊查詢")
         return None
 
-
     ticker_list_str = ", ".join(tickers)
     etf_list_str    = ", ".join(SECTOR_ETFS)
-
 
     prompt = (
         f"Given these US stock tickers: {ticker_list_str}\n"
@@ -223,7 +296,6 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
         f"No explanation, no markdown, just the JSON object."
     )
 
-
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -231,7 +303,7 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
         "temperature": 0,
     }
 
-
+    content = ""
     try:
         resp = requests.post(
             OPENROUTER_API_BASE,
@@ -246,12 +318,10 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
             print(f"⚠️ OpenRouter [{model}] 失敗: {resp.status_code} {resp.text[:100]}")
             return None
 
-
         content = resp.json()["choices"][0]["message"]["content"].strip()
         # 去掉可能的 markdown fences
         content = re.sub(r"```[a-z]*", "", content).strip().strip("`")
         result  = json.loads(content)
-
 
         # 驗證：只接受 SECTOR_ETFS 或 null
         validated = {}
@@ -264,7 +334,6 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
                 validated[t_upper] = None
         return validated
 
-
     except json.JSONDecodeError as e:
         print(f"⚠️ OpenRouter [{model}] JSON 解析失敗: {e} | 原文: {content[:100]}")
         return None
@@ -273,42 +342,38 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
         return None
 
 
-
-
 def _query_sector_via_openrouter(tickers: List[str]) -> Dict[str, Optional[str]]:
     """
     主備模型查詢，兩個都失敗返回空字典（所有 ticker sector=None）。
+    模型來源（v2.2）：env var，不再寫死。
     """
     if not tickers:
         return {}
 
+    primary_model = _get_sector_primary_model()
+    backup_model  = _get_sector_backup_model()
 
     # 主模型
-    result = _call_openrouter(tickers, OPENROUTER_PRIMARY_MODEL)
+    result = _call_openrouter(tickers, primary_model)
     if result is not None:
-        print(f"  ✅ OpenRouter 主模型查詢成功：{len(result)} 個 ticker")
+        print(f"  ✅ OpenRouter 主模型 [{primary_model}] 查詢成功：{len(result)} 個 ticker")
         return result
-
 
     # 備份模型
-    print(f"  🔄 主模型失敗，切換備份模型...")
-    result = _call_openrouter(tickers, OPENROUTER_BACKUP_MODEL)
+    print(f"  🔄 主模型 [{primary_model}] 失敗，切換備份模型 [{backup_model}]...")
+    result = _call_openrouter(tickers, backup_model)
     if result is not None:
-        print(f"  ✅ OpenRouter 備份模型查詢成功：{len(result)} 個 ticker")
+        print(f"  ✅ OpenRouter 備份模型 [{backup_model}] 查詢成功：{len(result)} 個 ticker")
         return result
 
-
-    print(f"  ❌ OpenRouter 主備模型均失敗，本批 {len(tickers)} 個 ticker sector=None")
+    print(f"  ❌ OpenRouter 主備模型均失敗 [{primary_model}/{backup_model}]，"
+          f"本批 {len(tickers)} 個 ticker sector=None")
     return {}
-
-
 
 
 # ─────────────────────────────────────────────
 # HF Dataset 讀寫工具
 # ─────────────────────────────────────────────
-
-
 
 
 def _hf_download_file(path: str) -> Optional[bytes]:
@@ -341,8 +406,6 @@ def _hf_download_file(path: str) -> Optional[bytes]:
     return None
 
 
-
-
 def _hf_batch_commit(files: List[dict], commit_message: str = "phase_calc batch") -> bool:
     """
     批量上傳多個 phase.csv（一次 commit，降低 rate limit 風險）。
@@ -361,10 +424,8 @@ def _hf_batch_commit(files: List[dict], commit_message: str = "phase_calc batch"
                 "encoding": "base64",
             })
 
-
         url     = f"{HF_API_BASE}/{HF_REPO_ID}/commit/main"
         payload = {"summary": commit_message, "files": file_payloads}
-
 
         for attempt in range(2):
             resp = requests.post(url, headers=_hf_headers(), json=payload, timeout=120)
@@ -377,16 +438,12 @@ def _hf_batch_commit(files: List[dict], commit_message: str = "phase_calc batch"
             print(f"❌ HF batch commit 失敗: {resp.status_code} {resp.text[:200]}")
             return False
 
-
         print(f"❌ HF batch commit：重試後仍失敗（rate limit），本批進度不推進")
         return False
-
 
     except Exception as e:
         print(f"❌ HF batch commit 異常: {e}")
         return False
-
-
 
 
 def _parse_next_url(link_header: str) -> Optional[str]:
@@ -401,8 +458,6 @@ def _parse_next_url(link_header: str) -> Optional[str]:
     return None
 
 
-
-
 def _hf_scan_all_tickers(prefix: str) -> dict:
     """
     v1.2：一次激活掃完 HF Dataset 目錄下所有 ticker（多頁翻頁）。
@@ -411,7 +466,6 @@ def _hf_scan_all_tickers(prefix: str) -> dict:
     total_items  = 0
     pages        = 0
     next_url     = f"{HF_API_BASE}/{HF_REPO_ID}/tree/main/{prefix}?recursive=false&expand=false"
-
 
     while next_url:
         try:
@@ -425,21 +479,17 @@ def _hf_scan_all_tickers(prefix: str) -> dict:
                     return {"tickers": all_tickers, "total_items": total_items,
                             "pages": pages, "error": True}
 
-
             if resp.status_code != 200:
                 print(f"⚠️ HF 目錄掃描失敗（第 {pages+1} 頁）: {resp.status_code}")
                 return {"tickers": all_tickers, "total_items": total_items,
                         "pages": pages, "error": True}
 
-
             items = resp.json()
             if not isinstance(items, list):
                 break
 
-
             pages       += 1
             total_items += len(items)
-
 
             dirs = [
                 item["path"].split("/")[-1]
@@ -449,19 +499,15 @@ def _hf_scan_all_tickers(prefix: str) -> dict:
             ]
             all_tickers.extend(dirs)
 
-
             print(f"  📄 第 {pages} 頁：{len(items)} items，{len(dirs)} 個 ticker，"
                   f"累計 {len(all_tickers)} 個")
 
-
             next_url = _parse_next_url(resp.headers.get("Link", ""))
-
 
         except Exception as e:
             print(f"❌ HF 目錄掃描異常（第 {pages+1} 頁）: {e}")
             return {"tickers": all_tickers, "total_items": total_items,
                     "pages": pages, "error": True}
-
 
     return {
         "tickers":     all_tickers,
@@ -471,13 +517,9 @@ def _hf_scan_all_tickers(prefix: str) -> dict:
     }
 
 
-
-
 # ─────────────────────────────────────────────
 # 數據加載
 # ─────────────────────────────────────────────
-
-
 
 
 def load_bars(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
@@ -490,22 +532,18 @@ def load_bars(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
     if not tf_key:
         return None
 
-
     path = f"{HF_TICKER_DIR}/{ticker}/{tf_key}.csv"
     raw  = _hf_download_file(path)
     if raw is None:
         return None
 
-
     try:
         df = pd.read_csv(io.BytesIO(raw))
         df.columns = [c.lower() for c in df.columns]
 
-
         required = {"date", "open", "high", "low", "close", "volume"}
         if not required.issubset(set(df.columns)):
             return None
-
 
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"])
@@ -514,20 +552,15 @@ def load_bars(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
         df = df.dropna(subset=["open", "high", "low", "close"])
         df = df.sort_values("date").reset_index(drop=True)
 
-
         min_bars = MA_PERIODS[timeframe] + SLOPE_LOOKBACK[timeframe] + 10
         if len(df) < min_bars:
             return None
 
-
         return df
-
 
     except Exception as e:
         print(f"❌ 解析 {path} 失敗: {e}")
         return None
-
-
 
 
 def load_phase_csv(ticker: str) -> Optional[pd.DataFrame]:
@@ -541,7 +574,6 @@ def load_phase_csv(ticker: str) -> Optional[pd.DataFrame]:
     if raw is None:
         return None
 
-
     try:
         df = pd.read_csv(io.BytesIO(raw))
         df.columns = [c.lower() for c in df.columns]
@@ -554,8 +586,6 @@ def load_phase_csv(ticker: str) -> Optional[pd.DataFrame]:
     except Exception as e:
         print(f"❌ 解析 phase.csv {ticker} 失敗: {e}")
         return None
-
-
 
 
 def get_phase_at_date(phase_df: pd.DataFrame, date_str: str, timeframe: str) -> str:
@@ -575,14 +605,10 @@ def get_phase_at_date(phase_df: pd.DataFrame, date_str: str, timeframe: str) -> 
     return str(sub.iloc[-1]["new_phase"])
 
 
-
-
 # ─────────────────────────────────────────────
 # 分形計算（複製自 CFET 定義，5根K線）
 # 禁止 import cfet_backtest（兩個中心獨立部署）
 # ─────────────────────────────────────────────
-
-
 
 
 def _calc_top_fractals(df: pd.DataFrame) -> pd.Series:
@@ -596,8 +622,6 @@ def _calc_top_fractals(df: pd.DataFrame) -> pd.Series:
     return pd.Series(result, index=df.index)
 
 
-
-
 def _calc_bot_fractals(df: pd.DataFrame) -> pd.Series:
     lows   = df["low"].values
     n      = len(lows)
@@ -609,13 +633,9 @@ def _calc_bot_fractals(df: pd.DataFrame) -> pd.Series:
     return pd.Series(result, index=df.index)
 
 
-
-
 # ─────────────────────────────────────────────
 # 相位判斷四要素
 # ─────────────────────────────────────────────
-
-
 
 
 def _calc_slope(ma_values: list, idx: int, lookback: int) -> str:
@@ -633,8 +653,6 @@ def _calc_slope(ma_values: list, idx: int, lookback: int) -> str:
     return "flat"
 
 
-
-
 def _calc_slope_value(ma_values: list, idx: int, lookback: int) -> float:
     if idx < lookback:
         return 0.0
@@ -645,35 +663,27 @@ def _calc_slope_value(ma_values: list, idx: int, lookback: int) -> float:
     return round((curr - prev) / prev, 6)
 
 
-
-
 def _calc_structure(top_fractals_idx: List[int], bot_fractals_idx: List[int],
                     df: pd.DataFrame, up_to_idx: int) -> str:
     tops = [i for i in top_fractals_idx if i <= up_to_idx]
     bots = [i for i in bot_fractals_idx if i <= up_to_idx]
 
-
     if len(tops) < 2 or len(bots) < 2:
         return "mixed"
 
-
     top1, top2 = tops[-1], tops[-2]
     bot1, bot2 = bots[-1], bots[-2]
-
 
     hh = df["high"].iloc[top1] > df["high"].iloc[top2]
     hl = df["low"].iloc[bot1]  > df["low"].iloc[bot2]
     lh = df["high"].iloc[top1] < df["high"].iloc[top2]
     ll = df["low"].iloc[bot1]  < df["low"].iloc[bot2]
 
-
     if hh and hl:
         return "HH_HL"
     if lh and ll:
         return "LH_LL"
     return "mixed"
-
-
 
 
 def _calc_last_fractal(top_fractals_idx: List[int], bot_fractals_idx: List[int],
@@ -687,8 +697,6 @@ def _calc_last_fractal(top_fractals_idx: List[int], bot_fractals_idx: List[int],
     return "bottom"
 
 
-
-
 def _determine_phase(slope: str, price_vs_ma: str, structure: str, last_fractal: str) -> str:
     if (last_fractal == "bottom"
             and structure == "mixed"
@@ -696,12 +704,10 @@ def _determine_phase(slope: str, price_vs_ma: str, structure: str, last_fractal:
             and slope in ("flat", "rising")):
         return "A1"
 
-
     if (structure == "HH_HL"
             and slope == "rising"
             and price_vs_ma == "above"):
         return "A2"
-
 
     if (last_fractal == "top"
             and structure == "HH_HL"
@@ -709,19 +715,16 @@ def _determine_phase(slope: str, price_vs_ma: str, structure: str, last_fractal:
             and price_vs_ma == "above"):
         return "A3"
 
-
     if (last_fractal == "top"
             and structure == "mixed"
             and price_vs_ma == "below"
             and slope in ("flat", "falling")):
         return "B1"
 
-
     if (structure == "LH_LL"
             and slope == "falling"
             and price_vs_ma == "below"):
         return "B2"
-
 
     if (last_fractal == "bottom"
             and structure == "LH_LL"
@@ -729,17 +732,12 @@ def _determine_phase(slope: str, price_vs_ma: str, structure: str, last_fractal:
             and price_vs_ma == "below"):
         return "B3"
 
-
     return "UNCLEAR"
-
-
 
 
 # ─────────────────────────────────────────────
 # 相位事件計算（單時間框架）
 # ─────────────────────────────────────────────
-
-
 
 
 def calc_phase_events(df: pd.DataFrame, timeframe: str) -> List[dict]:
@@ -749,42 +747,33 @@ def calc_phase_events(df: pd.DataFrame, timeframe: str) -> List[dict]:
     ma_period = MA_PERIODS[timeframe]
     slope_lb  = SLOPE_LOOKBACK[timeframe]
 
-
     df = df.copy()
     df["ma"] = df["close"].rolling(ma_period).mean()
-
 
     df["top_frac"] = _calc_top_fractals(df)
     df["bot_frac"] = _calc_bot_fractals(df)
 
-
     top_pos = [df.index.get_loc(i) for i in df.index[df["top_frac"]].tolist()]
     bot_pos = [df.index.get_loc(i) for i in df.index[df["bot_frac"]].tolist()]
-
 
     ma_values = df["ma"].values.tolist()
     closes    = df["close"].values.tolist()
     dates     = df["date"].tolist()
 
-
     events        = []
     current_phase = None
     start_pos     = ma_period + slope_lb + 5
 
-
     for pos in range(start_pos, len(df) - 2):
         if pd.isna(ma_values[pos]):
             continue
-
 
         slope        = _calc_slope(ma_values, pos, slope_lb)
         price_vs_ma  = "above" if closes[pos] > ma_values[pos] else "below"
         structure    = _calc_structure(top_pos, bot_pos, df, pos)
         last_fractal = _calc_last_fractal(top_pos, bot_pos, pos)
 
-
         new_phase = _determine_phase(slope, price_vs_ma, structure, last_fractal)
-
 
         if new_phase != "UNCLEAR" and new_phase != current_phase:
             date_str = dates[pos].strftime("%Y-%m-%d") if hasattr(dates[pos], "strftime") else str(dates[pos])[:10]
@@ -804,17 +793,12 @@ def calc_phase_events(df: pd.DataFrame, timeframe: str) -> List[dict]:
             })
             current_phase = new_phase
 
-
     return events
-
-
 
 
 # ─────────────────────────────────────────────
 # 三層快照補充（ticker 自身）
 # ─────────────────────────────────────────────
-
-
 
 
 def _get_phase_at_date(events: List[dict], date_str: str) -> str:
@@ -828,8 +812,6 @@ def _get_phase_at_date(events: List[dict], date_str: str) -> str:
     return phase
 
 
-
-
 def enrich_with_context(all_events: List[dict],
                         events_m: List[dict],
                         events_w: List[dict],
@@ -841,7 +823,6 @@ def enrich_with_context(all_events: List[dict],
         phase_w  = _get_phase_at_date(events_w, date_str)
         phase_d  = _get_phase_at_date(events_d, date_str)
 
-
         ev_copy = dict(ev)
         ev_copy["phase_M"] = phase_m
         ev_copy["phase_W"] = phase_w
@@ -851,13 +832,9 @@ def enrich_with_context(all_events: List[dict],
     return enriched
 
 
-
-
 # ─────────────────────────────────────────────
 # Round 2 環境附加
 # ─────────────────────────────────────────────
-
-
 
 
 def enrich_with_environment(
@@ -879,7 +856,6 @@ def enrich_with_environment(
         ev_copy  = dict(ev)
         ev_copy["round"] = current_round
 
-
         # SPY 相位
         if spy_phase_df is not None:
             ev_copy["spy_phase_M"] = get_phase_at_date(spy_phase_df, date_str, "M")
@@ -889,7 +865,6 @@ def enrich_with_environment(
             ev_copy["spy_phase_M"] = None
             ev_copy["spy_phase_W"] = None
             ev_copy["spy_phase_D"] = None
-
 
         # 板塊相位
         ev_copy["sector_etf"] = sector_etf
@@ -902,17 +877,13 @@ def enrich_with_environment(
             ev_copy["sector_phase_W"] = None
             ev_copy["sector_phase_D"] = None
 
-
         result.append(ev_copy)
     return result
-
-
 
 
 # ─────────────────────────────────────────────
 # 存儲：HF phase.csv
 # ─────────────────────────────────────────────
-
 
 # Round 1 基礎欄位
 _PHASE_CSV_COLS_R1 = [
@@ -922,15 +893,12 @@ _PHASE_CSV_COLS_R1 = [
     "ma_value", "close",
 ]
 
-
 # Round 2 起新增欄位
 _PHASE_CSV_COLS_R2 = _PHASE_CSV_COLS_R1 + [
     "round",
     "spy_phase_M", "spy_phase_W", "spy_phase_D",
     "sector_etf", "sector_phase_M", "sector_phase_W", "sector_phase_D",
 ]
-
-
 
 
 def _events_to_df(events: List[dict], current_round: int) -> pd.DataFrame:
@@ -968,8 +936,6 @@ def _events_to_df(events: List[dict], current_round: int) -> pd.DataFrame:
     return df
 
 
-
-
 def _build_phase_file(ticker: str, events: List[dict], current_round: int) -> Optional[dict]:
     if not events:
         return None
@@ -978,24 +944,18 @@ def _build_phase_file(ticker: str, events: List[dict], current_round: int) -> Op
     return {"path": path, "df": df}
 
 
-
-
 # ─────────────────────────────────────────────
 # 存儲：MongoDB Phase_History（僅 List ticker）
 # ─────────────────────────────────────────────
 
 
-
-
 class PhaseCalcDB:
     """
-    學習中心相位計算 DB 操作類 v2.1。
+    學習中心相位計算 DB 操作類 v2.2。
     管理：Phase_History、Phase_Calc_Progress、Ticker_Sector_Map、Configs 讀取。
     """
 
-
     RUN_ID = "phase_v1"
-
 
     def __init__(self):
         uri = _get_mongo_uri()
@@ -1005,12 +965,10 @@ class PhaseCalcDB:
         self.stock_db = self.client["StockData"]
         self._setup_indices()
 
-
         self._list_tickers  = set()   # List1~4 所有 ticker（寫 Phase_History 用）
         self._sector_map    = {}      # ticker → sector_etf（List3 已知映射）
         self._load_list_tickers()
         self._load_sector_map()
-
 
     def _setup_indices(self):
         try:
@@ -1040,7 +998,6 @@ class PhaseCalcDB:
         except Exception as e:
             print(f"⚠️ 索引建立失敗（可能已存在）: {e}")
 
-
     def _load_list_tickers(self):
         """加載 List1~4 全部 ticker（用於判斷是否寫 Phase_History）。"""
         cfg = self.stock_db["Configs"].find_one({"type": "ticker_lists"})
@@ -1048,14 +1005,11 @@ class PhaseCalcDB:
             print("⚠️ PhaseCalcDB: Configs 未找到，List ticker 集合為空")
             return
 
-
         lists = cfg.get("lists", {})
         seen  = set()
 
-
         def _add(t):
             seen.add(t.upper().strip())
-
 
         for t in lists.get("list_1", []):
             _add(t)
@@ -1071,10 +1025,8 @@ class PhaseCalcDB:
         for t in lists.get("list_4", []):
             _add(t)
 
-
         self._list_tickers = seen
         print(f"✅ PhaseCalcDB: List ticker 集合加載完成，共 {len(seen)} 個")
-
 
     def _load_sector_map(self):
         """
@@ -1086,7 +1038,6 @@ class PhaseCalcDB:
             print("⚠️ PhaseCalcDB: Configs 未找到，sector_map 為空")
             return
 
-
         sector_map = {}
         for line in cfg.get("lists", {}).get("list_3", []):
             sector, tickers, _ = _parse_list3_line(line)
@@ -1094,17 +1045,13 @@ class PhaseCalcDB:
                 for t in tickers:
                     sector_map[t.upper()] = sector.upper()
 
-
         self._sector_map = sector_map
         print(f"✅ PhaseCalcDB: List3 sector_map 加載完成，共 {len(sector_map)} 個映射")
-
 
     def is_list_ticker(self, ticker: str) -> bool:
         return ticker.upper() in self._list_tickers
 
-
     # ── 板塊映射查詢 ──
-
 
     def get_sector_etf(self, ticker: str) -> Optional[str]:
         """
@@ -1122,7 +1069,6 @@ class PhaseCalcDB:
             return doc.get("sector_etf")  # 可能是 None（上次查詢結果）
         return None
 
-
     def save_sector_mapping(self, ticker: str, sector_etf: Optional[str], source: str = "openrouter"):
         """
         保存 OpenRouter 查詢結果到 Ticker_Sector_Map。
@@ -1131,7 +1077,6 @@ class PhaseCalcDB:
         t   = ticker.upper()
         col = self.stock_db["Ticker_Sector_Map"]
         existing = col.find_one({"ticker": t})
-
 
         if existing is None:
             # 新記錄，直接寫入
@@ -1161,7 +1106,6 @@ class PhaseCalcDB:
                 print(f"  ⚠️ 板塊映射衝突 {t}: {existing_val} vs {sector_etf}，已記錄，保留原值")
             # 一致則靜默，不重複寫入
 
-
     def save_sector_mappings_batch(self, mappings: Dict[str, Optional[str]]):
         """批量保存 OpenRouter 查詢結果。"""
         for ticker, sector_etf in mappings.items():
@@ -1170,9 +1114,37 @@ class PhaseCalcDB:
             except Exception as e:
                 print(f"  ⚠️ 保存板塊映射失敗 {ticker}: {e}")
 
+    # ── 連續失敗計數（v2.2 新增）──
+
+    def get_sector_fail_streak(self) -> int:
+        """讀取目前連續失敗的 batch 數（存在 Phase_Calc_Progress 文檔內）。"""
+        doc = self.get_progress()
+        return doc.get("sector_fail_streak", 0)
+
+    def update_sector_fail_streak(self, success: bool) -> int:
+        """
+        更新連續失敗計數。
+        success=True  → 歸零
+        success=False → +1
+        返回更新後的計數值。
+        """
+        col = self.stock_db["Phase_Calc_Progress"]
+        if success:
+            new_streak = 0
+        else:
+            new_streak = self.get_sector_fail_streak() + 1
+
+        col.update_one(
+            {"run_id": self.RUN_ID},
+            {"$set": {
+                "sector_fail_streak": new_streak,
+                "sector_fail_last_updated": datetime.now(EST_TZ),
+            }},
+            upsert=True
+        )
+        return new_streak
 
     # ── Phase_History 寫入（v2.1：改為 upsert，支持 Round 2 覆蓋 Round 1 欄位）──
-
 
     def save_phase_events(self, ticker: str, events: List[dict]):
         if not events:
@@ -1204,7 +1176,6 @@ class PhaseCalcDB:
                 "created_at":     now,
             })
 
-
         if not docs:
             return
         # v2.1：改為逐條 upsert，確保 Round 2 的 spy_phase/sector_phase 能覆蓋 Round 1 已有記錄
@@ -1230,31 +1201,25 @@ class PhaseCalcDB:
         except Exception as e:
             print(f"  ❌ Phase_History 寫入 {ticker} 異常: {e}")
 
-
     # ── Phase_Calc_Progress 斷點續跑 ──
-
 
     def get_progress(self) -> dict:
         col = self.stock_db["Phase_Calc_Progress"]
         doc = col.find_one({"run_id": self.RUN_ID})
         return doc or {}
 
-
     def is_done(self) -> bool:
         """is_done = 真正停止（all_rounds_done）或舊版 done（兼容 Round 1）。"""
         doc = self.get_progress()
         return doc.get("status") in ("done", "all_rounds_done")
 
-
     def get_current_round(self) -> int:
         doc = self.get_progress()
         return doc.get("current_round", 1)
 
-
     def get_max_round(self) -> int:
         doc = self.get_progress()
         return doc.get("max_round", MAX_ROUND)
-
 
     def advance_round(self) -> str:
         """
@@ -1267,18 +1232,15 @@ class PhaseCalcDB:
         col = self.stock_db["Phase_Calc_Progress"]
         doc = self.get_progress()
 
-
         current_round = doc.get("current_round", 1)
         max_round     = doc.get("max_round", MAX_ROUND)
         history       = doc.get("round_history", [])
-
 
         history.append({
             "round":        current_round,
             "completed_at": datetime.now(EST_TZ).isoformat(),
             "total":        doc.get("total_tickers", 0),
         })
-
 
         next_round = current_round + 1
         if next_round > max_round:
@@ -1309,11 +1271,9 @@ class PhaseCalcDB:
             print(f"🔄 第 {current_round} 輪完成，進入第 {next_round} 輪")
             return "NEXT_ROUND"
 
-
     def is_all_rounds_done(self) -> bool:
         doc = self.get_progress()
         return doc.get("status") == "all_rounds_done"
-
 
     def mark_done(self):
         """保留兼容（不再主動呼叫，由 advance_round 控制終止）。"""
@@ -1324,17 +1284,14 @@ class PhaseCalcDB:
             upsert=True
         )
 
-
     def reset_progress(self):
         col = self.stock_db["Phase_Calc_Progress"]
         col.delete_one({"run_id": self.RUN_ID})
         print(f"🔄 Phase_Calc_Progress 已重置")
 
-
     def get_scan_status(self) -> str:
         doc = self.get_progress()
         return doc.get("scan_status", "scanning")
-
 
     def save_scanned_tickers(self, tickers: List[str]):
         """v1.2：掃描完成後一次性存入全部 ticker，切換到計算階段。"""
@@ -1355,7 +1312,6 @@ class PhaseCalcDB:
         )
         print(f"✅ 目錄掃描完成，共 {len(tickers)} 個 ticker，切換到計算階段")
 
-
     def reset_scan(self):
         col = self.stock_db["Phase_Calc_Progress"]
         col.update_one(
@@ -1370,21 +1326,17 @@ class PhaseCalcDB:
         )
         print(f"🔄 掃描進度已重置（計算進度保留）")
 
-
     def get_cached_tickers(self) -> List[str]:
         doc = self.get_progress()
         return doc.get("all_tickers", [])
-
 
     def get_completed_tickers(self) -> set:
         doc = self.get_progress()
         return set(doc.get("completed_tickers", []))
 
-
     def get_total_tickers(self) -> int:
         doc = self.get_progress()
         return doc.get("total_tickers", 0)
-
 
     def update_progress(self, completed_tickers: set):
         col   = self.stock_db["Phase_Calc_Progress"]
@@ -1401,13 +1353,9 @@ class PhaseCalcDB:
         )
 
 
-
-
 # ─────────────────────────────────────────────
 # 單 ticker 計算邏輯
 # ─────────────────────────────────────────────
-
-
 
 
 def calc_phase_for_ticker(
@@ -1420,13 +1368,10 @@ def calc_phase_for_ticker(
     """
     計算單個 ticker 的全量歷史相位轉換事件。
 
-
     Round 1：計算 + enrich（ticker 自身三層）
     Round 2：額外附加 SPY 相位 + 板塊相位
 
-
     sector_phase_cache: {sector_etf: phase_df}，由批次外預先加載，避免重複下載。
-
 
     返回 enriched event list；None = 數據缺失跳過；[] = 無事件（正常）。
     """
@@ -1434,12 +1379,10 @@ def calc_phase_for_ticker(
     df_w = load_bars(ticker, "W")
     df_d = load_bars(ticker, "D")
 
-
     if df_m is None or df_w is None or df_d is None:
         missing = [tf for tf, df in [("M", df_m), ("W", df_w), ("D", df_d)] if df is None]
         print(f"  ⏭️  {ticker}: 數據缺失 {missing}，跳過")
         return None
-
 
     try:
         events_m = calc_phase_events(df_m, "M")
@@ -1449,16 +1392,13 @@ def calc_phase_for_ticker(
         print(f"  ❌ {ticker}: 計算相位事件異常: {e}")
         return None
 
-
     all_events = events_m + events_w + events_d
-
 
     if all_events:
         all_events_sorted = sorted(all_events, key=lambda x: (x["date"], x["timeframe"]))
         enriched = enrich_with_context(all_events_sorted, events_m, events_w, events_d)
     else:
         enriched = []
-
 
     # Round 2：附加環境相位
     if current_round >= 2 and enriched:
@@ -1472,16 +1412,12 @@ def calc_phase_for_ticker(
             current_round=current_round,
         )
 
-
     if enriched and db.is_list_ticker(ticker):
         db.save_phase_events(ticker, enriched)
-
 
     print(f"  ✅ {ticker}: M={len(events_m)} W={len(events_w)} D={len(events_d)} "
           f"共{len(enriched)}條 R{current_round}")
     return enriched
-
-
 
 
 # ─────────────────────────────────────────────
@@ -1489,22 +1425,17 @@ def calc_phase_for_ticker(
 # ─────────────────────────────────────────────
 
 
-
-
 def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
     """
-    批次執行相位計算（v2.1 多輪 + Round 2 連動）。
-
+    批次執行相位計算（v2.2 多輪 + Round 2 連動 + OpenRouter 模型修復）。
 
     ── 階段一：SCANNING ──
     v1.2：一次激活掃完全部頁（cursor 翻頁）。
-
 
     ── 階段二：CALCULATING ──
     讀取 MongoDB ticker 列表，每批 PHASE_CALC_BATCH_SIZE 個。
     Round 2 起：附加 SPY + 板塊相位。
     批次結束後：對未知板塊 ticker 打包 OpenRouter 查詢，結果存 MongoDB。
-
 
     返回狀態：
       ALREADY_DONE  — 所有輪次已完成（ALL_ROUNDS_DONE）
@@ -1518,10 +1449,8 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
     if db.is_done():
         return {"status": "ALREADY_DONE"}
 
-
     scan_status   = db.get_scan_status()
     current_round = db.get_current_round()
-
 
     # ═══════════════════════════════
     # 階段一：SCANNING
@@ -1529,29 +1458,23 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
     if scan_status == "scanning":
         print(f"📂 目錄掃描開始（v1.2 cursor 翻頁模式）...")
 
-
         result = _hf_scan_all_tickers(HF_TICKER_DIR)
-
 
         if result["error"] and len(result["tickers"]) == 0:
             print(f"⚠️ 掃描失敗且無數據，下次重試")
             return {"status": "SCAN_ERROR"}
 
-
         tickers = result["tickers"]
         print(f"✅ 掃描完成：{result['pages']} 頁，{result['total_items']} items，"
               f"{len(tickers)} 個有效 ticker")
-
 
         if len(tickers) == 0:
             print("❌ 掃描完成但 ticker 列表為空")
             return {"status": "SCAN_ERROR"}
 
-
         db.save_scanned_tickers(tickers)
         scan_status = "calculating"
         # fall through 到計算階段
-
 
     # ═══════════════════════════════
     # 階段二：CALCULATING
@@ -1559,15 +1482,12 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
     completed   = db.get_completed_tickers()
     all_tickers = db.get_cached_tickers()
 
-
     if not all_tickers:
         print("⚠️ ticker 列表為空（掃描狀態異常），重置掃描")
         db.reset_scan()
         return {"status": "SCAN_ERROR"}
 
-
     remaining = [t for t in all_tickers if t not in completed]
-
 
     # ── 當前輪完成 ──
     if not remaining:
@@ -1588,23 +1508,19 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
                 "completed_count": len(completed),
             }
 
-
     batch = remaining[:PHASE_CALC_BATCH_SIZE]
     print(f"🔄 R{current_round} 相位計算 | "
           f"已完成 {len(completed)}/{len(all_tickers)} | 本批: {len(batch)} 個")
 
-
     # ── Round 2：預加載 SPY + 板塊 ETF phase.csv ──
     spy_phase_df        = None
     sector_phase_cache  = {}   # {sector_etf: phase_df}
-
 
     if current_round >= 2:
         print(f"  📥 R2：加載 SPY phase.csv...")
         spy_phase_df = load_phase_csv("SPY")
         if spy_phase_df is None:
             print(f"  ⚠️ SPY phase.csv 不存在，SPY 相位將為 UNKNOWN")
-
 
         # 預查本批需要的板塊 ETF
         needed_sectors = set()
@@ -1613,25 +1529,21 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
             if sector:
                 needed_sectors.add(sector)
 
-
         for sector in needed_sectors:
             if sector not in sector_phase_cache:
                 print(f"  📥 加載 {sector} phase.csv...")
                 sector_phase_cache[sector] = load_phase_csv(sector)
 
-
     # ── 計算本批 ──
     hf_files               = []
-    batch_success          = []
-    unknown_sector_tickers = []   # 本批中 sector=None 且 MongoDB 無任何記錄的 ticker
-
+    batch_success           = []
+    unknown_sector_tickers  = []   # 本批中 sector=None 且 MongoDB 無任何記錄的 ticker
 
     for ticker in batch:
         try:
             enriched = calc_phase_for_ticker(
                 ticker, db, current_round, spy_phase_df, sector_phase_cache
             )
-
 
             # v2.1 修復：記錄 Round 2 中無板塊映射的 ticker（供後續 OpenRouter 查詢）
             # 條件：非 List3 已知映射 + MongoDB Ticker_Sector_Map 中完全無記錄
@@ -1645,7 +1557,6 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
                     if cached is None:
                         unknown_sector_tickers.append(ticker)
 
-
             if enriched is not None and len(enriched) > 0:
                 file_entry = _build_phase_file(ticker, enriched, current_round)
                 if file_entry:
@@ -1655,7 +1566,6 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
             print(f"  ❌ {ticker} 異常（跳過）: {e}")
             batch_success.append(ticker)
 
-
     # ── HF commit ──
     commit_ok = True
     if hf_files:
@@ -1664,7 +1574,6 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
             hf_files,
             commit_message=f"phase_calc R{current_round} batch {len(hf_files)} tickers"
         )
-
 
     if not commit_ok:
         print(f"⚠️ HF commit 失敗，本批進度不推進，下次重試（{len(batch)} 個 ticker）")
@@ -1676,24 +1585,40 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
             "total_tickers":   len(all_tickers),
         }
 
-
     # ── 推進進度 ──
     completed.update(batch_success)
     db.update_progress(completed)
 
-
     new_remaining = len(all_tickers) - len(completed)
     print(f"💾 R{current_round} 進度保存：已完成 {len(completed)}/{len(all_tickers)}，剩餘 {new_remaining}")
 
-
     # ── Round 2：OpenRouter 批量查詢未知板塊（批次結束後執行，不阻塞進度推進）──
+    # v2.2：加入連續失敗計數 + 達閾值 Telegram 提醒
     if current_round >= 2 and unknown_sector_tickers:
         print(f"  🔍 OpenRouter 查詢 {len(unknown_sector_tickers)} 個未知板塊 ticker...")
         mappings = _query_sector_via_openrouter(unknown_sector_tickers)
+
         if mappings:
             db.save_sector_mappings_batch(mappings)
             print(f"  💾 板塊映射已保存：{len(mappings)} 個")
+            db.update_sector_fail_streak(success=True)
+        else:
+            streak = db.update_sector_fail_streak(success=False)
+            print(f"  ⚠️ 本批 OpenRouter 板塊查詢完全失敗，連續失敗 batch 數：{streak}")
 
+            if streak >= SECTOR_FAIL_ALERT_THRESHOLD:
+                alert_text = (
+                    f"⚠️ OpenClaw phase_calc 板塊分類連續失敗\n"
+                    f"連續 {streak} 個 batch，OpenRouter 主備模型查詢均失敗\n"
+                    f"主模型: {_get_sector_primary_model()}\n"
+                    f"備用模型: {_get_sector_backup_model()}\n"
+                    f"輪次: R{current_round}\n"
+                    f"建議檢查 OPENROUTER_API_KEY 是否有效，"
+                    f"或 AI_MODEL_SECTOR_PRIMARY/AI_MODEL_SECTOR_BACKUP "
+                    f"是否需要更換為目前存活的免費模型"
+                )
+                _send_telegram_alert(alert_text)
+                db.update_sector_fail_streak(success=True)   # 提醒後歸零，避免重複轟炸
 
     return {
         "status":          "BATCH_DONE",
