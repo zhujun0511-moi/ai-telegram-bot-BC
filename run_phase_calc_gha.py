@@ -1,5 +1,5 @@
 """
-run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.1
+run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.2
 
 職責：
   取代原 HF Space app.py 的 /webhook/phase-calc 端點 + 自激發機制。
@@ -12,7 +12,22 @@ run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.1
   - HTTP 自激發（_self_trigger_phase_calc）→ 本檔案內 while 迴圈
   - 5.5 小時主動逾時收尾（GitHub Actions job 上限 6 小時，留 30 分鐘緩衝）
 
-v1.1 修復（2026-06-21）：
+v1.2 修復（2026-06-21 實測修復）：
+  搶鎖 find_one_and_update 出現 E11000 DuplicateKeyError（run_id_1 唯一索引）。
+  根因：upsert=True 搭配 $or 條件的 filter，在併發場景下是 MongoDB 已知陷阱——
+    1. Process A 搶鎖成功（filter 匹配，純更新，非 insert 路徑）
+    2. Process B 幾乎同時搶鎖，此時 Process A 已把 is_running 改成 True，
+       Process B 的 $or 條件全部不匹配
+    3. MongoDB 判定無文檔符合 filter，觸發 upsert 插入路徑，
+       但 run_id 唯一索引已有文檔存在（即 Process A 剛更新那筆，
+       只是內容不滿足 Process B 的 $or 條件），插入撞唯一索引 → DuplicateKeyError
+  觸發場景：手動 workflow_dispatch 觸發時間點與每小時 cron 排程接近，
+    或上一個 job 收尾（_release_lock）與下一個 job 搶鎖時序非常接近時。
+  修復：捕捉 DuplicateKeyError，retry 同一個 find_one_and_update 但
+    upsert=False——此時文檔確定已存在，純更新不會再觸發 insert 路徑，
+    不可能再次撞唯一索引。單次 retry 即足夠正確，不需要迴圈重試。
+
+v1.1 修復（保留，2026-06-21）：
   搶鎖驗證邏輯改用唯一 token 比對，取代原本的時間戳差距比對。
   根因：pymongo 讀回的 datetime 預設不帶時區資訊（且數值為 UTC），
   與寫入時的 EST-aware datetime 比較會產生約 4-5 小時的時區誤判，
@@ -35,6 +50,7 @@ import uuid
 from datetime import datetime, timedelta
 
 import pytz
+from pymongo.errors import DuplicateKeyError
 
 from tasks.phase_calculator import run_phase_calc_batch, PhaseCalcDB
 
@@ -55,6 +71,14 @@ def _now_est() -> str:
     return datetime.now(EST_TZ).strftime("%Y-%m-%d %H:%M:%S EST")
 
 
+def _try_lock_update(col, filter_query: dict, update_doc: dict, upsert: bool):
+    """
+    v1.2 新增：抽出單次 find_one_and_update 呼叫，供 _acquire_lock
+    在 upsert 路徑撞 DuplicateKeyError 時重試（upsert=False）。
+    """
+    return col.find_one_and_update(filter_query, update_doc, upsert=upsert)
+
+
 def _acquire_lock(db: PhaseCalcDB) -> bool:
     """
     嘗試搶佔 MongoDB 層級鎖。
@@ -63,6 +87,11 @@ def _acquire_lock(db: PhaseCalcDB) -> bool:
       條件：is_running 不存在，或為 False，或鎖已過期（stale）
       動作：設 is_running=True，記錄 lock_acquired_at（人類可讀，僅供查閱）、
             lock_token（本次運行的唯一識別碼，用於後續驗證）
+
+    v1.2 修復：upsert=True 搭配 $or 條件，併發時有機率撞 E11000
+    DuplicateKeyError（run_id 唯一索引）——詳見檔案頂部說明。
+    捕捉該例外後，retry 同一呼叫但 upsert=False，此時文檔確定已存在，
+    不會再觸發 insert 路徑，不可能再次撞唯一索引。
 
     v1.1 修復：原先用「比對 lock_acquired_at 時間戳差距」判斷是否搶鎖成功，
     但 pymongo 讀回的 datetime 預設不帶時區資訊（且數值為 UTC），與寫入時的
@@ -78,24 +107,31 @@ def _acquire_lock(db: PhaseCalcDB) -> bool:
     stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
     token = uuid.uuid4().hex
 
-    col.find_one_and_update(
-        {
-            "run_id": db.RUN_ID,
-            "$or": [
-                {"is_running": {"$exists": False}},
-                {"is_running": False},
-                {"lock_acquired_at": {"$lt": stale_before}},
-            ],
-        },
-        {
-            "$set": {
-                "is_running": True,
-                "lock_acquired_at": now,
-                "lock_token": token,
-            }
-        },
-        upsert=True,
-    )
+    filter_query = {
+        "run_id": db.RUN_ID,
+        "$or": [
+            {"is_running": {"$exists": False}},
+            {"is_running": False},
+            {"lock_acquired_at": {"$lt": stale_before}},
+        ],
+    }
+    update_doc = {
+        "$set": {
+            "is_running": True,
+            "lock_acquired_at": now,
+            "lock_token": token,
+        }
+    }
+
+    try:
+        _try_lock_update(col, filter_query, update_doc, upsert=True)
+    except DuplicateKeyError:
+        # 文檔已被另一個併發 process 建立（即使其內容不滿足 $or 條件），
+        # 確定存在，改用 upsert=False 重試一次即可，不會再次撞唯一索引。
+        print(f"[{_now_est()}] ⚠️ 搶鎖 upsert 撞 DuplicateKeyError（併發場景），"
+              f"以 upsert=False 重試一次")
+        _try_lock_update(col, filter_query, update_doc, upsert=False)
+
     # find_one_and_update 在條件不匹配時不會執行 $set，
     # 重新讀取後比對 lock_token 是否為本次寫入的值，
     # 是 = 搶鎖成功（無論原本是 upsert 新建還是更新既有文檔）；
