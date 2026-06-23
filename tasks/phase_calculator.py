@@ -1,15 +1,36 @@
 """
-tasks/phase_calculator.py — 相位計算引擎（v2.2 OpenRouter 模型修復）
+tasks/phase_calculator.py — 相位計算引擎（v2.3 OpenRouter 模型 MongoDB fallback）
 
-v2.2 改動（本次新增）：
+v2.3 改動（本次新增）：
+  問題5修復：env var 模型失效後無自動恢復機制
+    根因：
+      - openrouter/free 返回 200 但模型開始解釋推理，JSON 解析失敗
+      - meta-llama/llama-3.3-70b:free ID 錯誤（應為 llama-3.3-70b-instruct:free）
+    修復策略（三層降級）：
+      層一：env var（AI_MODEL_SECTOR_PRIMARY / AI_MODEL_SECTOR_BACKUP），無 default
+      層二：兩個都失敗 → 從 MongoDB CommData.Configs.free_models_registry 讀取
+            active_phase_primary / active_phase_backup（AC 測試通過的模型）
+      層三：MongoDB 也失敗或無設定 → 靜默放棄，本批 sector=None，下輪重試
+
+    新增 PhaseCalcDB.comm_db：連接 CommData（與 StockData 同一 MongoClient）
+    新增 PhaseCalcDB.fetch_mongo_models()：讀取 CommData.Configs 模型設定
+    _query_sector_via_openrouter() 加入 db 參數，主備失敗後觸發 MongoDB fallback
+
+  修復 _call_openrouter()：
+    - 加入 response_format: {"type": "json_object"} 強制 JSON 輸出
+    - 加強 prompt：明確要求只輸出 JSON，不允許任何說明文字
+    - 這樣可以解決 openrouter/free 隨機路由到不遵守 JSON-only 指令的模型問題
+
+
+v2.2 改動（保留）：
   問題4修復：OpenRouter 板塊分類模型 100% 失敗（404 No endpoints found）
     根因：OPENROUTER_PRIMARY_MODEL / OPENROUTER_BACKUP_MODEL 寫死在代碼裡，
           原值 meta-llama/llama-3.3-8b-instruct:free 與 google/gemma-3-4b-it:free
           均已從 OpenRouter 免費路由下架（gemma 官方訊息明確：免費版已不可用）
     修復：
-      - 改為 os.getenv("AI_MODEL_SECTOR_PRIMARY", "openrouter/free") 讀取
-      - 改為 os.getenv("AI_MODEL_SECTOR_BACKUP", "meta-llama/llama-3.3-70b:free") 讀取
-      - 符合 DANGER_ZONES 規則：禁止固化在代碼裡，必須走 os.getenv() 帶 default
+      - 改為 os.getenv("AI_MODEL_SECTOR_PRIMARY") 讀取（無 default，強制走 env var）
+      - 改為 os.getenv("AI_MODEL_SECTOR_BACKUP") 讀取（無 default，強制走 env var）
+      - 符合 DANGER_ZONES 規則：禁止固化在代碼裡
       - 主模型改用 openrouter/free（OpenRouter 官方免費 router，自動避開失效模型）
 
   新增：連續失敗 Telegram 提醒機制
@@ -52,9 +73,10 @@ v2.0 改動（保留）：
 
   OpenRouter 板塊查詢（僅 Round 2 起，僅 List3 之外的 ticker）：
     - 每批 phase_calc 結束後，打包本批未知 ticker 送 OpenRouter
-    - 主模型：env var AI_MODEL_SECTOR_PRIMARY（預設 openrouter/free）
-    - 備份模型：env var AI_MODEL_SECTOR_BACKUP（預設 meta-llama/llama-3.3-70b:free）
-    - 兩個都失敗 → 靜默跳過，本輪 sector=None，下輪重試（連續 5 batch 失敗額外觸發提醒）
+    - 主模型：env var AI_MODEL_SECTOR_PRIMARY（無 default，不設定即跳過層一）
+    - 備份模型：env var AI_MODEL_SECTOR_BACKUP（無 default，不設定即跳過層一）
+    - 兩個都失敗 → MongoDB fallback（CommData.Configs active_phase_primary/backup）
+    - 全部失敗 → 靜默跳過，本輪 sector=None，下輪重試（連續 5 batch 失敗額外觸發提醒）
     - 結果衝突（第二次查詢與第一次不同）→ 存入 Ticker_Sector_Conflicts，不覆蓋
 
 
@@ -149,19 +171,16 @@ def _get_openrouter_key() -> str:
 
 def _get_sector_primary_model() -> str:
     """
-    板塊分類主模型（v2.2 新增，修復寫死問題）。
-    預設 openrouter/free：OpenRouter 官方免費 router，自動從目前存活的
-    免費模型中選擇，並篩選支援結構化輸出的模型，避開單一模型 404 失效問題。
+    板塊分類主模型（v2.3：無 default，不設定則返回空字串，觸發 MongoDB fallback）。
     """
-    return os.getenv("AI_MODEL_SECTOR_PRIMARY", "openrouter/free").strip()
+    return os.getenv("AI_MODEL_SECTOR_PRIMARY", "").strip()
 
 
 def _get_sector_backup_model() -> str:
     """
-    板塊分類備用模型（v2.2 新增）。
-    預設 meta-llama/llama-3.3-70b:free（與舊版 8b 不同，8b 免費路由已確認失效）。
+    板塊分類備用模型（v2.3：無 default，不設定則返回空字串，觸發 MongoDB fallback）。
     """
-    return os.getenv("AI_MODEL_SECTOR_BACKUP", "meta-llama/llama-3.3-70b:free").strip()
+    return os.getenv("AI_MODEL_SECTOR_BACKUP", "").strip()
 
 
 def _get_comm_hub_url() -> str:
@@ -277,7 +296,15 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
     """
     呼叫 OpenRouter 查詢 ticker → 板塊 ETF 映射。
     返回 {ticker: sector_etf_or_null}，失敗返回 None。
+
+    v2.3 新增：
+      - response_format: {"type": "json_object"} 強制 JSON 輸出
+      - prompt 強化：明確禁止說明文字，避免 openrouter/free 隨機路由到
+        不遵守 JSON-only 指令的模型時造成解析失敗
     """
+    if not model:
+        return None
+
     key = _get_openrouter_key()
     if not key:
         print("⚠️ OPENROUTER_API_KEY 未設定，跳過板塊查詢")
@@ -287,13 +314,13 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
     etf_list_str    = ", ".join(SECTOR_ETFS)
 
     prompt = (
-        f"Given these US stock tickers: {ticker_list_str}\n"
-        f"For each ticker, determine which SPDR sector ETF it primarily belongs to.\n"
-        f"You MUST only choose from: {etf_list_str}\n"
-        f"If you are not sure, use null.\n"
-        f"Respond ONLY with a valid JSON object mapping each ticker to its sector ETF or null.\n"
-        f"Example: {{\"AAPL\": \"XLK\", \"XOM\": \"XLE\", \"UNKNWN\": null}}\n"
-        f"No explanation, no markdown, just the JSON object."
+        f"You are a stock sector classifier. Output ONLY a JSON object, nothing else.\n"
+        f"Map each US stock ticker to its primary SPDR sector ETF.\n"
+        f"Allowed ETF values: {etf_list_str}\n"
+        f"Use null if unsure.\n"
+        f"Tickers: {ticker_list_str}\n"
+        f"Output format: {{\"TICKER\": \"ETF_OR_NULL\", ...}}\n"
+        f"Example: {{\"AAPL\": \"XLK\", \"XOM\": \"XLE\", \"UNKNWN\": null}}"
     )
 
     payload = {
@@ -301,6 +328,7 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 300,
         "temperature": 0,
+        "response_format": {"type": "json_object"},
     }
 
     content = ""
@@ -319,7 +347,7 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
             return None
 
         content = resp.json()["choices"][0]["message"]["content"].strip()
-        # 去掉可能的 markdown fences
+        # 去掉可能殘留的 markdown fences
         content = re.sub(r"```[a-z]*", "", content).strip().strip("`")
         result  = json.loads(content)
 
@@ -342,10 +370,15 @@ def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optio
         return None
 
 
-def _query_sector_via_openrouter(tickers: List[str]) -> Dict[str, Optional[str]]:
+def _query_sector_via_openrouter(
+    tickers: List[str],
+    db: "PhaseCalcDB",
+) -> Dict[str, Optional[str]]:
     """
-    主備模型查詢，兩個都失敗返回空字典（所有 ticker sector=None）。
-    模型來源（v2.2）：env var，不再寫死。
+    三層降級查詢（v2.3）：
+      層一：env var（AI_MODEL_SECTOR_PRIMARY / AI_MODEL_SECTOR_BACKUP）
+      層二：兩個都失敗 → 從 MongoDB CommData.Configs 讀 active_phase_primary / active_phase_backup
+      層三：全部失敗 → 返回空字典，本批 ticker sector=None
     """
     if not tickers:
         return {}
@@ -353,20 +386,46 @@ def _query_sector_via_openrouter(tickers: List[str]) -> Dict[str, Optional[str]]
     primary_model = _get_sector_primary_model()
     backup_model  = _get_sector_backup_model()
 
-    # 主模型
-    result = _call_openrouter(tickers, primary_model)
-    if result is not None:
-        print(f"  ✅ OpenRouter 主模型 [{primary_model}] 查詢成功：{len(result)} 個 ticker")
-        return result
+    # ── 層一：env var 主模型 ──
+    if primary_model:
+        result = _call_openrouter(tickers, primary_model)
+        if result is not None:
+            print(f"  ✅ OpenRouter 主模型 [{primary_model}] 查詢成功：{len(result)} 個 ticker")
+            return result
+    else:
+        print(f"  ℹ️ AI_MODEL_SECTOR_PRIMARY 未設定，跳過層一主模型")
 
-    # 備份模型
-    print(f"  🔄 主模型 [{primary_model}] 失敗，切換備份模型 [{backup_model}]...")
-    result = _call_openrouter(tickers, backup_model)
-    if result is not None:
-        print(f"  ✅ OpenRouter 備份模型 [{backup_model}] 查詢成功：{len(result)} 個 ticker")
-        return result
+    # ── 層一：env var 備用模型 ──
+    if backup_model:
+        print(f"  🔄 主模型 [{primary_model or '未設定'}] 失敗，切換備用模型 [{backup_model}]...")
+        result = _call_openrouter(tickers, backup_model)
+        if result is not None:
+            print(f"  ✅ OpenRouter 備用模型 [{backup_model}] 查詢成功：{len(result)} 個 ticker")
+            return result
+    else:
+        print(f"  ℹ️ AI_MODEL_SECTOR_BACKUP 未設定，跳過層一備用模型")
 
-    print(f"  ❌ OpenRouter 主備模型均失敗 [{primary_model}/{backup_model}]，"
+    # ── 層二：MongoDB fallback ──
+    print(f"  🔄 env var 模型均失敗，嘗試從 MongoDB 讀取 AC 設定的模型...")
+    mongo_primary, mongo_backup = db.fetch_mongo_models()
+
+    if mongo_primary and mongo_primary != primary_model:
+        print(f"  🔄 MongoDB 主模型 [{mongo_primary}]...")
+        result = _call_openrouter(tickers, mongo_primary)
+        if result is not None:
+            print(f"  ✅ MongoDB 主模型 [{mongo_primary}] 查詢成功：{len(result)} 個 ticker")
+            return result
+
+    if mongo_backup and mongo_backup != backup_model:
+        print(f"  🔄 MongoDB 備用模型 [{mongo_backup}]...")
+        result = _call_openrouter(tickers, mongo_backup)
+        if result is not None:
+            print(f"  ✅ MongoDB 備用模型 [{mongo_backup}] 查詢成功：{len(result)} 個 ticker")
+            return result
+
+    # ── 層三：全部失敗 ──
+    print(f"  ❌ 全部模型均失敗（env: {primary_model}/{backup_model}，"
+          f"mongo: {mongo_primary}/{mongo_backup}），"
           f"本批 {len(tickers)} 個 ticker sector=None")
     return {}
 
@@ -951,8 +1010,12 @@ def _build_phase_file(ticker: str, events: List[dict], current_round: int) -> Op
 
 class PhaseCalcDB:
     """
-    學習中心相位計算 DB 操作類 v2.2。
+    學習中心相位計算 DB 操作類 v2.3。
     管理：Phase_History、Phase_Calc_Progress、Ticker_Sector_Map、Configs 讀取。
+
+    v2.3 新增：
+      self.comm_db — CommData database（與 StockData 同一 MongoClient）
+      fetch_mongo_models() — 從 CommData.Configs 讀取 AC 設定的 active_phase_primary/backup
     """
 
     RUN_ID = "phase_v1"
@@ -963,6 +1026,7 @@ class PhaseCalcDB:
             raise RuntimeError("MONGO_URI 未設定")
         self.client   = pymongo.MongoClient(uri)
         self.stock_db = self.client["StockData"]
+        self.comm_db  = self.client["CommData"]   # v2.3：用於讀取模型 registry
         self._setup_indices()
 
         self._list_tickers  = set()   # List1~4 所有 ticker（寫 Phase_History 用）
@@ -1047,6 +1111,48 @@ class PhaseCalcDB:
 
         self._sector_map = sector_map
         print(f"✅ PhaseCalcDB: List3 sector_map 加載完成，共 {len(sector_map)} 個映射")
+
+    def fetch_mongo_models(self) -> Tuple[str, str]:
+        """
+        v2.3 新增：從 CommData.Configs 讀取 AC 設定的板塊分類模型。
+        返回 (primary_model, backup_model)，找不到或異常時返回 ("", "")。
+
+        讀取邏輯與 AC core/model_registry.py get_free_models_config() 一致：
+          - type = "free_models_registry"
+          - active_phase_primary = True → primary
+          - active_phase_backup  = True → backup
+        """
+        try:
+            doc = self.comm_db["Configs"].find_one({"type": "free_models_registry"})
+            if not doc:
+                print("  ⚠️ CommData.Configs: free_models_registry 不存在")
+                return "", ""
+
+            registry = doc.get("models", [])
+            primary  = ""
+            backup   = ""
+
+            for m in registry:
+                mid = m.get("model_id", "")
+                if not mid:
+                    continue
+                if not primary and m.get("active_phase_primary"):
+                    primary = mid
+                if not backup and m.get("active_phase_backup"):
+                    backup = mid
+                if primary and backup:
+                    break
+
+            if primary or backup:
+                print(f"  📋 MongoDB 模型設定：primary={primary or '未設定'}, backup={backup or '未設定'}")
+            else:
+                print(f"  ⚠️ CommData.Configs: free_models_registry 無 active_phase_primary/backup 設定")
+
+            return primary, backup
+
+        except Exception as e:
+            print(f"  ⚠️ fetch_mongo_models 異常: {e}")
+            return "", ""
 
     def is_list_ticker(self, ticker: str) -> bool:
         return ticker.upper() in self._list_tickers
@@ -1427,7 +1533,7 @@ def calc_phase_for_ticker(
 
 def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
     """
-    批次執行相位計算（v2.2 多輪 + Round 2 連動 + OpenRouter 模型修復）。
+    批次執行相位計算（v2.3 三層模型降級）。
 
     ── 階段一：SCANNING ──
     v1.2：一次激活掃完全部頁（cursor 翻頁）。
@@ -1536,8 +1642,8 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
 
     # ── 計算本批 ──
     hf_files               = []
-    batch_success           = []
-    unknown_sector_tickers  = []   # 本批中 sector=None 且 MongoDB 無任何記錄的 ticker
+    batch_success          = []
+    unknown_sector_tickers = []   # 本批中 sector=None 且 MongoDB 無任何記錄的 ticker
 
     for ticker in batch:
         try:
@@ -1593,10 +1699,10 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
     print(f"💾 R{current_round} 進度保存：已完成 {len(completed)}/{len(all_tickers)}，剩餘 {new_remaining}")
 
     # ── Round 2：OpenRouter 批量查詢未知板塊（批次結束後執行，不阻塞進度推進）──
-    # v2.2：加入連續失敗計數 + 達閾值 Telegram 提醒
+    # v2.3：三層降級（env var → MongoDB → 放棄），連續失敗計數 + 達閾值 Telegram 提醒
     if current_round >= 2 and unknown_sector_tickers:
         print(f"  🔍 OpenRouter 查詢 {len(unknown_sector_tickers)} 個未知板塊 ticker...")
-        mappings = _query_sector_via_openrouter(unknown_sector_tickers)
+        mappings = _query_sector_via_openrouter(unknown_sector_tickers, db)
 
         if mappings:
             db.save_sector_mappings_batch(mappings)
@@ -1607,15 +1713,16 @@ def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
             print(f"  ⚠️ 本批 OpenRouter 板塊查詢完全失敗，連續失敗 batch 數：{streak}")
 
             if streak >= SECTOR_FAIL_ALERT_THRESHOLD:
+                primary_model = _get_sector_primary_model()
+                backup_model  = _get_sector_backup_model()
                 alert_text = (
                     f"⚠️ OpenClaw phase_calc 板塊分類連續失敗\n"
-                    f"連續 {streak} 個 batch，OpenRouter 主備模型查詢均失敗\n"
-                    f"主模型: {_get_sector_primary_model()}\n"
-                    f"備用模型: {_get_sector_backup_model()}\n"
+                    f"連續 {streak} 個 batch，所有模型查詢均失敗（含 MongoDB fallback）\n"
+                    f"env 主模型: {primary_model or '未設定'}\n"
+                    f"env 備用模型: {backup_model or '未設定'}\n"
                     f"輪次: R{current_round}\n"
-                    f"建議檢查 OPENROUTER_API_KEY 是否有效，"
-                    f"或 AI_MODEL_SECTOR_PRIMARY/AI_MODEL_SECTOR_BACKUP "
-                    f"是否需要更換為目前存活的免費模型"
+                    f"建議：至 AC 模型管理介面更新 active_phase_primary/backup，"
+                    f"或更新 GHA Variables AI_MODEL_SECTOR_PRIMARY/BACKUP"
                 )
                 _send_telegram_alert(alert_text)
                 db.update_sector_fail_streak(success=True)   # 提醒後歸零，避免重複轟炸
