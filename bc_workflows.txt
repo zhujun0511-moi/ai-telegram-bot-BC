@@ -1,0 +1,115 @@
+﻿name: mp_nightly
+
+on:
+  # DC reorganize wm ALL_DONE 後透過 GitHub API dispatch 觸發
+  workflow_dispatch:
+    inputs:
+      trigger_date:
+        description: '觸發日期（YYYY-MM-DD），由 DC 傳入'
+        required: false
+        default: ''
+
+  # 備用：每日 23:30 UTC（EST 19:30，盤後數據應已完備）
+  # 正常情況由 DC dispatch 觸發，此排程作為保底
+  schedule:
+    - cron: '30 23 * * 1-5'
+
+jobs:
+  # ──────────────────────────────────────────
+  # job1：MP 指標計算（D1/W1 EMA/ATR/RSI/RVOL）
+  # ──────────────────────────────────────────
+  mp_indicator_calc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # 5.5 小時，GitHub Actions 上限 6 小時留緩衝
+
+    env:
+      HF_TOKEN:   ${{ secrets.HF_TOKEN }}
+      HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+      MONGO_URI:  ${{ secrets.MONGO_URI }}
+
+    steps:
+      - name: Checkout BC repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas numpy ta pymongo pytz
+
+      - name: Run mp_indicator_calc
+        run: |
+          echo "🚀 mp_indicator_calc 開始 | trigger_date=${{ github.event.inputs.trigger_date }}"
+          python run_mp_indicator_calc.py
+          echo "✅ mp_indicator_calc 結束"
+
+  # ──────────────────────────────────────────
+  # job2：MP 道氏結構計算（D1/W1）
+  # 與 job1 並行（兩者均只讀 d.csv，輸出不同，無衝突）
+  # ──────────────────────────────────────────
+  mp_dow_structure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    env:
+      HF_TOKEN:   ${{ secrets.HF_TOKEN }}
+      HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+      MONGO_URI:  ${{ secrets.MONGO_URI }}
+
+    steps:
+      - name: Checkout BC repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas pymongo pytz
+
+      - name: Run mp_dow_structure
+        run: |
+          echo "🚀 mp_dow_structure 開始 | trigger_date=${{ github.event.inputs.trigger_date }}"
+          python run_mp_dow_structure.py
+          echo "✅ mp_dow_structure 結束"
+
+  # ──────────────────────────────────────────
+  # job3：phase_calc（needs: job1 + job2）
+  # 等 job1 + job2 均完成後才執行
+  # ──────────────────────────────────────────
+  phase_calc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    needs: [mp_indicator_calc, mp_dow_structure]
+
+    env:
+      HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+      HF_REPO_ID:        ${{ secrets.HF_REPO_ID }}
+      MONGO_URI:         ${{ secrets.MONGO_URI }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      WEBHOOK_SECRET:    ${{ secrets.WEBHOOK_SECRET }}
+      COMM_HUB_URL:      ${{ secrets.COMM_HUB_URL }}
+
+    steps:
+      - name: Checkout BC repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas pymongo pytz
+
+      - name: Run phase_calc
+        run: |
+          echo "🚀 phase_calc 開始"
+          python run_phase_calc_gha.py
+          echo "✅ phase_calc 結束"

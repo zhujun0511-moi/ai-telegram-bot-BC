@@ -1,0 +1,133 @@
+name: MP Reorganize
+
+on:
+  # DC fetch_mp_full ALL_DONE 後透過 GitHub API dispatch 觸發
+  workflow_dispatch:
+    inputs:
+      trading_date:
+        description: '交易日期 YYYY-MM-DD'
+        required: true
+      mode:
+        description: '模式：daily（正常，含補缺口）/ rebuild（單日強制重跑）'
+        required: false
+        default: 'daily'
+
+jobs:
+  # ──────────────────────────────────────────
+  # job1：fetch_mp — 從 MP API 拉取數據到本地 staging
+  # ──────────────────────────────────────────
+  fetch_mp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout BC repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas pyarrow pymongo pytz
+
+      - name: Run fetch_mp
+        env:
+          MP_API_KEY:     ${{ secrets.MP_API_KEY }}
+          MONGO_URI:      ${{ secrets.MONGO_URI }}
+          TRADING_DATE:   ${{ inputs.trading_date }}
+          MODE:           ${{ inputs.mode }}
+          COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          echo "🚀 fetch_mp 開始 | date=${{ inputs.trading_date }} mode=${{ inputs.mode }}"
+          python run_mp_fetch.py
+          echo "✅ fetch_mp 結束"
+
+      - name: Upload staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mp-staging-${{ inputs.trading_date }}
+          path: ./staging/
+          retention-days: 3
+
+  # ──────────────────────────────────────────
+  # job2：reorganize_daily — merge d.csv + upload_folder
+  # ──────────────────────────────────────────
+  reorganize_daily:
+    needs: fetch_mp
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout BC repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas pyarrow pymongo pytz "huggingface_hub>=0.20"
+
+      - name: Download staging artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mp-staging-${{ inputs.trading_date }}
+          path: ./staging/
+
+      - name: Run reorganize_daily
+        env:
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:     ${{ secrets.HF_REPO_ID }}
+          MONGO_URI:      ${{ secrets.MONGO_URI }}
+          TRADING_DATE:   ${{ inputs.trading_date }}
+          COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          echo "🚀 reorganize_daily 開始 | date=${{ inputs.trading_date }}"
+          python run_mp_reorganize_daily.py
+          echo "✅ reorganize_daily 結束"
+
+  # ──────────────────────────────────────────
+  # job3：reorganize_wm — resample w/m + dispatch mp_nightly
+  # ──────────────────────────────────────────
+  reorganize_wm:
+    needs: reorganize_daily
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout BC repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas pyarrow pymongo pytz "huggingface_hub>=0.20"
+
+      - name: Download staging artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mp-staging-${{ inputs.trading_date }}
+          path: ./staging/
+
+      - name: Run reorganize_wm
+        env:
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:     ${{ secrets.HF_REPO_ID }}
+          MONGO_URI:      ${{ secrets.MONGO_URI }}
+          GH_TOKEN:       ${{ secrets.GH_TOKEN }}
+          GH_REPO:        ${{ secrets.GH_REPO }}
+          TRADING_DATE:   ${{ inputs.trading_date }}
+          COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          echo "🚀 reorganize_wm 開始 | date=${{ inputs.trading_date }}"
+          python run_mp_reorganize_wm.py
+          echo "✅ reorganize_wm 結束"
