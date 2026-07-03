@@ -38,5 +38,5 @@ jobs:
           MONGO_URI:      ${{ secrets.MONGO_URI }}
           POLYGON_KEY:    ${{ secrets.POLYGON_KEY }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          COMM_HUB_URL:   ${{ vars.COMM_HUB_URL }}
+          COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
         run: python run_verify_weekend.py
