@@ -1,0 +1,4749 @@
+
+=== phase_calculator.py ===
+"""
+tasks/phase_calculator.py — 相位計算引擎（v2.4 MongoDB 候選池輪替）
+
+v2.4 改動（本次新增）：
+  問題根因：模型接替機制不健壯
+    - env var 沒有在 yaml 傳入，層一永遠跳過
+    - MongoDB 只設了 primary，backup 全 false，層二只有一個模型
+    - 單一模型 429 → 三層全敗
+    - 解決方案：完全移除 env var 層，改用 MongoDB 候選池輪替
+
+  新設計：
+    1. 從 CommData.Configs.free_models_registry 讀取完整候選池（21個模型）
+    2. active_phase_primary=True 的模型優先嘗試
+    3. 失敗（任何非 200 或解析失敗）→ 自動輪替下一個候選模型
+    4. 全部失敗 → 靜默放棄，本批 sector=None
+
+  移除：
+    - _get_sector_primary_model()（env var 方式）
+    - _get_sector_backup_model()（env var 方式）
+    - yaml 不再需要 AI_MODEL_SECTOR_PRIMARY / AI_MODEL_SECTOR_BACKUP
+
+  新增：
+    - PhaseCalcDB.fetch_sector_model_pool()：讀取完整候選池，active 的排前面
+    - _query_sector_via_openrouter(tickers, db)：遍歷候選池直到成功或全敗
+
+  告警訊息更新：
+    - 改為列出嘗試過的模型數量，不再列具體模型名稱（候選池動態）
+
+v2.3 改動（保留）：
+  PhaseCalcDB 加入 comm_db（CommData 連線）
+  fetch_mongo_models() → 已由 fetch_sector_model_pool() 取代
+
+v2.2 改動（保留）：
+  連續失敗 Telegram 提醒機制
+  _send_telegram_alert() 走 AC /comm/send
+
+v2.1 改動（保留）：
+  Phase_History 寫入改為 upsert
+  unknown_sector_tickers 條件修正
+
+v2.0 改動（保留）：
+  多輪自激發框架
+  Round 2 大盤 + 板塊連動附加
+
+v1.2 改動（保留）：
+  HF 目錄掃描改為 cursor 翻頁
+
+Python 3.9 兼容，不用 str | None。
+"""
+
+
+import os
+import io
+import re
+import json
+import base64
+import requests
+import pymongo
+from datetime import datetime
+from typing import Optional, List, Dict, Tuple
+import pytz
+import time
+import pandas as pd
+
+
+# ─────────────────────────────────────────────
+# 常數
+# ─────────────────────────────────────────────
+
+
+HF_REPO_ID    = os.getenv("HF_REPO_ID", "zhujun0511-AI/ai-telegram-bot-dataset")
+HF_API_BASE   = "https://huggingface.co/api/datasets"
+HF_TICKER_DIR = "mp_data/ticker"
+HF_PHASE_DIR  = "phase_data"
+
+EST_TZ = pytz.timezone("US/Eastern")
+
+PHASE_CALC_BATCH_SIZE = 10
+
+MA_PERIODS = {"M": 6, "W": 10, "D": 20}
+SLOPE_LOOKBACK = {"M": 2, "W": 3, "D": 3}
+SLOPE_THRESHOLD = 0.001
+
+MAX_ROUND = 20
+
+SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLB", "XLU", "XLRE", "XLC"]
+
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1/chat/completions"
+
+SECTOR_FAIL_ALERT_THRESHOLD = 5
+
+
+# ─────────────────────────────────────────────
+# 環境變量動態讀取
+# ─────────────────────────────────────────────
+
+
+def _get_hf_token() -> str:
+    return os.getenv("HF_TOKEN", "")
+
+
+def _get_mongo_uri() -> str:
+    return os.getenv("MONGO_URI", "")
+
+
+def _get_openrouter_key() -> str:
+    return os.getenv("OPENROUTER_API_KEY", "")
+
+
+def _get_comm_hub_url() -> str:
+    return os.getenv("COMM_HUB_URL", "").strip()
+
+
+def _get_gha_webhook_secret() -> str:
+    return os.getenv("WEBHOOK_SECRET", "").strip()
+
+
+def _hf_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_get_hf_token()}",
+        "Content-Type": "application/json",
+    }
+
+
+# ─────────────────────────────────────────────
+# Telegram 提醒（連續失敗用）
+# ─────────────────────────────────────────────
+
+
+def _send_telegram_alert(text: str) -> bool:
+    secret = _get_gha_webhook_secret()
+    url    = _get_comm_hub_url()
+
+    if not secret:
+        print(f"⚠️ WEBHOOK_SECRET 未設定，提醒僅記錄日誌：{text}")
+        return False
+    if not url:
+        print(f"⚠️ COMM_HUB_URL 未設定，提醒僅記錄日誌：{text}")
+        return False
+
+    payload = {"content": text, "report_type": "brief"}
+    headers = {"x-webhook-secret": secret, "Content-Type": "application/json"}
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                print(f"✅ Telegram 提醒已送出（經 AC /comm/send）")
+                return True
+            print(f"⚠️ Telegram 提醒送出失敗（第 {attempt+1} 次）: "
+                  f"{resp.status_code} {resp.text[:150]}")
+        except Exception as e:
+            print(f"⚠️ Telegram 提醒異常（第 {attempt+1} 次）: {e}")
+        time.sleep(2)
+
+    print(f"❌ Telegram 提醒已達最大重試次數，放棄本次推送")
+    return False
+
+
+# ─────────────────────────────────────────────
+# List3 解析（複製自 cfet_backtest，禁止 import）
+# ─────────────────────────────────────────────
+
+
+def _parse_list3_line(line: str) -> Tuple[Optional[str], List[str], str]:
+    line = line.strip().upper()
+    if ":" not in line:
+        return None, [], "leader"
+    sector_raw, rest = line.split(":", 1)
+    sector_raw = sector_raw.strip()
+    tickers    = [t.strip() for t in rest.split(",") if t.strip()]
+    if sector_raw.endswith("_MID"):
+        sector = sector_raw[:-4]
+        tier   = "mid"
+    else:
+        sector = sector_raw
+        tier   = "leader"
+    return sector, tickers, tier
+
+
+# ─────────────────────────────────────────────
+# OpenRouter 板塊查詢
+# ─────────────────────────────────────────────
+
+
+def _call_openrouter(tickers: List[str], model: str) -> Optional[Dict[str, Optional[str]]]:
+    """
+    呼叫 OpenRouter 查詢 ticker → 板塊 ETF 映射。
+    返回 {ticker: sector_etf_or_null}，失敗返回 None。
+    """
+    if not model:
+        return None
+
+    key = _get_openrouter_key()
+    if not key:
+        print("⚠️ OPENROUTER_API_KEY 未設定，跳過板塊查詢")
+        return None
+
+    ticker_list_str = ", ".join(tickers)
+    etf_list_str    = ", ".join(SECTOR_ETFS)
+
+    prompt = (
+        f"Given these US stock tickers: {ticker_list_str}\n"
+        f"For each ticker, determine which SPDR sector ETF it primarily belongs to.\n"
+        f"You MUST only choose from: {etf_list_str}\n"
+        f"If you are not sure, use null.\n"
+        f"Respond ONLY with a valid JSON object mapping each ticker to its sector ETF or null.\n"
+        f"Example: {{\"AAPL\": \"XLK\", \"XOM\": \"XLE\", \"UNKNWN\": null}}\n"
+        f"No explanation, no markdown, just the JSON object."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 300,
+        "temperature": 0,
+    }
+
+    content = ""
+    try:
+        resp = requests.post(
+            OPENROUTER_API_BASE,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"  ⚠️ OpenRouter [{model}] 失敗: {resp.status_code} {resp.text[:100]}")
+            return None
+
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+        content = re.sub(r"```[a-z]*", "", content).strip().strip("`")
+        result  = json.loads(content)
+
+        validated = {}
+        for t, v in result.items():
+            t_upper = t.upper()
+            if v is None or (isinstance(v, str) and v.upper() in SECTOR_ETFS):
+                validated[t_upper] = v.upper() if v else None
+            else:
+                print(f"  ⚠️ OpenRouter 返回無效板塊 {t}={v}，設為 null")
+                validated[t_upper] = None
+        return validated
+
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️ OpenRouter [{model}] JSON 解析失敗: {e} | 原文: {content[:100]}")
+        return None
+    except Exception as e:
+        print(f"  ⚠️ OpenRouter [{model}] 異常: {e}")
+        return None
+
+
+def _query_sector_via_openrouter(
+    tickers: List[str],
+    db: "PhaseCalcDB",
+) -> Dict[str, Optional[str]]:
+    """
+    v2.4：MongoDB 候選池輪替。
+    從 CommData.Configs.free_models_registry 讀取完整候選池，
+    active_phase_primary=True 的模型排在最前面優先嘗試，
+    失敗則自動輪替下一個，直到成功或全部耗盡。
+    """
+    if not tickers:
+        return {}
+
+    model_pool = db.fetch_sector_model_pool()
+
+    if not model_pool:
+        print(f"  ⚠️ 候選池為空（MongoDB 未設定任何模型），跳過板塊查詢")
+        return {}
+
+    print(f"  🔍 OpenRouter 板塊查詢，候選池共 {len(model_pool)} 個模型...")
+
+    for i, model_id in enumerate(model_pool):
+        print(f"  🔄 嘗試模型 [{i+1}/{len(model_pool)}] {model_id}...")
+        result = _call_openrouter(tickers, model_id)
+        if result is not None:
+            print(f"  ✅ [{model_id}] 查詢成功：{len(result)} 個 ticker")
+            return result
+
+    print(f"  ❌ 候選池 {len(model_pool)} 個模型全部失敗，本批 {len(tickers)} 個 ticker sector=None")
+    return {}
+
+
+# ─────────────────────────────────────────────
+# HF Dataset 讀寫工具
+# ─────────────────────────────────────────────
+
+
+def _hf_download_file(path: str) -> Optional[bytes]:
+    url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{path}"
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {_get_hf_token()}"},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                return resp.content
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                print(f"⚠️ HF 下載 429 rate limit（{path}），等待 70 秒後重試...")
+                time.sleep(70)
+                continue
+            print(f"⚠️ HF 下載失敗 {path}: {resp.status_code}")
+            return None
+        except Exception as e:
+            print(f"❌ HF 下載異常 {path}: {e}")
+            return None
+    print(f"❌ HF 下載 {path}：重試後仍失敗（rate limit）")
+    return None
+
+
+def _hf_batch_commit(files: List[dict], commit_message: str = "phase_calc batch") -> bool:
+    if not files:
+        return True
+    try:
+        file_payloads = []
+        for f in files:
+            csv_bytes   = f["df"].to_csv(index=False).encode("utf-8")
+            content_b64 = base64.b64encode(csv_bytes).decode()
+            file_payloads.append({
+                "path":     f["path"],
+                "content":  content_b64,
+                "encoding": "base64",
+            })
+
+        url     = f"{HF_API_BASE}/{HF_REPO_ID}/commit/main"
+        payload = {"summary": commit_message, "files": file_payloads}
+
+        for attempt in range(2):
+            resp = requests.post(url, headers=_hf_headers(), json=payload, timeout=120)
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429:
+                print(f"⚠️ HF commit 429 rate limit（{len(files)} 個文件），等待 70 秒後重試...")
+                time.sleep(70)
+                continue
+            print(f"❌ HF batch commit 失敗: {resp.status_code} {resp.text[:200]}")
+            return False
+
+        print(f"❌ HF batch commit：重試後仍失敗（rate limit），本批進度不推進")
+        return False
+
+    except Exception as e:
+        print(f"❌ HF batch commit 異常: {e}")
+        return False
+
+
+def _parse_next_url(link_header: str) -> Optional[str]:
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        part = part.strip()
+        m = re.match(r'<([^>]+)>;\s*rel="next"', part)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _hf_scan_all_tickers(prefix: str) -> dict:
+    all_tickers  = []
+    total_items  = 0
+    pages        = 0
+    next_url     = f"{HF_API_BASE}/{HF_REPO_ID}/tree/main/{prefix}?recursive=false&expand=false"
+
+    while next_url:
+        try:
+            resp = requests.get(next_url, headers=_hf_headers(), timeout=30)
+            if resp.status_code == 429:
+                print(f"⚠️ HF 目錄掃描 429（第 {pages+1} 頁），等待 70 秒後重試...")
+                time.sleep(70)
+                resp = requests.get(next_url, headers=_hf_headers(), timeout=30)
+                if resp.status_code != 200:
+                    print(f"❌ HF 目錄掃描重試後仍失敗: {resp.status_code}")
+                    return {"tickers": all_tickers, "total_items": total_items,
+                            "pages": pages, "error": True}
+
+            if resp.status_code != 200:
+                print(f"⚠️ HF 目錄掃描失敗（第 {pages+1} 頁）: {resp.status_code}")
+                return {"tickers": all_tickers, "total_items": total_items,
+                        "pages": pages, "error": True}
+
+            items = resp.json()
+            if not isinstance(items, list):
+                break
+
+            pages       += 1
+            total_items += len(items)
+
+            dirs = [
+                item["path"].split("/")[-1]
+                for item in items
+                if item.get("type") == "directory"
+                and "_" not in item["path"].split("/")[-1]
+            ]
+            all_tickers.extend(dirs)
+
+            print(f"  📄 第 {pages} 頁：{len(items)} items，{len(dirs)} 個 ticker，"
+                  f"累計 {len(all_tickers)} 個")
+
+            next_url = _parse_next_url(resp.headers.get("Link", ""))
+
+        except Exception as e:
+            print(f"❌ HF 目錄掃描異常（第 {pages+1} 頁）: {e}")
+            return {"tickers": all_tickers, "total_items": total_items,
+                    "pages": pages, "error": True}
+
+    return {
+        "tickers":     all_tickers,
+        "total_items": total_items,
+        "pages":       pages,
+        "error":       False,
+    }
+
+
+# ─────────────────────────────────────────────
+# 數據加載
+# ─────────────────────────────────────────────
+
+
+def load_bars(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
+    tf_map = {"M": "m", "W": "w", "D": "d"}
+    tf_key = tf_map.get(timeframe)
+    if not tf_key:
+        return None
+
+    path = f"{HF_TICKER_DIR}/{ticker}/{tf_key}.csv"
+    raw  = _hf_download_file(path)
+    if raw is None:
+        return None
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+        df.columns = [c.lower() for c in df.columns]
+
+        required = {"date", "open", "high", "low", "close", "volume"}
+        if not required.issubset(set(df.columns)):
+            return None
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+        min_bars = MA_PERIODS[timeframe] + SLOPE_LOOKBACK[timeframe] + 10
+        if len(df) < min_bars:
+            return None
+
+        return df
+
+    except Exception as e:
+        print(f"❌ 解析 {path} 失敗: {e}")
+        return None
+
+
+def load_phase_csv(ticker: str) -> Optional[pd.DataFrame]:
+    path = f"{HF_PHASE_DIR}/{ticker}/phase.csv"
+    raw  = _hf_download_file(path)
+    if raw is None:
+        return None
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+        df.columns = [c.lower() for c in df.columns]
+        if "date" not in df.columns or "timeframe" not in df.columns or "new_phase" not in df.columns:
+            return None
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df = df.dropna(subset=["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
+    except Exception as e:
+        print(f"❌ 解析 phase.csv {ticker} 失敗: {e}")
+        return None
+
+
+def get_phase_at_date(phase_df: pd.DataFrame, date_str: str, timeframe: str) -> str:
+    if phase_df is None or phase_df.empty:
+        return "UNKNOWN"
+    sub = phase_df[
+        (phase_df["timeframe"] == timeframe) &
+        (phase_df["date"] <= date_str)
+    ]
+    if sub.empty:
+        return "UNKNOWN"
+    return str(sub.iloc[-1]["new_phase"])
+
+
+# ─────────────────────────────────────────────
+# 分形計算
+# ─────────────────────────────────────────────
+
+
+def _calc_top_fractals(df: pd.DataFrame) -> pd.Series:
+    highs  = df["high"].values
+    n      = len(highs)
+    result = [False] * n
+    for i in range(2, n - 3):
+        if (highs[i] > highs[i-1] and highs[i] > highs[i-2]
+                and highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+            result[i] = True
+    return pd.Series(result, index=df.index)
+
+
+def _calc_bot_fractals(df: pd.DataFrame) -> pd.Series:
+    lows   = df["low"].values
+    n      = len(lows)
+    result = [False] * n
+    for i in range(2, n - 3):
+        if (lows[i] < lows[i-1] and lows[i] < lows[i-2]
+                and lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+            result[i] = True
+    return pd.Series(result, index=df.index)
+
+
+# ─────────────────────────────────────────────
+# 相位判斷四要素
+# ─────────────────────────────────────────────
+
+
+def _calc_slope(ma_values: list, idx: int, lookback: int) -> str:
+    if idx < lookback:
+        return "flat"
+    prev = ma_values[idx - lookback]
+    curr = ma_values[idx]
+    if prev <= 0:
+        return "flat"
+    slope = (curr - prev) / prev
+    if slope > SLOPE_THRESHOLD:
+        return "rising"
+    if slope < -SLOPE_THRESHOLD:
+        return "falling"
+    return "flat"
+
+
+def _calc_slope_value(ma_values: list, idx: int, lookback: int) -> float:
+    if idx < lookback:
+        return 0.0
+    prev = ma_values[idx - lookback]
+    curr = ma_values[idx]
+    if prev <= 0:
+        return 0.0
+    return round((curr - prev) / prev, 6)
+
+
+def _calc_structure(top_fractals_idx: List[int], bot_fractals_idx: List[int],
+                    df: pd.DataFrame, up_to_idx: int) -> str:
+    tops = [i for i in top_fractals_idx if i <= up_to_idx]
+    bots = [i for i in bot_fractals_idx if i <= up_to_idx]
+
+    if len(tops) < 2 or len(bots) < 2:
+        return "mixed"
+
+    top1, top2 = tops[-1], tops[-2]
+    bot1, bot2 = bots[-1], bots[-2]
+
+    hh = df["high"].iloc[top1] > df["high"].iloc[top2]
+    hl = df["low"].iloc[bot1]  > df["low"].iloc[bot2]
+    lh = df["high"].iloc[top1] < df["high"].iloc[top2]
+    ll = df["low"].iloc[bot1]  < df["low"].iloc[bot2]
+
+    if hh and hl:
+        return "HH_HL"
+    if lh and ll:
+        return "LH_LL"
+    return "mixed"
+
+
+def _calc_last_fractal(top_fractals_idx: List[int], bot_fractals_idx: List[int],
+                       up_to_idx: int) -> str:
+    last_top = max((i for i in top_fractals_idx if i <= up_to_idx), default=-1)
+    last_bot = max((i for i in bot_fractals_idx if i <= up_to_idx), default=-1)
+    if last_top == -1 and last_bot == -1:
+        return "none"
+    if last_top > last_bot:
+        return "top"
+    return "bottom"
+
+
+def _determine_phase(slope: str, price_vs_ma: str, structure: str, last_fractal: str) -> str:
+    if (last_fractal == "bottom" and structure == "mixed"
+            and price_vs_ma == "above" and slope in ("flat", "rising")):
+        return "A1"
+    if (structure == "HH_HL" and slope == "rising" and price_vs_ma == "above"):
+        return "A2"
+    if (last_fractal == "top" and structure == "HH_HL"
+            and slope in ("flat", "rising") and price_vs_ma == "above"):
+        return "A3"
+    if (last_fractal == "top" and structure == "mixed"
+            and price_vs_ma == "below" and slope in ("flat", "falling")):
+        return "B1"
+    if (structure == "LH_LL" and slope == "falling" and price_vs_ma == "below"):
+        return "B2"
+    if (last_fractal == "bottom" and structure == "LH_LL"
+            and slope in ("flat", "falling") and price_vs_ma == "below"):
+        return "B3"
+    return "UNCLEAR"
+
+
+# ─────────────────────────────────────────────
+# 相位事件計算（單時間框架）
+# ─────────────────────────────────────────────
+
+
+def calc_phase_events(df: pd.DataFrame, timeframe: str) -> List[dict]:
+    ma_period = MA_PERIODS[timeframe]
+    slope_lb  = SLOPE_LOOKBACK[timeframe]
+
+    df = df.copy()
+    df["ma"] = df["close"].rolling(ma_period).mean()
+
+    df["top_frac"] = _calc_top_fractals(df)
+    df["bot_frac"] = _calc_bot_fractals(df)
+
+    top_pos = [df.index.get_loc(i) for i in df.index[df["top_frac"]].tolist()]
+    bot_pos = [df.index.get_loc(i) for i in df.index[df["bot_frac"]].tolist()]
+
+    ma_values = df["ma"].values.tolist()
+    closes    = df["close"].values.tolist()
+    dates     = df["date"].tolist()
+
+    events        = []
+    current_phase = None
+    start_pos     = ma_period + slope_lb + 5
+
+    for pos in range(start_pos, len(df) - 2):
+        if pd.isna(ma_values[pos]):
+            continue
+
+        slope        = _calc_slope(ma_values, pos, slope_lb)
+        price_vs_ma  = "above" if closes[pos] > ma_values[pos] else "below"
+        structure    = _calc_structure(top_pos, bot_pos, df, pos)
+        last_fractal = _calc_last_fractal(top_pos, bot_pos, pos)
+
+        new_phase = _determine_phase(slope, price_vs_ma, structure, last_fractal)
+
+        if new_phase != "UNCLEAR" and new_phase != current_phase:
+            date_str = dates[pos].strftime("%Y-%m-%d") if hasattr(dates[pos], "strftime") else str(dates[pos])[:10]
+            events.append({
+                "date":        date_str,
+                "timeframe":   timeframe,
+                "prev_phase":  current_phase if current_phase else "UNKNOWN",
+                "new_phase":   new_phase,
+                "indicators": {
+                    "ma_slope":     _calc_slope_value(ma_values, pos, slope_lb),
+                    "price_vs_ma":  price_vs_ma,
+                    "fractal_type": last_fractal,
+                    "structure":    structure,
+                    "ma_value":     round(ma_values[pos], 4),
+                    "close":        round(closes[pos], 4),
+                },
+            })
+            current_phase = new_phase
+
+    return events
+
+
+# ─────────────────────────────────────────────
+# 三層快照補充（ticker 自身）
+# ─────────────────────────────────────────────
+
+
+def _get_phase_at_date(events: List[dict], date_str: str) -> str:
+    phase = "UNKNOWN"
+    for ev in events:
+        if ev["date"] <= date_str:
+            phase = ev["new_phase"]
+        else:
+            break
+    return phase
+
+
+def enrich_with_context(all_events: List[dict],
+                        events_m: List[dict],
+                        events_w: List[dict],
+                        events_d: List[dict]) -> List[dict]:
+    enriched = []
+    for ev in all_events:
+        date_str = ev["date"]
+        phase_m  = _get_phase_at_date(events_m, date_str)
+        phase_w  = _get_phase_at_date(events_w, date_str)
+        phase_d  = _get_phase_at_date(events_d, date_str)
+
+        ev_copy = dict(ev)
+        ev_copy["phase_M"] = phase_m
+        ev_copy["phase_W"] = phase_w
+        ev_copy["phase_D"] = phase_d
+        ev_copy["pattern"] = f"M_{phase_m}_W_{phase_w}_D_{phase_d}"
+        enriched.append(ev_copy)
+    return enriched
+
+
+# ─────────────────────────────────────────────
+# Round 2 環境附加
+# ─────────────────────────────────────────────
+
+
+def enrich_with_environment(
+    enriched: List[dict],
+    spy_phase_df: Optional[pd.DataFrame],
+    sector_etf: Optional[str],
+    sector_phase_df: Optional[pd.DataFrame],
+    current_round: int,
+) -> List[dict]:
+    result = []
+    for ev in enriched:
+        date_str = ev["date"]
+        ev_copy  = dict(ev)
+        ev_copy["round"] = current_round
+
+        if spy_phase_df is not None:
+            ev_copy["spy_phase_M"] = get_phase_at_date(spy_phase_df, date_str, "M")
+            ev_copy["spy_phase_W"] = get_phase_at_date(spy_phase_df, date_str, "W")
+            ev_copy["spy_phase_D"] = get_phase_at_date(spy_phase_df, date_str, "D")
+        else:
+            ev_copy["spy_phase_M"] = None
+            ev_copy["spy_phase_W"] = None
+            ev_copy["spy_phase_D"] = None
+
+        ev_copy["sector_etf"] = sector_etf
+        if sector_etf and sector_phase_df is not None:
+            ev_copy["sector_phase_M"] = get_phase_at_date(sector_phase_df, date_str, "M")
+            ev_copy["sector_phase_W"] = get_phase_at_date(sector_phase_df, date_str, "W")
+            ev_copy["sector_phase_D"] = get_phase_at_date(sector_phase_df, date_str, "D")
+        else:
+            ev_copy["sector_phase_M"] = None
+            ev_copy["sector_phase_W"] = None
+            ev_copy["sector_phase_D"] = None
+
+        result.append(ev_copy)
+    return result
+
+
+# ─────────────────────────────────────────────
+# 存儲：HF phase.csv
+# ─────────────────────────────────────────────
+
+_PHASE_CSV_COLS_R1 = [
+    "date", "timeframe", "prev_phase", "new_phase",
+    "phase_M", "phase_W", "phase_D", "pattern",
+    "ma_slope", "price_vs_ma", "fractal_type", "structure",
+    "ma_value", "close",
+]
+
+_PHASE_CSV_COLS_R2 = _PHASE_CSV_COLS_R1 + [
+    "round",
+    "spy_phase_M", "spy_phase_W", "spy_phase_D",
+    "sector_etf", "sector_phase_M", "sector_phase_W", "sector_phase_D",
+]
+
+
+def _events_to_df(events: List[dict], current_round: int) -> pd.DataFrame:
+    cols = _PHASE_CSV_COLS_R2 if current_round >= 2 else _PHASE_CSV_COLS_R1
+    rows = []
+    for ev in events:
+        ind = ev.get("indicators", {})
+        row = {
+            "date":         ev["date"],
+            "timeframe":    ev["timeframe"],
+            "prev_phase":   ev["prev_phase"],
+            "new_phase":    ev["new_phase"],
+            "phase_M":      ev.get("phase_M", ""),
+            "phase_W":      ev.get("phase_W", ""),
+            "phase_D":      ev.get("phase_D", ""),
+            "pattern":      ev.get("pattern", ""),
+            "ma_slope":     ind.get("ma_slope", ""),
+            "price_vs_ma":  ind.get("price_vs_ma", ""),
+            "fractal_type": ind.get("fractal_type", ""),
+            "structure":    ind.get("structure", ""),
+            "ma_value":     ind.get("ma_value", ""),
+            "close":        ind.get("close", ""),
+        }
+        if current_round >= 2:
+            row["round"]          = ev.get("round", current_round)
+            row["spy_phase_M"]    = ev.get("spy_phase_M", "")
+            row["spy_phase_W"]    = ev.get("spy_phase_W", "")
+            row["spy_phase_D"]    = ev.get("spy_phase_D", "")
+            row["sector_etf"]     = ev.get("sector_etf", "")
+            row["sector_phase_M"] = ev.get("sector_phase_M", "")
+            row["sector_phase_W"] = ev.get("sector_phase_W", "")
+            row["sector_phase_D"] = ev.get("sector_phase_D", "")
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=cols)
+    return df
+
+
+def _build_phase_file(ticker: str, events: List[dict], current_round: int) -> Optional[dict]:
+    if not events:
+        return None
+    df   = _events_to_df(events, current_round)
+    path = f"{HF_PHASE_DIR}/{ticker}/phase.csv"
+    return {"path": path, "df": df}
+
+
+# ─────────────────────────────────────────────
+# 存儲：MongoDB Phase_History
+# ─────────────────────────────────────────────
+
+
+class PhaseCalcDB:
+    """
+    學習中心相位計算 DB 操作類 v2.4。
+
+    v2.4 新增：
+      self.comm_db — CommData database
+      fetch_sector_model_pool() — 從 CommData.Configs.free_models_registry
+        讀取完整候選池，active_phase_primary=True 的排最前面
+    """
+
+    RUN_ID = "phase_v1"
+
+    def __init__(self):
+        uri = _get_mongo_uri()
+        if not uri:
+            raise RuntimeError("MONGO_URI 未設定")
+        self.client   = pymongo.MongoClient(uri)
+        self.stock_db = self.client["StockData"]
+        self.comm_db  = self.client["CommData"]
+        self._setup_indices()
+
+        self._list_tickers = set()
+        self._sector_map   = {}
+        self._load_list_tickers()
+        self._load_sector_map()
+
+    def _setup_indices(self):
+        try:
+            self.stock_db["Phase_History"].create_index(
+                [("ticker", pymongo.ASCENDING),
+                 ("timeframe", pymongo.ASCENDING),
+                 ("date", pymongo.DESCENDING)],
+                name="ticker_tf_date"
+            )
+            self.stock_db["Phase_History"].create_index(
+                [("ticker", pymongo.ASCENDING),
+                 ("timeframe", pymongo.ASCENDING),
+                 ("date", pymongo.ASCENDING)],
+                unique=True,
+                name="unique_ticker_tf_date"
+            )
+            self.stock_db["Phase_Calc_Progress"].create_index("run_id", unique=True)
+            self.stock_db["Ticker_Sector_Map"].create_index("ticker", unique=True)
+            self.stock_db["Ticker_Sector_Conflicts"].create_index(
+                [("ticker", pymongo.ASCENDING),
+                 ("detected_at", pymongo.DESCENDING)]
+            )
+        except Exception as e:
+            print(f"⚠️ 索引建立失敗（可能已存在）: {e}")
+
+    def _load_list_tickers(self):
+        cfg = self.stock_db["Configs"].find_one({"type": "ticker_lists"})
+        if not cfg:
+            print("⚠️ PhaseCalcDB: Configs 未找到，List ticker 集合為空")
+            return
+
+        lists = cfg.get("lists", {})
+        seen  = set()
+
+        def _add(t):
+            seen.add(t.upper().strip())
+
+        for t in lists.get("list_1", []):
+            _add(t)
+        for t in lists.get("list_2", []):
+            _add(t)
+        for line in lists.get("list_3", []):
+            if ":" in line:
+                _, rest = line.split(":", 1)
+                for t in rest.split(","):
+                    t = t.strip().upper()
+                    if t:
+                        seen.add(t)
+        for t in lists.get("list_4", []):
+            _add(t)
+
+        self._list_tickers = seen
+        print(f"✅ PhaseCalcDB: List ticker 集合加載完成，共 {len(seen)} 個")
+
+    def _load_sector_map(self):
+        cfg = self.stock_db["Configs"].find_one({"type": "ticker_lists"})
+        if not cfg:
+            print("⚠️ PhaseCalcDB: Configs 未找到，sector_map 為空")
+            return
+
+        sector_map = {}
+        for line in cfg.get("lists", {}).get("list_3", []):
+            sector, tickers, _ = _parse_list3_line(line)
+            if sector and tickers:
+                for t in tickers:
+                    sector_map[t.upper()] = sector.upper()
+
+        self._sector_map = sector_map
+        print(f"✅ PhaseCalcDB: List3 sector_map 加載完成，共 {len(sector_map)} 個映射")
+
+    def fetch_sector_model_pool(self) -> List[str]:
+        """
+        v2.4 核心：從 CommData.Configs.free_models_registry 讀取完整候選池。
+        排序規則：
+          1. active_phase_primary=True 的模型排最前面
+          2. 其餘模型依原始順序排列
+        返回 model_id 列表，空列表代表無可用模型。
+        """
+        try:
+            doc = self.comm_db["Configs"].find_one({"type": "free_models_registry"})
+            if not doc:
+                print("  ⚠️ CommData.Configs: free_models_registry 不存在")
+                return []
+
+            models = doc.get("models", [])
+            primary   = []
+            secondary = []
+
+            for m in models:
+                mid = m.get("model_id", "").strip()
+                if not mid:
+                    continue
+                if m.get("active_phase_primary"):
+                    primary.append(mid)
+                else:
+                    secondary.append(mid)
+
+            pool = primary + secondary
+            print(f"  📋 候選池載入：{len(primary)} 個 primary + {len(secondary)} 個備選，共 {len(pool)} 個")
+            return pool
+
+        except Exception as e:
+            print(f"  ⚠️ fetch_sector_model_pool 異常: {e}")
+            return []
+
+    def is_list_ticker(self, ticker: str) -> bool:
+        return ticker.upper() in self._list_tickers
+
+    def get_sector_etf(self, ticker: str) -> Optional[str]:
+        t = ticker.upper()
+        if t in self._sector_map:
+            return self._sector_map[t]
+        doc = self.stock_db["Ticker_Sector_Map"].find_one({"ticker": t})
+        if doc:
+            return doc.get("sector_etf")
+        return None
+
+    def save_sector_mapping(self, ticker: str, sector_etf: Optional[str], source: str = "openrouter"):
+        t   = ticker.upper()
+        col = self.stock_db["Ticker_Sector_Map"]
+        existing = col.find_one({"ticker": t})
+
+        if existing is None:
+            col.insert_one({
+                "ticker":      t,
+                "sector_etf":  sector_etf,
+                "source":      source,
+                "conflict":    False,
+                "created_at":  datetime.now(EST_TZ),
+                "updated_at":  datetime.now(EST_TZ),
+            })
+        else:
+            existing_val = existing.get("sector_etf")
+            if existing_val != sector_etf:
+                self.stock_db["Ticker_Sector_Conflicts"].insert_one({
+                    "ticker":      t,
+                    "original":    existing_val,
+                    "new_value":   sector_etf,
+                    "detected_at": datetime.now(EST_TZ),
+                })
+                col.update_one(
+                    {"ticker": t},
+                    {"$set": {"conflict": True, "updated_at": datetime.now(EST_TZ)}}
+                )
+                print(f"  ⚠️ 板塊映射衝突 {t}: {existing_val} vs {sector_etf}，已記錄，保留原值")
+
+    def save_sector_mappings_batch(self, mappings: Dict[str, Optional[str]]):
+        for ticker, sector_etf in mappings.items():
+            try:
+                self.save_sector_mapping(ticker, sector_etf)
+            except Exception as e:
+                print(f"  ⚠️ 保存板塊映射失敗 {ticker}: {e}")
+
+    def get_sector_fail_streak(self) -> int:
+        doc = self.get_progress()
+        return doc.get("sector_fail_streak", 0)
+
+    def update_sector_fail_streak(self, success: bool) -> int:
+        col = self.stock_db["Phase_Calc_Progress"]
+        new_streak = 0 if success else self.get_sector_fail_streak() + 1
+        col.update_one(
+            {"run_id": self.RUN_ID},
+            {"$set": {
+                "sector_fail_streak":        new_streak,
+                "sector_fail_last_updated":  datetime.now(EST_TZ),
+            }},
+            upsert=True
+        )
+        return new_streak
+
+    def save_phase_events(self, ticker: str, events: List[dict]):
+        if not events:
+            return
+        col  = self.stock_db["Phase_History"]
+        now  = datetime.now(EST_TZ)
+        docs = []
+        for ev in events:
+            ind = ev.get("indicators", {})
+            docs.append({
+                "ticker":         ticker,
+                "date":           ev["date"],
+                "timeframe":      ev["timeframe"],
+                "prev_phase":     ev["prev_phase"],
+                "new_phase":      ev["new_phase"],
+                "phase_M":        ev.get("phase_M", "UNKNOWN"),
+                "phase_W":        ev.get("phase_W", "UNKNOWN"),
+                "phase_D":        ev.get("phase_D", "UNKNOWN"),
+                "pattern":        ev.get("pattern", ""),
+                "round":          ev.get("round", 1),
+                "spy_phase_M":    ev.get("spy_phase_M"),
+                "spy_phase_W":    ev.get("spy_phase_W"),
+                "spy_phase_D":    ev.get("spy_phase_D"),
+                "sector_etf":     ev.get("sector_etf"),
+                "sector_phase_M": ev.get("sector_phase_M"),
+                "sector_phase_W": ev.get("sector_phase_W"),
+                "sector_phase_D": ev.get("sector_phase_D"),
+                "indicators":     ind,
+                "created_at":     now,
+            })
+
+        if not docs:
+            return
+        try:
+            upserted = 0
+            modified = 0
+            for doc in docs:
+                r = col.update_one(
+                    {"ticker": doc["ticker"], "timeframe": doc["timeframe"], "date": doc["date"]},
+                    {"$set": doc},
+                    upsert=True,
+                )
+                if r.upserted_id:
+                    upserted += 1
+                elif r.modified_count:
+                    modified += 1
+            print(f"  📝 Phase_History upsert {ticker}: 新增 {upserted} 條，更新 {modified} 條")
+        except Exception as e:
+            print(f"  ❌ Phase_History 寫入 {ticker} 異常: {e}")
+
+    def get_progress(self) -> dict:
+        col = self.stock_db["Phase_Calc_Progress"]
+        doc = col.find_one({"run_id": self.RUN_ID})
+        return doc or {}
+
+    def is_done(self) -> bool:
+        doc = self.get_progress()
+        return doc.get("status") in ("done", "all_rounds_done")
+
+    def get_current_round(self) -> int:
+        return self.get_progress().get("current_round", 1)
+
+    def get_max_round(self) -> int:
+        return self.get_progress().get("max_round", MAX_ROUND)
+
+    def advance_round(self) -> str:
+        col = self.stock_db["Phase_Calc_Progress"]
+        doc = self.get_progress()
+
+        current_round = doc.get("current_round", 1)
+        max_round     = doc.get("max_round", MAX_ROUND)
+        history       = doc.get("round_history", [])
+
+        history.append({
+            "round":        current_round,
+            "completed_at": datetime.now(EST_TZ).isoformat(),
+            "total":        doc.get("total_tickers", 0),
+        })
+
+        next_round = current_round + 1
+        if next_round > max_round:
+            col.update_one(
+                {"run_id": self.RUN_ID},
+                {"$set": {
+                    "status":        "all_rounds_done",
+                    "round_history": history,
+                    "last_updated":  datetime.now(EST_TZ),
+                }},
+                upsert=True
+            )
+            print(f"🏁 全部 {max_round} 輪相位計算完成")
+            return "ALL_ROUNDS_DONE"
+        else:
+            col.update_one(
+                {"run_id": self.RUN_ID},
+                {"$set": {
+                    "current_round":     next_round,
+                    "completed_tickers": [],
+                    "completed_count":   0,
+                    "status":            "running",
+                    "round_history":     history,
+                    "last_updated":      datetime.now(EST_TZ),
+                }},
+                upsert=True
+            )
+            print(f"🔄 第 {current_round} 輪完成，進入第 {next_round} 輪")
+            return "NEXT_ROUND"
+
+    def is_all_rounds_done(self) -> bool:
+        return self.get_progress().get("status") == "all_rounds_done"
+
+    def mark_done(self):
+        col = self.stock_db["Phase_Calc_Progress"]
+        col.update_one(
+            {"run_id": self.RUN_ID},
+            {"$set": {"status": "done", "last_updated": datetime.now(EST_TZ)}},
+            upsert=True
+        )
+
+    def reset_progress(self):
+        col = self.stock_db["Phase_Calc_Progress"]
+        col.delete_one({"run_id": self.RUN_ID})
+        print(f"🔄 Phase_Calc_Progress 已重置")
+
+    def get_scan_status(self) -> str:
+        return self.get_progress().get("scan_status", "scanning")
+
+    def save_scanned_tickers(self, tickers: List[str]):
+        col = self.stock_db["Phase_Calc_Progress"]
+        col.update_one(
+            {"run_id": self.RUN_ID},
+            {"$set": {
+                "scan_status":   "calculating",
+                "all_tickers":   tickers,
+                "total_tickers": len(tickers),
+                "current_round": 1,
+                "max_round":     MAX_ROUND,
+                "round_history": [],
+                "status":        "running",
+                "last_updated":  datetime.now(EST_TZ),
+            }},
+            upsert=True
+        )
+        print(f"✅ 目錄掃描完成，共 {len(tickers)} 個 ticker，切換到計算階段")
+
+    def reset_scan(self):
+        col = self.stock_db["Phase_Calc_Progress"]
+        col.update_one(
+            {"run_id": self.RUN_ID},
+            {"$set": {
+                "scan_status":   "scanning",
+                "all_tickers":   [],
+                "total_tickers": 0,
+                "last_updated":  datetime.now(EST_TZ),
+            }},
+            upsert=True
+        )
+        print(f"🔄 掃描進度已重置（計算進度保留）")
+
+    def get_cached_tickers(self) -> List[str]:
+        return self.get_progress().get("all_tickers", [])
+
+    def get_completed_tickers(self) -> set:
+        return set(self.get_progress().get("completed_tickers", []))
+
+    def get_total_tickers(self) -> int:
+        return self.get_progress().get("total_tickers", 0)
+
+    def update_progress(self, completed_tickers: set):
+        col   = self.stock_db["Phase_Calc_Progress"]
+        tlist = sorted(list(completed_tickers))
+        col.update_one(
+            {"run_id": self.RUN_ID},
+            {"$set": {
+                "completed_tickers": tlist,
+                "completed_count":   len(tlist),
+                "status":            "running",
+                "last_updated":      datetime.now(EST_TZ),
+            }},
+            upsert=True
+        )
+
+
+# ─────────────────────────────────────────────
+# 單 ticker 計算邏輯
+# ─────────────────────────────────────────────
+
+
+def calc_phase_for_ticker(
+    ticker: str,
+    db: PhaseCalcDB,
+    current_round: int,
+    spy_phase_df: Optional[pd.DataFrame],
+    sector_phase_cache: Dict[str, Optional[pd.DataFrame]],
+) -> Optional[List[dict]]:
+    df_m = load_bars(ticker, "M")
+    df_w = load_bars(ticker, "W")
+    df_d = load_bars(ticker, "D")
+
+    if df_m is None or df_w is None or df_d is None:
+        missing = [tf for tf, df in [("M", df_m), ("W", df_w), ("D", df_d)] if df is None]
+        print(f"  ⏭️  {ticker}: 數據缺失 {missing}，跳過")
+        return None
+
+    try:
+        events_m = calc_phase_events(df_m, "M")
+        events_w = calc_phase_events(df_w, "W")
+        events_d = calc_phase_events(df_d, "D")
+    except Exception as e:
+        print(f"  ❌ {ticker}: 計算相位事件異常: {e}")
+        return None
+
+    all_events = events_m + events_w + events_d
+
+    if all_events:
+        all_events_sorted = sorted(all_events, key=lambda x: (x["date"], x["timeframe"]))
+        enriched = enrich_with_context(all_events_sorted, events_m, events_w, events_d)
+    else:
+        enriched = []
+
+    if current_round >= 2 and enriched:
+        sector_etf      = db.get_sector_etf(ticker)
+        sector_phase_df = sector_phase_cache.get(sector_etf) if sector_etf else None
+        enriched = enrich_with_environment(
+            enriched,
+            spy_phase_df    = spy_phase_df,
+            sector_etf      = sector_etf,
+            sector_phase_df = sector_phase_df,
+            current_round   = current_round,
+        )
+
+    if enriched and db.is_list_ticker(ticker):
+        db.save_phase_events(ticker, enriched)
+
+    print(f"  ✅ {ticker}: M={len(events_m)} W={len(events_w)} D={len(events_d)} "
+          f"共{len(enriched)}條 R{current_round}")
+    return enriched
+
+
+# ─────────────────────────────────────────────
+# 批次主入口
+# ─────────────────────────────────────────────
+
+
+def run_phase_calc_batch(db: PhaseCalcDB) -> dict:
+    """
+    批次執行相位計算（v2.4 MongoDB 候選池輪替）。
+    """
+    if db.is_done():
+        return {"status": "ALREADY_DONE"}
+
+    scan_status   = db.get_scan_status()
+    current_round = db.get_current_round()
+
+    # ═══════════════════════════════
+    # 階段一：SCANNING
+    # ═══════════════════════════════
+    if scan_status == "scanning":
+        print(f"📂 目錄掃描開始（cursor 翻頁模式）...")
+
+        result = _hf_scan_all_tickers(HF_TICKER_DIR)
+
+        if result["error"] and len(result["tickers"]) == 0:
+            print(f"⚠️ 掃描失敗且無數據，下次重試")
+            return {"status": "SCAN_ERROR"}
+
+        tickers = result["tickers"]
+        print(f"✅ 掃描完成：{result['pages']} 頁，{result['total_items']} items，"
+              f"{len(tickers)} 個有效 ticker")
+
+        if len(tickers) == 0:
+            print("❌ 掃描完成但 ticker 列表為空")
+            return {"status": "SCAN_ERROR"}
+
+        db.save_scanned_tickers(tickers)
+        scan_status = "calculating"
+
+    # ═══════════════════════════════
+    # 階段二：CALCULATING
+    # ═══════════════════════════════
+    completed   = db.get_completed_tickers()
+    all_tickers = db.get_cached_tickers()
+
+    if not all_tickers:
+        print("⚠️ ticker 列表為空（掃描狀態異常），重置掃描")
+        db.reset_scan()
+        return {"status": "SCAN_ERROR"}
+
+    remaining = [t for t in all_tickers if t not in completed]
+
+    if not remaining:
+        advance_result = db.advance_round()
+        if advance_result == "ALL_ROUNDS_DONE":
+            return {
+                "status":          "ALL_ROUNDS_DONE",
+                "round":           current_round,
+                "total_tickers":   len(all_tickers),
+                "completed_count": len(completed),
+            }
+        else:
+            return {
+                "status":          "ALL_DONE",
+                "round":           current_round,
+                "next_round":      db.get_current_round(),
+                "total_tickers":   len(all_tickers),
+                "completed_count": len(completed),
+            }
+
+    batch = remaining[:PHASE_CALC_BATCH_SIZE]
+    print(f"🔄 R{current_round} 相位計算 | "
+          f"已完成 {len(completed)}/{len(all_tickers)} | 本批: {len(batch)} 個")
+
+    # ── Round 2：預加載 SPY + 板塊 ETF phase.csv ──
+    spy_phase_df       = None
+    sector_phase_cache = {}
+
+    if current_round >= 2:
+        print(f"  📥 R2：加載 SPY phase.csv...")
+        spy_phase_df = load_phase_csv("SPY")
+        if spy_phase_df is None:
+            print(f"  ⚠️ SPY phase.csv 不存在，SPY 相位將為 UNKNOWN")
+
+        needed_sectors = set()
+        for ticker in batch:
+            sector = db.get_sector_etf(ticker)
+            if sector:
+                needed_sectors.add(sector)
+
+        for sector in needed_sectors:
+            if sector not in sector_phase_cache:
+                print(f"  📥 加載 {sector} phase.csv...")
+                sector_phase_cache[sector] = load_phase_csv(sector)
+
+    # ── 計算本批 ──
+    hf_files              = []
+    batch_success         = []
+    unknown_sector_tickers = []
+
+    for ticker in batch:
+        try:
+            enriched = calc_phase_for_ticker(
+                ticker, db, current_round, spy_phase_df, sector_phase_cache
+            )
+
+            if current_round >= 2:
+                sector = db.get_sector_etf(ticker)
+                if sector is None and ticker not in db._sector_map:
+                    cached = db.stock_db["Ticker_Sector_Map"].find_one(
+                        {"ticker": ticker.upper()}
+                    )
+                    if cached is None:
+                        unknown_sector_tickers.append(ticker)
+
+            if enriched is not None and len(enriched) > 0:
+                file_entry = _build_phase_file(ticker, enriched, current_round)
+                if file_entry:
+                    hf_files.append(file_entry)
+            batch_success.append(ticker)
+        except Exception as e:
+            print(f"  ❌ {ticker} 異常（跳過）: {e}")
+            batch_success.append(ticker)
+
+    # ── HF commit ──
+    commit_ok = True
+    if hf_files:
+        print(f"📤 HF batch commit：{len(hf_files)} 個文件...")
+        commit_ok = _hf_batch_commit(
+            hf_files,
+            commit_message=f"phase_calc R{current_round} batch {len(hf_files)} tickers"
+        )
+
+    if not commit_ok:
+        print(f"⚠️ HF commit 失敗，本批進度不推進，下次重試（{len(batch)} 個 ticker）")
+        return {
+            "status":          "COMMIT_FAILED",
+            "round":           current_round,
+            "batch_size":      len(batch),
+            "completed_count": len(completed),
+            "total_tickers":   len(all_tickers),
+        }
+
+    # ── 推進進度 ──
+    completed.update(batch_success)
+    db.update_progress(completed)
+
+    new_remaining = len(all_tickers) - len(completed)
+    print(f"💾 R{current_round} 進度保存：已完成 {len(completed)}/{len(all_tickers)}，剩餘 {new_remaining}")
+
+    # ── Round 2：OpenRouter 候選池查詢（v2.4）──
+    if current_round >= 2 and unknown_sector_tickers:
+        print(f"  🔍 OpenRouter 查詢 {len(unknown_sector_tickers)} 個未知板塊 ticker...")
+        mappings = _query_sector_via_openrouter(unknown_sector_tickers, db)
+
+        if mappings:
+            db.save_sector_mappings_batch(mappings)
+            print(f"  💾 板塊映射已保存：{len(mappings)} 個")
+            db.update_sector_fail_streak(success=True)
+        else:
+            streak = db.update_sector_fail_streak(success=False)
+            print(f"  ⚠️ 本批 OpenRouter 板塊查詢完全失敗，連續失敗 batch 數：{streak}")
+
+            if streak >= SECTOR_FAIL_ALERT_THRESHOLD:
+                alert_text = (
+                    f"⚠️ OpenClaw phase_calc 板塊分類連續失敗\n"
+                    f"連續 {streak} 個 batch，候選池所有模型均失敗\n"
+                    f"輪次: R{current_round}\n"
+                    f"建議：至 AC 模型管理介面更新 free_models_registry，"
+                    f"或檢查 OPENROUTER_API_KEY 是否有效"
+                )
+                _send_telegram_alert(alert_text)
+                db.update_sector_fail_streak(success=True)
+
+    return {
+        "status":          "BATCH_DONE",
+        "round":           current_round,
+        "completed_count": len(completed),
+        "total_tickers":   len(all_tickers),
+        "remaining":       new_remaining,
+        "batch_success":   len(batch_success),
+        "hf_files":        len(hf_files),
+    }
+
+
+=== run_mp_dow_structure.py ===
+"""
+run_mp_dow_structure.py — BC job2：MP 道氏結構計算 v1.0
+
+職責（只做一件事）：
+  讀 HF mp_data/ticker/XXX/d.csv
+  → 計算 D1/W1 道氏趨勢結構
+  → 寫 mp_data/ticker/XXX/structure.json（覆蓋，最新狀態）
+
+不做的事：
+  - 不計算指標（由 run_mp_indicator_calc.py 負責）
+  - 不計算 phase（由 run_phase_calc.py 負責）
+  - 不寫 indicators.csv
+
+並行說明：
+  與 run_mp_indicator_calc.py 並行執行（job1 + job2 同時跑）。
+  兩者均只讀 d.csv，輸出文件不同，無衝突。
+  HF commit 共 ~84 次 < 128次/小時上限，安全。
+
+未收盤 bar 保護：
+  讀 mp_data/meta/daily_status.json
+  is_week_complete=false → W1 道氏結構跳過，dow_trend_w1=null
+
+道氏算法：
+  與 DC tasks/dow_structure.py 完全一致（禁止跨文件 import，複製核心函數）。
+  fractal 右側保護：range(2, n-2)（不是 CFET 的 n-3）。
+  bars 輸入：新在前 list，每個 bar {"h": float, "l": float, "t": str}。
+
+進度追蹤：
+  StockData.System_State  id="mp_dow_structure"
+  每天重置：date ≠ 今天 → 清空 completed_tickers
+
+環境變量（GitHub Actions Secrets）：
+  HF_TOKEN   → HF Dataset 讀寫
+  HF_REPO_ID → HF Dataset repo
+  MONGO_URI  → MongoDB 進度存取
+
+Python 3.9 兼容。
+"""
+
+import os
+import io
+import re
+import sys
+import json
+import base64
+import time
+from datetime import datetime
+from typing import Optional, List
+
+import requests
+import pandas as pd
+import pymongo
+import pytz
+
+# ─────────────────────────────────────────────
+# 常數
+# ─────────────────────────────────────────────
+
+HF_REPO_ID    = os.getenv("HF_REPO_ID", "zhujun0511-AI/ai-telegram-bot-dataset")
+HF_API_BASE   = "https://huggingface.co/api/datasets"
+HF_TICKER_DIR = "mp_data/ticker"
+HF_META_DIR   = "mp_data/meta"
+
+BATCH_SIZE         = 200
+SLEEP_AFTER_COMMIT = 2.0
+
+EST_TZ       = pytz.timezone("US/Eastern")
+PROGRESS_KEY = "mp_dow_structure"
+
+
+# ─────────────────────────────────────────────
+# 環境變量讀取
+# ─────────────────────────────────────────────
+
+def _hf_token() -> str:
+    return os.getenv("HF_TOKEN", "")
+
+def _hf_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_hf_token()}",
+        "Content-Type":  "application/json",
+    }
+
+def _mongo_uri() -> str:
+    return os.getenv("MONGO_URI", "")
+
+
+# ─────────────────────────────────────────────
+# MongoDB 進度追蹤（與 run_mp_indicator_calc.py 結構一致）
+# ─────────────────────────────────────────────
+
+class ProgressDB:
+    def __init__(self):
+        uri = _mongo_uri()
+        if not uri:
+            raise RuntimeError("MONGO_URI 未設定")
+        self.client = pymongo.MongoClient(uri)
+        self.col    = self.client["StockData"]["System_State"]
+
+    def _today(self) -> str:
+        return datetime.now(EST_TZ).strftime("%Y-%m-%d")
+
+    def _now_iso(self) -> str:
+        return datetime.now(EST_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def get(self) -> dict:
+        doc = self.col.find_one({"id": PROGRESS_KEY})
+        return doc or {}
+
+    def reset_if_new_day(self, all_tickers: list) -> dict:
+        today = self._today()
+        doc   = self.get()
+        if doc.get("date") != today:
+            print(f"📅 [進度] 新的一天（{today}），重置進度，共 {len(all_tickers)} 個 ticker")
+            new_doc = {
+                "id":                PROGRESS_KEY,
+                "date":              today,
+                "status":            "running",
+                "all_tickers":       all_tickers,
+                "total_tickers":     len(all_tickers),
+                "completed_tickers": [],
+                "completed_count":   0,
+                "last_updated":      self._now_iso(),
+            }
+            self.col.update_one(
+                {"id": PROGRESS_KEY},
+                {"$set": new_doc},
+                upsert=True,
+            )
+            return new_doc
+        else:
+            print(f"📅 [進度] 今天（{today}），斷點續跑，"
+                  f"已完成 {doc.get('completed_count', 0)}/{doc.get('total_tickers', 0)}")
+            return doc
+
+    def save_all_tickers(self, all_tickers: list):
+        self.col.update_one(
+            {"id": PROGRESS_KEY},
+            {"$set": {
+                "all_tickers":   all_tickers,
+                "total_tickers": len(all_tickers),
+                "last_updated":  self._now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def update_completed(self, completed: set):
+        self.col.update_one(
+            {"id": PROGRESS_KEY},
+            {"$set": {
+                "completed_tickers": sorted(list(completed)),
+                "completed_count":   len(completed),
+                "status":            "running",
+                "last_updated":      self._now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def mark_done(self):
+        self.col.update_one(
+            {"id": PROGRESS_KEY},
+            {"$set": {"status": "done", "last_updated": self._now_iso()}},
+            upsert=True,
+        )
+
+    def close(self):
+        self.client.close()
+
+
+# ─────────────────────────────────────────────
+# HF Dataset 工具
+# ─────────────────────────────────────────────
+
+def _hf_download(path: str) -> Optional[bytes]:
+    url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{path}"
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {_hf_token()}"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.content
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                print(f"⚠️ [HF] 下載 429，等待 70 秒重試: {path}")
+                time.sleep(70)
+                continue
+            print(f"⚠️ [HF] 下載失敗 {resp.status_code}: {path}")
+            return None
+        except Exception as e:
+            print(f"❌ [HF] 下載異常 {path}: {e}")
+            return None
+    return None
+
+
+def _hf_batch_commit(files: list, message: str) -> bool:
+    if not files:
+        return True
+    try:
+        file_payloads = [
+            {"path": f["path"], "content": f["content_b64"], "encoding": "base64"}
+            for f in files
+        ]
+        url     = f"{HF_API_BASE}/{HF_REPO_ID}/commit/main"
+        payload = {"summary": message, "files": file_payloads}
+        for attempt in range(2):
+            resp = requests.post(url, headers=_hf_headers(), json=payload, timeout=120)
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429:
+                print(f"⚠️ [HF] commit 429，等待 70 秒重試")
+                time.sleep(70)
+                continue
+            print(f"❌ [HF] commit 失敗 {resp.status_code}: {resp.text[:200]}")
+            return False
+        return False
+    except Exception as e:
+        print(f"❌ [HF] commit 異常: {e}")
+        return False
+
+
+def _hf_scan_ticker_dirs() -> list:
+    all_tickers = []
+    next_url = (
+        f"{HF_API_BASE}/{HF_REPO_ID}/tree/main/{HF_TICKER_DIR}"
+        f"?recursive=false&expand=false"
+    )
+    page = 0
+    while next_url:
+        try:
+            resp = requests.get(next_url, headers=_hf_headers(), timeout=30)
+            if resp.status_code == 429:
+                print(f"⚠️ [掃描] 429，等待 70 秒重試（第 {page+1} 頁）")
+                time.sleep(70)
+                resp = requests.get(next_url, headers=_hf_headers(), timeout=30)
+            if resp.status_code != 200:
+                print(f"❌ [掃描] 失敗 {resp.status_code}（第 {page+1} 頁）")
+                break
+            items = resp.json()
+            if not isinstance(items, list):
+                break
+            page += 1
+            dirs = [
+                item["path"].split("/")[-1]
+                for item in items
+                if item.get("type") == "directory"
+                and "_" not in item["path"].split("/")[-1]
+            ]
+            all_tickers.extend(dirs)
+            print(f"  📄 掃描第 {page} 頁：{len(items)} items，"
+                  f"{len(dirs)} 個 ticker，累計 {len(all_tickers)}")
+            link = resp.headers.get("Link", "")
+            m    = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            next_url = m.group(1) if m else None
+        except Exception as e:
+            print(f"❌ [掃描] 異常（第 {page+1} 頁）: {e}")
+            break
+    print(f"✅ [掃描] 完成：共 {len(all_tickers)} 個 ticker，{page} 頁")
+    return all_tickers
+
+
+# ─────────────────────────────────────────────
+# daily_status.json 讀取
+# ─────────────────────────────────────────────
+
+def _load_daily_status() -> dict:
+    raw = _hf_download(f"{HF_META_DIR}/daily_status.json")
+    if raw is None:
+        print("⚠️ [daily_status] 文件不存在，W1 道氏結構將完整計算（不截斷）")
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ [daily_status] 解析失敗: {e}，W1 不截斷")
+        return {}
+
+
+# ─────────────────────────────────────────────
+# 數據讀取與 resample
+# ─────────────────────────────────────────────
+
+def _read_d_csv(ticker: str) -> Optional[pd.DataFrame]:
+    path = f"{HF_TICKER_DIR}/{ticker}/d.csv"
+    raw  = _hf_download(path)
+    if raw is None:
+        return None
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+        df.columns = [c.lower() for c in df.columns]
+        required = {"date", "open", "high", "low", "close", "volume"}
+        if not required.issubset(set(df.columns)):
+            return None
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        df = df.sort_values("date").reset_index(drop=True)
+        if len(df) < 20:
+            return None
+        return df
+    except Exception as e:
+        print(f"  ❌ {ticker}: d.csv 解析失敗: {e}")
+        return None
+
+
+def _resample_weekly(df_d: pd.DataFrame) -> pd.DataFrame:
+    """日線 → 週線（W-MON 錨點，與 mp_reorganize 一致）。"""
+    df = df_d.copy()
+    df = df.set_index("date")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+    resampled = df.resample("W-MON", label="left", closed="left").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
+    resampled = resampled.reset_index()
+    resampled["date"] = resampled["date"].dt.strftime("%Y-%m-%d")
+    return resampled[["date", "open", "high", "low", "close", "volume"]]
+
+
+# ─────────────────────────────────────────────
+# 道氏結構算法（完整複製自 DC tasks/dow_structure.py）
+# 禁止跨文件 import，必須在此處複製
+# ─────────────────────────────────────────────
+
+def _find_top_fractals(bars_raw: list) -> list:
+    """
+    掃描頂部 fractal。
+    bars_raw：新在前，每個 bar {"h": float, "l": float, "t": str}。
+    右側保護：range(2, n-2)（道氏用 n-2，不是 CFET 的 n-3）。
+    """
+    n      = len(bars_raw)
+    result = []
+    for i in range(2, n - 2):
+        if (bars_raw[i]["h"] > bars_raw[i-1]["h"] and
+                bars_raw[i]["h"] > bars_raw[i-2]["h"] and
+                bars_raw[i]["h"] > bars_raw[i+1]["h"] and
+                bars_raw[i]["h"] > bars_raw[i+2]["h"]):
+            result.append({"type": "H", "price": bars_raw[i]["h"],
+                            "time": bars_raw[i]["t"], "bar_idx": i})
+    return result
+
+
+def _find_bot_fractals(bars_raw: list) -> list:
+    """掃描底部 fractal，右側保護同 n-2。"""
+    n      = len(bars_raw)
+    result = []
+    for i in range(2, n - 2):
+        if (bars_raw[i]["l"] < bars_raw[i-1]["l"] and
+                bars_raw[i]["l"] < bars_raw[i-2]["l"] and
+                bars_raw[i]["l"] < bars_raw[i+1]["l"] and
+                bars_raw[i]["l"] < bars_raw[i+2]["l"]):
+            result.append({"type": "L", "price": bars_raw[i]["l"],
+                            "time": bars_raw[i]["t"], "bar_idx": i})
+    return result
+
+
+def _merge_and_deduplicate(tops: list, bots: list) -> list:
+    """
+    合併頂底 fractal，按 bar_idx 降序（舊在前），相鄰同向只保留最極端點。
+    bar_idx 大 = 舊，降序排列後才能正確標記 HH/HL/LH/LL。
+    """
+    merged = sorted(tops + bots, key=lambda x: x["bar_idx"], reverse=True)
+    if not merged:
+        return []
+    deduped = [merged[0]]
+    for point in merged[1:]:
+        last = deduped[-1]
+        if last["type"] == point["type"]:
+            # 同向，保留最極端
+            if point["type"] == "H" and point["price"] > last["price"]:
+                deduped[-1] = point
+            elif point["type"] == "L" and point["price"] < last["price"]:
+                deduped[-1] = point
+        else:
+            deduped.append(point)
+    return deduped
+
+
+def _label_swing_points(points: list) -> list:
+    """
+    標記 HH / HL / LH / LL。
+    輸入必須是舊在前（_merge_and_deduplicate 輸出）。
+    """
+    labeled = []
+    tops    = [p for p in points if p["type"] == "H"]
+    bots    = [p for p in points if p["type"] == "L"]
+
+    for point in points:
+        p = dict(point)
+        if point["type"] == "H":
+            idx_in_tops = tops.index(point)
+            if idx_in_tops == 0:
+                p["label"] = "?"
+            else:
+                prev_top = tops[idx_in_tops - 1]
+                p["label"] = "HH" if point["price"] > prev_top["price"] else "LH"
+        else:
+            idx_in_bots = bots.index(point)
+            if idx_in_bots == 0:
+                p["label"] = "?"
+            else:
+                prev_bot = bots[idx_in_bots - 1]
+                p["label"] = "HL" if point["price"] > prev_bot["price"] else "LL"
+        labeled.append(p)
+    return labeled
+
+
+def _determine_trend(labeled: list) -> dict:
+    """根據最新頂+最新底的 label 組合判定趨勢。"""
+    tops = [p for p in labeled if p["type"] == "H" and p.get("label") in ("HH", "LH")]
+    bots = [p for p in labeled if p["type"] == "L" and p.get("label") in ("HL", "LL")]
+
+    if not tops or not bots:
+        return {"trend": "sideways", "reason": "擺動點不足"}
+
+    latest_top = tops[-1]
+    latest_bot = bots[-1]
+    top_label  = latest_top["label"]
+    bot_label  = latest_bot["label"]
+
+    if top_label == "HH" and bot_label == "HL":
+        trend  = "up"
+        reason = f"HH({latest_top['price']:.2f}) + HL({latest_bot['price']:.2f})"
+    elif top_label == "LH" and bot_label == "LL":
+        trend  = "down"
+        reason = f"LH({latest_top['price']:.2f}) + LL({latest_bot['price']:.2f})"
+    else:
+        trend  = "sideways"
+        reason = f"{top_label}({latest_top['price']:.2f}) + {bot_label}({latest_bot['price']:.2f})"
+
+    return {"trend": trend, "reason": reason}
+
+
+def _calculate_dow_structure(bars_raw: list, timeframe: str) -> dict:
+    """
+    道氏趨勢結構計算主入口。
+    bars_raw：新在前，每個 bar {"h": float, "l": float, "t": str}。
+    """
+    empty = {"timeframe": timeframe, "trend": "sideways",
+              "structure": [], "reason": "數據不足"}
+    if not bars_raw or len(bars_raw) < 10:
+        return empty
+    try:
+        tops   = _find_top_fractals(bars_raw)
+        bots   = _find_bot_fractals(bars_raw)
+        merged = _merge_and_deduplicate(tops, bots)
+        if len(merged) < 4:
+            empty["reason"] = f"有效擺動點不足（{len(merged)} 個，需至少 4 個）"
+            return empty
+        labeled = _label_swing_points(merged)
+        result  = _determine_trend(labeled)
+        recent  = labeled[-10:]  # 最近 10 個點
+        return {
+            "timeframe": timeframe,
+            "trend":     result["trend"],
+            "structure": recent,
+            "reason":    result["reason"],
+        }
+    except Exception as e:
+        empty["reason"] = f"計算異常: {e}"
+        return empty
+
+
+def _df_to_bars_raw(df: pd.DataFrame) -> list:
+    """
+    DataFrame（舊在前，全名欄位）→ 新在前 bars_raw list。
+    每個 bar：{"h": float, "l": float, "t": str}
+    """
+    bars = []
+    for _, row in df.iloc[::-1].iterrows():  # 倒序 = 新在前
+        bars.append({
+            "h": float(row["high"]),
+            "l": float(row["low"]),
+            "t": str(row["date"])[:10],
+        })
+    return bars
+
+
+# ─────────────────────────────────────────────
+# 單 ticker 處理
+# ─────────────────────────────────────────────
+
+def _process_ticker(ticker: str,
+                    today_str: str,
+                    is_week_complete: bool) -> Optional[dict]:
+    """
+    處理單個 ticker，返回 {"path": ..., "content_b64": ...} 或 None（跳過）。
+    """
+    df_d = _read_d_csv(ticker)
+    if df_d is None:
+        print(f"  ⚠️ {ticker}: d.csv 缺失或不足，跳過")
+        return None
+
+    # D1 道氏結構
+    bars_d = _df_to_bars_raw(df_d)
+    res_d  = _calculate_dow_structure(bars_d, "D")
+
+    # W1 道氏結構
+    if is_week_complete:
+        try:
+            df_w   = _resample_weekly(df_d)
+            bars_w = _df_to_bars_raw(df_w)
+            res_w  = _calculate_dow_structure(bars_w, "W")
+            w1_note = "完整"
+        except Exception as e:
+            res_w   = {"timeframe": "W", "trend": "sideways", "structure": [], "reason": f"計算異常:{e}"}
+            w1_note = f"W1異常:{e}"
+    else:
+        # 截斷最後一根未收盤週線
+        try:
+            df_w = _resample_weekly(df_d)
+            if len(df_w) > 1:
+                df_w_trimmed = df_w.iloc[:-1].reset_index(drop=True)
+                bars_w = _df_to_bars_raw(df_w_trimmed)
+                res_w  = _calculate_dow_structure(bars_w, "W")
+            else:
+                res_w = {"timeframe": "W", "trend": "sideways", "structure": [], "reason": "週線不足"}
+            w1_note = "截斷(partial)"
+        except Exception as e:
+            res_w   = {"timeframe": "W", "trend": "sideways", "structure": [], "reason": f"計算異常:{e}"}
+            w1_note = f"W1異常:{e}"
+
+    # 組裝 structure.json
+    structure = {
+        "dow_trend_d1":    res_d["trend"],
+        "dow_trend_w1":    res_w["trend"] if is_week_complete else None,
+        "dow_reason_d1":   res_d["reason"],
+        "dow_reason_w1":   res_w["reason"] if is_week_complete else None,
+        "structure_d1":    res_d["structure"],
+        "structure_w1":    res_w["structure"] if is_week_complete else [],
+        "is_week_complete": is_week_complete,
+        "updated_at":      today_str,
+    }
+
+    content_bytes = json.dumps(structure, ensure_ascii=False, indent=2).encode("utf-8")
+    content_b64   = base64.b64encode(content_bytes).decode()
+
+    print(f"  ✅ {ticker} | D1:{res_d['trend']}({res_d['reason'][:30]}) | "
+          f"W1:{res_w['trend'] if is_week_complete else 'SKIP'}({w1_note})")
+
+    return {
+        "path":        f"{HF_TICKER_DIR}/{ticker}/structure.json",
+        "content_b64": content_b64,
+    }
+
+
+# ─────────────────────────────────────────────
+# 主入口
+# ─────────────────────────────────────────────
+
+def main():
+    start_time = time.monotonic()
+    today_str  = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+
+    print(f"🚀 [mp_dow_structure] 開始 | 日期: {today_str}")
+
+    # 初始化進度 DB
+    try:
+        pdb = ProgressDB()
+    except Exception as e:
+        print(f"❌ [mp_dow_structure] MongoDB 連接失敗: {e}")
+        sys.exit(1)
+
+    # 讀 daily_status.json
+    daily_status     = _load_daily_status()
+    is_week_complete = daily_status.get("is_week_complete", True)
+    if not daily_status:
+        print("⚠️ [mp_dow_structure] STATUS_MISSING：W1 不截斷（保守處理）")
+    else:
+        print(f"📋 [mp_dow_structure] daily_status: "
+              f"is_week_complete={is_week_complete} "
+              f"last_w={daily_status.get('last_complete_w_date', 'N/A')}")
+
+    # 讀或重置進度
+    progress    = pdb.get()
+    all_tickers = progress.get("all_tickers", [])
+
+    if not all_tickers:
+        print(f"📂 [mp_dow_structure] 首次運行，掃描 HF ticker 目錄...")
+        all_tickers = _hf_scan_ticker_dirs()
+        if not all_tickers:
+            print("❌ [mp_dow_structure] 掃描結果為空，退出")
+            pdb.close()
+            sys.exit(1)
+        pdb.save_all_tickers(all_tickers)
+        print(f"✅ [mp_dow_structure] 掃描完成，共 {len(all_tickers)} 個 ticker")
+
+    progress  = pdb.reset_if_new_day(all_tickers)
+    completed = set(progress.get("completed_tickers", []))
+    total     = len(all_tickers)
+
+    print(f"📊 [mp_dow_structure] 總計 {total} 個 ticker，已完成 {len(completed)}")
+
+    remaining = [t for t in all_tickers if t not in completed]
+    print(f"▶️  [mp_dow_structure] 剩餘 {len(remaining)} 個 ticker 待處理")
+
+    batch_num  = 0
+    ok_count   = 0
+    skip_count = 0
+    err_count  = 0
+
+    for i in range(0, len(remaining), BATCH_SIZE):
+        batch      = remaining[i: i + BATCH_SIZE]
+        batch_num += 1
+        hf_files   = []
+        batch_ok   = []
+        batch_skip = []
+        batch_err  = []
+
+        print(f"\n🔄 [mp_dow_structure] 批次 {batch_num} | "
+              f"ticker {i+1}~{min(i+BATCH_SIZE, len(remaining))}/{len(remaining)}")
+
+        for ticker in batch:
+            try:
+                result = _process_ticker(ticker, today_str, is_week_complete)
+                if result is not None:
+                    hf_files.append(result)
+                    batch_ok.append(ticker)
+                else:
+                    batch_skip.append(ticker)
+            except Exception as e:
+                print(f"  ❌ {ticker}: 異常: {e}")
+                batch_err.append(ticker)
+
+        if hf_files:
+            commit_msg = (
+                f"mp_dow_structure {today_str} "
+                f"batch {batch_num} ({len(hf_files)} tickers)"
+            )
+            print(f"💾 [mp_dow_structure] commit {len(hf_files)} 個文件...")
+            commit_ok = _hf_batch_commit(hf_files, commit_msg)
+            if commit_ok:
+                print(f"✅ [mp_dow_structure] commit 成功")
+                completed.update(batch_ok)
+                ok_count   += len(batch_ok)
+                skip_count += len(batch_skip)
+                err_count  += len(batch_err)
+                pdb.update_completed(completed)
+                time.sleep(SLEEP_AFTER_COMMIT)
+            else:
+                print(f"❌ [mp_dow_structure] commit 失敗，本批進度不推進")
+        else:
+            completed.update(batch_ok + batch_skip)
+            skip_count += len(batch_skip)
+            err_count  += len(batch_err)
+            pdb.update_completed(completed)
+
+        elapsed = time.monotonic() - start_time
+        print(f"📊 [mp_dow_structure] 進度: {len(completed)}/{total} | "
+              f"本批 OK:{len(batch_ok)} 跳過:{len(batch_skip)} ERR:{len(batch_err)} | "
+              f"耗時 {elapsed:.0f}s")
+
+    pdb.mark_done()
+    pdb.close()
+
+    elapsed_total = time.monotonic() - start_time
+    print(f"\n✅ [mp_dow_structure] 全部完成 | "
+          f"總計 {total} 個 ticker | "
+          f"OK:{ok_count} 跳過:{skip_count} ERR:{err_count} | "
+          f"耗時 {elapsed_total:.0f}s ({elapsed_total/60:.1f}min)")
+
+
+if __name__ == "__main__":
+    main()
+
+
+=== run_mp_fetch.py ===
+"""
+run_mp_fetch.py — BC job：MP 數據拉取 v1.0
+
+職責：
+  從 MarketParquet API 拉取交易日數據，寫到本地 ./staging/ 供後續 job 使用。
+
+模式：
+  daily  — 正常模式。
+           1. 查 MP_Full_Progress 找所有未解決缺口（status partial/failed, resolved=False）
+           2. 自動補缺口 + 今日數據（今日若已 done 則跳過）
+           3. 完整寫 Task_Log + MP_Full_Progress
+
+  rebuild — 備用工具。
+            強制重拉 trading_date 指定的單日，不查缺口，直接覆蓋。
+            用於特殊情況手動修復。
+
+輸出：
+  ./staging/{date}.parquet  每日一個文件
+  ./staging/summary.json    { trading_date, dates_fetched, ticker_counts, skipped }
+
+環境變量（GitHub Actions Secrets）：
+  MP_API_KEY   → MarketParquet API 鑰匙
+  MONGO_URI    → MongoDB 連線
+  TRADING_DATE → 目標交易日（YYYY-MM-DD），workflow input 傳入
+  MODE         → daily / rebuild（預設 daily）
+
+過濾條件（與 DC fetch_mp_full.py 一致）：
+  close > 5.0, volume > 1,000,000
+
+Python 3.9 兼容。
+"""
+
+import io
+import json
+import os
+import sys
+import time
+from datetime import datetime
+
+import pandas as pd
+import pymongo
+import pytz
+import requests
+
+# ─────────────────────────────────────────────
+# 常數
+# ─────────────────────────────────────────────
+
+MP_BASE_URL  = "https://marketparquet.com/api/v1"
+SLEEP_PER_REQ = 1.0
+PRICE_MIN     = 5.0
+VOLUME_MIN    = 1_000_000
+STAGING_DIR   = "./staging"
+
+EST_TZ = pytz.timezone("US/Eastern")
+
+
+# ─────────────────────────────────────────────
+# 環境變量
+# ─────────────────────────────────────────────
+
+def _mp_headers() -> dict:
+    key = os.environ.get("MP_API_KEY", "")
+    return {"Authorization": f"Bearer {key}"}
+
+def _mongo_uri() -> str:
+    return os.environ.get("MONGO_URI", "")
+
+def _trading_date() -> str:
+    return os.environ.get("TRADING_DATE", "")
+
+def _mode() -> str:
+    return os.environ.get("MODE", "daily").lower()
+
+
+# ─────────────────────────────────────────────
+# 時間工具
+# ─────────────────────────────────────────────
+
+def _now_est() -> str:
+    return datetime.now(EST_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+
+def _now_iso() -> str:
+    return datetime.now(EST_TZ).isoformat()
+
+
+# ─────────────────────────────────────────────
+# MongoDB
+# ─────────────────────────────────────────────
+
+class FetchDB:
+    def __init__(self):
+        uri = _mongo_uri()
+        if not uri:
+            raise RuntimeError("MONGO_URI 未設定")
+        self.client    = pymongo.MongoClient(uri)
+        self.stock_db  = self.client["StockData"]
+        self.comm_db   = self.client["CommData"]
+        self.progress  = self.stock_db["MP_Full_Progress"]
+        self.task_log  = self.stock_db["Task_Log"]
+
+    def close(self):
+        self.client.close()
+
+    def get_progress_doc(self, date_str: str) -> dict:
+        doc = self.progress.find_one({"date": date_str})
+        return doc or {}
+
+    def get_unresolved_gaps(self) -> list:
+        """查詢所有未解決缺口（status partial/failed, resolved=False，排除 _ 開頭 key）。"""
+        docs = self.progress.find(
+            {
+                "status": {"$in": ["failed", "partial"]},
+                "resolved": False,
+                "date": {"$not": {"$regex": "^_"}},
+            },
+            {"date": 1, "status": 1},
+            sort=[("date", 1)],
+        )
+        return [d["date"] for d in docs]
+
+    def is_date_done(self, date_str: str) -> bool:
+        doc = self.progress.find_one({"date": date_str}, {"status": 1})
+        return bool(doc) and doc.get("status") == "done"
+
+    def mark_fetched(self, date_str: str, ticker_count: int):
+        self.progress.update_one(
+            {"date": date_str},
+            {"$set": {
+                "date":       date_str,
+                "year":       int(date_str[:4]),
+                "status":     "fetched",
+                "row_count":  ticker_count,
+                "updated_at": _now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def mark_fetch_failed(self, date_str: str, reason: str):
+        self.progress.update_one(
+            {"date": date_str},
+            {"$set": {
+                "date":       date_str,
+                "year":       int(date_str[:4]),
+                "status":     "failed",
+                "reason":     reason,
+                "resolved":   False,
+                "updated_at": _now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def write_task_log(self, task: str, status: str, detail: dict):
+        self.task_log.insert_one({
+            "task":       task,
+            "status":     status,
+            "detail":     detail,
+            "created_at": _now_iso(),
+        })
+
+
+# ─────────────────────────────────────────────
+# MP API：下載單日 Parquet
+# ─────────────────────────────────────────────
+
+def _download_parquet(asset_type: str, date_str: str) -> pd.DataFrame:
+    """下載單日 parquet，返回 DataFrame（失敗返回空 DataFrame）。"""
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                f"{MP_BASE_URL}/download/{asset_type}/{date_str}",
+                headers=_mp_headers(),
+                timeout=30,
+            )
+            time.sleep(SLEEP_PER_REQ)
+
+            if resp.status_code == 429:
+                wait = 60 * (attempt + 1)
+                print(f"  ⚠️ 429 ({asset_type} {date_str})，等待 {wait}s 重試...")
+                time.sleep(wait)
+                continue
+
+            if resp.status_code == 404:
+                print(f"  ℹ️ {asset_type} {date_str}: 404 無數據")
+                return pd.DataFrame()
+
+            if resp.status_code != 200:
+                print(f"  ❌ 取得 download_url 失敗 ({asset_type} {date_str}): {resp.status_code}")
+                return pd.DataFrame()
+
+            download_url = resp.json().get("download_url", "")
+            if not download_url:
+                print(f"  ⚠️ download_url 為空 ({asset_type} {date_str})")
+                return pd.DataFrame()
+
+            parquet_resp = requests.get(download_url, timeout=120)
+            if parquet_resp.status_code != 200:
+                print(f"  ❌ 下載 parquet 失敗 ({asset_type} {date_str}): {parquet_resp.status_code}")
+                return pd.DataFrame()
+
+            return pd.read_parquet(io.BytesIO(parquet_resp.content))
+
+        except Exception as e:
+            print(f"  ❌ 下載異常 ({asset_type} {date_str}) attempt={attempt + 1}: {e}")
+            time.sleep(5)
+
+    return pd.DataFrame()
+
+
+def _fetch_single_date(date_str: str) -> pd.DataFrame:
+    """
+    拉取單日 stock + etf 數據，合併過濾後返回 DataFrame。
+    columns: symbol, date, open, high, low, close, volume（全小寫）
+    """
+    print(f"📥 下載 stock_daily {date_str}...")
+    df_stock = _download_parquet("stock_daily", date_str)
+    if not df_stock.empty:
+        print(f"  ✅ stock_daily {date_str}: {len(df_stock)} rows")
+    else:
+        print(f"  ⚠️ stock_daily {date_str}: 空")
+
+    print(f"📥 下載 etf_daily {date_str}...")
+    df_etf = _download_parquet("etf_daily", date_str)
+    if not df_etf.empty:
+        print(f"  ✅ etf_daily {date_str}: {len(df_etf)} rows")
+    else:
+        print(f"  ⚠️ etf_daily {date_str}: 空")
+
+    frames = [f for f in [df_stock, df_etf] if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [c.lower() for c in df.columns]
+
+    # 標準化欄位
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].str.upper().str.strip()
+    if "date" not in df.columns:
+        df["date"] = date_str
+
+    # 過濾（與 DC 一致）
+    if "close" in df.columns and "volume" in df.columns:
+        before = len(df)
+        df = df[(df["close"] > PRICE_MIN) & (df["volume"] > VOLUME_MIN)]
+        print(f"  🔍 過濾後：{before} → {len(df)} rows")
+
+    # 確保必需欄位存在
+    required = {"symbol", "date", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"  ❌ 缺少欄位: {missing}")
+        return pd.DataFrame()
+
+    df = df[list(required)].copy()
+    df = df.dropna(subset=["symbol", "date"])
+    df = df.reset_index(drop=True)
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# 本地 staging 讀寫
+# ─────────────────────────────────────────────
+
+def _write_staging(date_str: str, df: pd.DataFrame) -> str:
+    """寫入 ./staging/{date}.parquet，返回文件路徑。"""
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    path = os.path.join(STAGING_DIR, f"{date_str}.parquet")
+    df.to_parquet(path, index=False)
+    size_mb = os.path.getsize(path) / 1024 / 1024
+    print(f"  💾 寫入 {path} | {len(df)} rows | {size_mb:.1f} MB")
+    return path
+
+
+def _write_summary(summary: dict):
+    """寫入 ./staging/summary.json。"""
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    path = os.path.join(STAGING_DIR, "summary.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"  📋 summary.json 已寫入: {path}")
+
+
+# ─────────────────────────────────────────────
+# Telegram 告警（通過 COMM_HUB_URL / GAS）
+# ─────────────────────────────────────────────
+
+def _send_telegram(msg: str):
+    url    = os.environ.get("COMM_HUB_URL", "")
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    if not url:
+        print(f"  ⚠️ COMM_HUB_URL 未設定，跳過 Telegram: {msg[:50]}")
+        return
+    try:
+        resp = requests.post(
+            url,
+            json={"message": msg, "secret": secret},
+            timeout=15,
+        )
+        print(f"  📨 Telegram: {resp.status_code}")
+    except Exception as e:
+        print(f"  ⚠️ Telegram 發送失敗: {e}")
+
+
+# ─────────────────────────────────────────────
+# 主邏輯
+# ─────────────────────────────────────────────
+
+def run_daily(db: FetchDB, trading_date: str):
+    """
+    daily 模式：
+    1. 查未解決缺口 → Telegram 告警
+    2. 判斷 trading_date 是否已 done → 跳過
+    3. 確定需要拉取的日期列表（缺口 + 今日）
+    4. 逐日拉取、過濾、寫 staging
+    5. 寫 summary.json + Task_Log + MP_Full_Progress
+    """
+    t_start = time.monotonic()
+    print(f"\n🔄 fetch_mp daily 開始 | 交易日: {trading_date}")
+
+    # 1. 查缺口
+    gaps = db.get_unresolved_gaps()
+    if gaps:
+        print(f"⚠️ 發現 {len(gaps)} 個未解決缺口: {gaps}")
+        _send_telegram(
+            f"⚠️ MP 數據缺口告警\n"
+            f"發現 {len(gaps)} 個未解決缺口：{', '.join(gaps)}\n"
+            f"本次將自動補跑"
+        )
+    else:
+        print("✅ 無未解決缺口")
+
+    # 2. 判斷今日是否已 done
+    today_already_done = db.is_date_done(trading_date)
+    if today_already_done:
+        print(f"✅ {trading_date} 已是 done 狀態，跳過今日拉取")
+
+    # 3. 確定待拉取日期列表（缺口優先，今日排末）
+    pending_dates = list(gaps)
+    if not today_already_done:
+        if trading_date not in pending_dates:
+            pending_dates.append(trading_date)
+
+    if not pending_dates:
+        print(f"✅ 無需拉取（今日已 done，無缺口），直接退出")
+        _write_summary({
+            "trading_date":  trading_date,
+            "dates_fetched": [],
+            "ticker_counts": {},
+            "skipped":       True,
+            "reason":        "already_done_no_gaps",
+        })
+        db.write_task_log("run_mp_fetch", "SKIPPED", {
+            "trading_date": trading_date,
+            "reason":       "already_done_no_gaps",
+        })
+        return
+
+    print(f"📋 待拉取日期（共 {len(pending_dates)} 個）: {pending_dates}")
+
+    # 4. 逐日拉取
+    dates_fetched  = []
+    ticker_counts  = {}
+    failed_dates   = []
+
+    for date_str in pending_dates:
+        print(f"\n── {date_str} ──")
+        df = _fetch_single_date(date_str)
+        if df.empty:
+            print(f"  ❌ {date_str} 拉取失敗或無數據")
+            db.mark_fetch_failed(date_str, "empty_response")
+            failed_dates.append(date_str)
+            continue
+
+        ticker_count = df["symbol"].nunique()
+        print(f"  📊 {date_str}: {ticker_count} 個 ticker，{len(df)} rows")
+
+        _write_staging(date_str, df)
+        db.mark_fetched(date_str, ticker_count)
+
+        dates_fetched.append(date_str)
+        ticker_counts[date_str] = ticker_count
+
+    # 5. 寫 summary.json
+    summary = {
+        "trading_date":  trading_date,
+        "dates_fetched": dates_fetched,
+        "ticker_counts": ticker_counts,
+        "failed_dates":  failed_dates,
+        "skipped":       False,
+    }
+    _write_summary(summary)
+
+    elapsed = time.monotonic() - t_start
+    status  = "SUCCESS" if not failed_dates else "PARTIAL"
+
+    print(f"\n✅ fetch_mp daily 完成 | "
+          f"成功: {len(dates_fetched)} 個日期 | "
+          f"失敗: {len(failed_dates)} 個 | "
+          f"耗時: {elapsed:.0f}s")
+
+    db.write_task_log("run_mp_fetch", status, {
+        "mode":          "daily",
+        "trading_date":  trading_date,
+        "dates_fetched": dates_fetched,
+        "failed_dates":  failed_dates,
+        "ticker_counts": ticker_counts,
+        "elapsed_s":     round(elapsed, 1),
+    })
+
+    if failed_dates:
+        _send_telegram(
+            f"⚠️ MP fetch 部分失敗\n"
+            f"失敗日期: {', '.join(failed_dates)}\n"
+            f"成功: {len(dates_fetched)} 個"
+        )
+
+
+def run_rebuild(db: FetchDB, trading_date: str):
+    """
+    rebuild 模式：
+    強制重拉 trading_date 單日，覆蓋任何現有狀態。
+    用於特殊情況手動修復。
+    """
+    t_start = time.monotonic()
+    print(f"\n🔧 fetch_mp rebuild 開始 | 目標日期: {trading_date}")
+
+    df = _fetch_single_date(trading_date)
+    if df.empty:
+        print(f"❌ {trading_date} 拉取失敗")
+        db.mark_fetch_failed(trading_date, "empty_response_rebuild")
+        _write_summary({
+            "trading_date":  trading_date,
+            "dates_fetched": [],
+            "ticker_counts": {},
+            "failed_dates":  [trading_date],
+            "skipped":       False,
+        })
+        db.write_task_log("run_mp_fetch", "FAILED", {
+            "mode":         "rebuild",
+            "trading_date": trading_date,
+            "reason":       "empty_response",
+        })
+        sys.exit(1)
+
+    ticker_count = df["symbol"].nunique()
+    print(f"📊 {trading_date}: {ticker_count} 個 ticker，{len(df)} rows")
+
+    _write_staging(trading_date, df)
+    db.mark_fetched(trading_date, ticker_count)
+
+    summary = {
+        "trading_date":  trading_date,
+        "dates_fetched": [trading_date],
+        "ticker_counts": {trading_date: ticker_count},
+        "failed_dates":  [],
+        "skipped":       False,
+    }
+    _write_summary(summary)
+
+    elapsed = time.monotonic() - t_start
+    print(f"✅ fetch_mp rebuild 完成 | {ticker_count} 個 ticker | 耗時: {elapsed:.0f}s")
+
+    db.write_task_log("run_mp_fetch", "SUCCESS", {
+        "mode":         "rebuild",
+        "trading_date": trading_date,
+        "ticker_count": ticker_count,
+        "elapsed_s":    round(elapsed, 1),
+    })
+
+
+# ─────────────────────────────────────────────
+# 入口
+# ─────────────────────────────────────────────
+
+def main() -> int:
+    trading_date = _trading_date()
+    mode         = _mode()
+
+    if not trading_date:
+        print("❌ TRADING_DATE 未設定")
+        return 1
+
+    if not os.environ.get("MP_API_KEY"):
+        print("❌ MP_API_KEY 未設定")
+        return 1
+
+    print(f"🚀 run_mp_fetch.py 啟動 | mode={mode} | trading_date={trading_date}")
+
+    try:
+        db = FetchDB()
+    except Exception as e:
+        print(f"❌ 資料庫連線失敗: {e}")
+        return 1
+
+    try:
+        if mode == "rebuild":
+            run_rebuild(db, trading_date)
+        else:
+            run_daily(db, trading_date)
+        return 0
+    except Exception as e:
+        print(f"❌ 執行異常: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+=== run_mp_indicator_calc.py ===
+"""
+run_mp_indicator_calc.py — BC job1：MP 指標計算 v1.0
+
+職責（只做一件事）：
+  讀 HF mp_data/ticker/XXX/d.csv
+  → 計算 D1/W1 技術指標（EMA/ATR/RSI/RVOL/dist 等）
+  → append 一行到 mp_data/ticker/XXX/indicators.csv
+
+不做的事：
+  - 不計算道氏結構（由 run_mp_dow_structure.py 負責）
+  - 不計算 phase（由 run_phase_calc.py 負責）
+  - 不寫 structure.json
+
+觸發方式：
+  DC reorganize wm ALL_DONE → dispatch GitHub Actions mp_nightly.yml → job1
+
+進度追蹤：
+  StockData.System_State  id="mp_indicator_calc"
+  每天重置：date ≠ 今天 → 清空 completed_tickers
+
+未收盤 bar 保護：
+  讀 mp_data/meta/daily_status.json
+  is_week_complete=false → W1 截斷最後一根，W1 欄位留空字串
+  daily_status.json 不存在 → STATUS_MISSING，W1 不截斷，輸出 warning
+
+環境變量（GitHub Actions Secrets）：
+  HF_TOKEN   → HF Dataset 讀寫
+  HF_REPO_ID → HF Dataset repo
+  MONGO_URI  → MongoDB 進度存取
+
+Python 3.9 兼容。
+"""
+
+import os
+import io
+import re
+import sys
+import json
+import base64
+import time
+from datetime import datetime
+from typing import Optional
+
+import requests
+import pandas as pd
+import numpy as np
+import ta
+import pymongo
+import pytz
+
+# ─────────────────────────────────────────────
+# 常數
+# ─────────────────────────────────────────────
+
+HF_REPO_ID    = os.getenv("HF_REPO_ID", "zhujun0511-AI/ai-telegram-bot-dataset")
+HF_API_BASE   = "https://huggingface.co/api/datasets"
+HF_TICKER_DIR = "mp_data/ticker"
+HF_META_DIR   = "mp_data/meta"
+
+BATCH_SIZE    = 200   # 每批 ticker 數，commit 一次
+SLEEP_AFTER_COMMIT = 2.0  # commit 後等待（避免 HF rate limit）
+
+EST_TZ = pytz.timezone("US/Eastern")
+PROGRESS_KEY = "mp_indicator_calc"
+
+# indicators.csv 欄位順序（固定，append 時用）
+INDICATOR_COLS = [
+    "date", "updated_at",
+    # D1
+    "ema9_d1", "ema20_d1", "ema50_d1",
+    "atr22_d1", "atr_ratio_d1",
+    "rsi14_d1", "rvol_d1",
+    "trend_d1",
+    "dist_52h_d", "dist_d1", "dist_pct_rank_60d",
+    "ema9_slope_d1", "ema20_slope_d1",
+    # W1
+    "ema9_w1", "ema20_w1", "ema50_w1",
+    "atr22_w1", "atr_ratio_w1",
+    "rsi14_w1", "rvol_w1",
+    "trend_w1",
+]
+
+
+# ─────────────────────────────────────────────
+# 環境變量讀取
+# ─────────────────────────────────────────────
+
+def _hf_token() -> str:
+    return os.getenv("HF_TOKEN", "")
+
+def _hf_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_hf_token()}",
+        "Content-Type":  "application/json",
+    }
+
+def _mongo_uri() -> str:
+    return os.getenv("MONGO_URI", "")
+
+
+# ─────────────────────────────────────────────
+# MongoDB 進度追蹤
+# ─────────────────────────────────────────────
+
+class ProgressDB:
+    def __init__(self):
+        uri = _mongo_uri()
+        if not uri:
+            raise RuntimeError("MONGO_URI 未設定")
+        self.client = pymongo.MongoClient(uri)
+        self.col    = self.client["StockData"]["System_State"]
+
+    def _today(self) -> str:
+        return datetime.now(EST_TZ).strftime("%Y-%m-%d")
+
+    def _now_iso(self) -> str:
+        return datetime.now(EST_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def get(self) -> dict:
+        doc = self.col.find_one({"id": PROGRESS_KEY})
+        return doc or {}
+
+    def reset_if_new_day(self, all_tickers: list) -> dict:
+        """
+        若今天是新的一天，重置進度。
+        若 all_tickers 已存在且 date=今天，返回現有進度。
+        """
+        today = self._today()
+        doc   = self.get()
+
+        if doc.get("date") != today:
+            print(f"📅 [進度] 新的一天（{today}），重置進度，共 {len(all_tickers)} 個 ticker")
+            new_doc = {
+                "id":                PROGRESS_KEY,
+                "date":              today,
+                "status":            "running",
+                "all_tickers":       all_tickers,
+                "total_tickers":     len(all_tickers),
+                "completed_tickers": [],
+                "completed_count":   0,
+                "last_updated":      self._now_iso(),
+            }
+            self.col.update_one(
+                {"id": PROGRESS_KEY},
+                {"$set": new_doc},
+                upsert=True,
+            )
+            return new_doc
+        else:
+            print(f"📅 [進度] 今天（{today}），斷點續跑，"
+                  f"已完成 {doc.get('completed_count', 0)}/{doc.get('total_tickers', 0)}")
+            return doc
+
+    def save_all_tickers(self, all_tickers: list):
+        """第一批掃描完後，把 all_tickers 存入進度（之後復用，不重掃）。"""
+        self.col.update_one(
+            {"id": PROGRESS_KEY},
+            {"$set": {
+                "all_tickers":   all_tickers,
+                "total_tickers": len(all_tickers),
+                "last_updated":  self._now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def update_completed(self, completed: set):
+        self.col.update_one(
+            {"id": PROGRESS_KEY},
+            {"$set": {
+                "completed_tickers": sorted(list(completed)),
+                "completed_count":   len(completed),
+                "status":            "running",
+                "last_updated":      self._now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def mark_done(self):
+        self.col.update_one(
+            {"id": PROGRESS_KEY},
+            {"$set": {"status": "done", "last_updated": self._now_iso()}},
+            upsert=True,
+        )
+
+    def close(self):
+        self.client.close()
+
+
+# ─────────────────────────────────────────────
+# HF Dataset 工具
+# ─────────────────────────────────────────────
+
+def _hf_download(path: str) -> Optional[bytes]:
+    url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{path}"
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {_hf_token()}"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.content
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                print(f"⚠️ [HF] 下載 429，等待 70 秒重試: {path}")
+                time.sleep(70)
+                continue
+            print(f"⚠️ [HF] 下載失敗 {resp.status_code}: {path}")
+            return None
+        except Exception as e:
+            print(f"❌ [HF] 下載異常: {path}: {e}")
+            return None
+    return None
+
+
+def _hf_batch_commit(files: list, message: str) -> bool:
+    """
+    批次 commit 多個文件到 HF Dataset。
+    files 格式：[{"path": str, "content_b64": str}, ...]
+    """
+    if not files:
+        return True
+    try:
+        file_payloads = [
+            {"path": f["path"], "content": f["content_b64"], "encoding": "base64"}
+            for f in files
+        ]
+        url     = f"{HF_API_BASE}/{HF_REPO_ID}/commit/main"
+        payload = {"summary": message, "files": file_payloads}
+
+        for attempt in range(2):
+            resp = requests.post(url, headers=_hf_headers(), json=payload, timeout=120)
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 429:
+                print(f"⚠️ [HF] commit 429，等待 70 秒重試")
+                time.sleep(70)
+                continue
+            print(f"❌ [HF] commit 失敗 {resp.status_code}: {resp.text[:200]}")
+            return False
+        return False
+    except Exception as e:
+        print(f"❌ [HF] commit 異常: {e}")
+        return False
+
+
+def _hf_scan_ticker_dirs() -> list:
+    """
+    cursor 翻頁掃描 mp_data/ticker/ 所有 ticker 目錄。
+    返回 ticker 名稱列表（排除含底線的異常目錄）。
+    """
+    all_tickers = []
+    next_url = (
+        f"{HF_API_BASE}/{HF_REPO_ID}/tree/main/{HF_TICKER_DIR}"
+        f"?recursive=false&expand=false"
+    )
+    page = 0
+    while next_url:
+        try:
+            resp = requests.get(next_url, headers=_hf_headers(), timeout=30)
+            if resp.status_code == 429:
+                print(f"⚠️ [掃描] 429，等待 70 秒重試（第 {page+1} 頁）")
+                time.sleep(70)
+                resp = requests.get(next_url, headers=_hf_headers(), timeout=30)
+            if resp.status_code != 200:
+                print(f"❌ [掃描] 失敗 {resp.status_code}（第 {page+1} 頁）")
+                break
+            items = resp.json()
+            if not isinstance(items, list):
+                break
+            page += 1
+            dirs = [
+                item["path"].split("/")[-1]
+                for item in items
+                if item.get("type") == "directory"
+                and "_" not in item["path"].split("/")[-1]
+            ]
+            all_tickers.extend(dirs)
+            print(f"  📄 掃描第 {page} 頁：{len(items)} items，"
+                  f"{len(dirs)} 個 ticker，累計 {len(all_tickers)}")
+            # Link header 取下一頁
+            link = resp.headers.get("Link", "")
+            m    = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            next_url = m.group(1) if m else None
+        except Exception as e:
+            print(f"❌ [掃描] 異常（第 {page+1} 頁）: {e}")
+            break
+    print(f"✅ [掃描] 完成：共 {len(all_tickers)} 個 ticker，{page} 頁")
+    return all_tickers
+
+
+# ─────────────────────────────────────────────
+# daily_status.json 讀取
+# ─────────────────────────────────────────────
+
+def _load_daily_status() -> dict:
+    """
+    讀取 HF mp_data/meta/daily_status.json。
+    不存在時返回 {}，調用方需處理 STATUS_MISSING。
+    """
+    raw = _hf_download(f"{HF_META_DIR}/daily_status.json")
+    if raw is None:
+        print("⚠️ [daily_status] 文件不存在，W1 計算將不截斷（保守處理）")
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ [daily_status] 解析失敗: {e}，W1 計算將不截斷")
+        return {}
+
+
+# ─────────────────────────────────────────────
+# 數據讀取與 resample
+# ─────────────────────────────────────────────
+
+def _read_d_csv(ticker: str) -> Optional[pd.DataFrame]:
+    """讀取 d.csv，返回舊在前 DataFrame，欄位為全名（open/high/low/close/volume）。"""
+    path = f"{HF_TICKER_DIR}/{ticker}/d.csv"
+    raw  = _hf_download(path)
+    if raw is None:
+        return None
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+        df.columns = [c.lower() for c in df.columns]
+        required = {"date", "open", "high", "low", "close", "volume"}
+        if not required.issubset(set(df.columns)):
+            print(f"  ⚠️ {ticker}: d.csv 缺少必要欄位")
+            return None
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        df = df.sort_values("date").reset_index(drop=True)
+        if len(df) < 50:
+            return None
+        return df
+    except Exception as e:
+        print(f"  ❌ {ticker}: d.csv 解析失敗: {e}")
+        return None
+
+
+def _resample_weekly(df_d: pd.DataFrame) -> pd.DataFrame:
+    """
+    日線 → 週線（W-MON 錨點）。
+    與 mp_reorganize._resample_weekly 完全一致（禁止跨文件 import，複製）。
+    """
+    df = df_d.copy()
+    df = df.set_index("date")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+    resampled = df.resample("W-MON", label="left", closed="left").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
+    resampled = resampled.reset_index()
+    resampled["date"] = resampled["date"].dt.strftime("%Y-%m-%d")
+    return resampled[["date", "open", "high", "low", "close", "volume"]]
+
+
+# ─────────────────────────────────────────────
+# 指標計算輔助函數（完整借鑒 DC indicator_logic.py）
+# ─────────────────────────────────────────────
+
+def _calc_atr_ratio(atr_series: pd.Series, window: int = 20) -> Optional[float]:
+    if atr_series is None or len(atr_series) < window + 1:
+        return None
+    recent = atr_series.dropna().tail(window + 1)
+    if len(recent) < window + 1:
+        return None
+    current_atr     = recent.iloc[-1]
+    historical_mean = recent.iloc[:-1].mean()
+    if historical_mean == 0:
+        return None
+    return round(float(current_atr / historical_mean), 3)
+
+
+def _calc_ema_slope(ema_series: pd.Series, n: int, atr22: float) -> Optional[float]:
+    """EMA 斜率 = (EMA[-1] - EMA[-(n+1)]) / n / ATR22"""
+    if atr22 is None or atr22 == 0:
+        return None
+    clean = ema_series.dropna()
+    if len(clean) < n + 1:
+        return None
+    slope = (float(clean.iloc[-1]) - float(clean.iloc[-(n + 1)])) / n / atr22
+    return round(slope, 4)
+
+
+def _calc_dist(close: float, ema20: float, atr22: float) -> Optional[float]:
+    if atr22 is None or atr22 == 0:
+        return None
+    return round((close - ema20) / atr22, 3)
+
+
+def _dist_52h(df_d: pd.DataFrame) -> Optional[float]:
+    """當前收盤價距52週高點百分比（需 >= 252 根）。"""
+    if len(df_d) < 252:
+        return None
+    recent_252    = df_d.tail(252)
+    high_52w      = recent_252["h"].max()
+    current_close = df_d.iloc[-1]["c"]
+    if high_52w == 0:
+        return None
+    return round((current_close - high_52w) / high_52w * 100, 2)
+
+
+# ─────────────────────────────────────────────
+# 核心計算：D1 指標
+# ─────────────────────────────────────────────
+
+def _calc_d1(df_raw: pd.DataFrame) -> dict:
+    """
+    計算 D1 所有指標。
+    輸入 df_raw：舊在前，全名欄位（open/high/low/close/volume）。
+    計算前 rename 為單字母（c/h/l/v）。
+    """
+    df = df_raw.copy()
+    df = df.rename(columns={"close": "c", "high": "h", "low": "l",
+                             "open": "o", "volume": "v"})
+
+    r = {}
+    ema20_series = None
+    atr22_series = None
+
+    if len(df) >= 9:
+        r["ema9_d1"] = round(ta.trend.ema_indicator(df["c"], window=9).iloc[-1], 2)
+
+    if len(df) >= 50:
+        ema20_series    = ta.trend.ema_indicator(df["c"], window=20)
+        r["ema20_d1"]   = round(ema20_series.iloc[-1], 2)
+        r["ema50_d1"]   = round(ta.trend.ema_indicator(df["c"], window=50).iloc[-1], 2)
+
+    if len(df) >= 22:
+        atr22_series    = ta.volatility.average_true_range(
+            df["h"], df["l"], df["c"], window=22)
+        r["atr22_d1"]   = round(atr22_series.iloc[-1], 2)
+
+    if len(df) >= 14:
+        r["rsi14_d1"]   = round(ta.momentum.rsi(df["c"], window=14).iloc[-1], 2)
+
+    if len(df) >= 23:
+        avg_v = df["v"].iloc[-23:-1].mean()
+        r["rvol_d1"] = round(df["v"].iloc[-1] / avg_v, 2) if avg_v != 0 else 0.0
+
+    # trend_d1（EMA 排列）
+    if all(k in r for k in ["ema9_d1", "ema20_d1", "ema50_d1"]):
+        if r["ema9_d1"] > r["ema20_d1"] > r["ema50_d1"]:
+            r["trend_d1"] = "bull"
+        elif r["ema9_d1"] < r["ema20_d1"] < r["ema50_d1"]:
+            r["trend_d1"] = "bear"
+        else:
+            r["trend_d1"] = "neutral"
+
+    # dist_52h_d（需要原始 h 欄位）
+    dist_52h = _dist_52h(df)
+    if dist_52h is not None:
+        r["dist_52h_d"] = dist_52h
+
+    atr22_val = r.get("atr22_d1")
+    ema20_val = r.get("ema20_d1")
+
+    # dist_d1
+    if ema20_val is not None and atr22_val is not None:
+        d = _calc_dist(float(df["c"].iloc[-1]), ema20_val, atr22_val)
+        if d is not None:
+            r["dist_d1"] = d
+
+    # dist_pct_rank_60d
+    if ema20_series is not None and atr22_series is not None:
+        ema20_full = ema20_series.dropna()
+        atr22_full = atr22_series.dropna()
+        min_len    = min(len(ema20_full), len(atr22_full), len(df))
+        if min_len >= 5:
+            closes    = df["c"].values[-min_len:]
+            ema20_arr = ema20_full.values[-min_len:]
+            atr22_arr = atr22_full.values[-min_len:]
+            dist_full = np.array([
+                (c - e) / a if a != 0 else np.nan
+                for c, e, a in zip(closes, ema20_arr, atr22_arr)
+            ])
+            dist_valid = dist_full[~np.isnan(dist_full)]
+            hist_60    = dist_valid[-60:] if len(dist_valid) >= 5 else None
+            if hist_60 is not None and len(hist_60) >= 5:
+                today_dist = dist_valid[-1]
+                pct_rank   = float(np.sum(hist_60 <= today_dist) / len(hist_60) * 100)
+                r["dist_pct_rank_60d"] = round(pct_rank, 1)
+
+    # atr_ratio_d1
+    if atr22_series is not None:
+        ratio = _calc_atr_ratio(atr22_series, window=20)
+        if ratio is not None:
+            r["atr_ratio_d1"] = ratio
+
+    # ema9_slope_d1（n=5）
+    if len(df) >= 9 + 5:
+        ema9_series = ta.trend.ema_indicator(df["c"], window=9)
+        slope = _calc_ema_slope(ema9_series, n=5, atr22=atr22_val)
+        if slope is not None:
+            r["ema9_slope_d1"] = slope
+
+    # ema20_slope_d1（n=5）
+    if ema20_series is not None and atr22_val is not None:
+        slope = _calc_ema_slope(ema20_series, n=5, atr22=atr22_val)
+        if slope is not None:
+            r["ema20_slope_d1"] = slope
+
+    return r
+
+
+# ─────────────────────────────────────────────
+# 核心計算：W1 指標
+# ─────────────────────────────────────────────
+
+def _calc_w1(df_raw: pd.DataFrame) -> dict:
+    """
+    計算 W1 所有指標。
+    輸入 df_raw：舊在前，全名欄位（open/high/low/close/volume）。
+    調用前已按 daily_status 截斷最後一根（若 is_week_complete=false）。
+    """
+    df = df_raw.copy()
+    df = df.rename(columns={"close": "c", "high": "h", "low": "l",
+                             "open": "o", "volume": "v"})
+
+    r = {}
+    ema20_series = None
+    atr22_series = None
+
+    if len(df) >= 9:
+        r["ema9_w1"] = round(ta.trend.ema_indicator(df["c"], window=9).iloc[-1], 2)
+
+    if len(df) >= 50:
+        ema20_series  = ta.trend.ema_indicator(df["c"], window=20)
+        r["ema20_w1"] = round(ema20_series.iloc[-1], 2)
+        r["ema50_w1"] = round(ta.trend.ema_indicator(df["c"], window=50).iloc[-1], 2)
+
+    if len(df) >= 22:
+        atr22_series  = ta.volatility.average_true_range(
+            df["h"], df["l"], df["c"], window=22)
+        r["atr22_w1"] = round(atr22_series.iloc[-1], 2)
+
+    if len(df) >= 14:
+        r["rsi14_w1"] = round(ta.momentum.rsi(df["c"], window=14).iloc[-1], 2)
+
+    if len(df) >= 51:
+        avg_v = df["v"].iloc[-51:-1].mean()
+        r["rvol_w1"] = round(df["v"].iloc[-1] / avg_v, 2) if avg_v != 0 else 0.0
+
+    # atr_ratio_w1
+    if atr22_series is not None:
+        ratio = _calc_atr_ratio(atr22_series, window=20)
+        if ratio is not None:
+            r["atr_ratio_w1"] = ratio
+
+    # trend_w1（EMA 排列）
+    if all(k in r for k in ["ema9_w1", "ema20_w1", "ema50_w1"]):
+        if r["ema9_w1"] > r["ema20_w1"] > r["ema50_w1"]:
+            r["trend_w1"] = "bull"
+        elif r["ema9_w1"] < r["ema20_w1"] < r["ema50_w1"]:
+            r["trend_w1"] = "bear"
+        else:
+            r["trend_w1"] = "neutral"
+
+    return r
+
+
+# ─────────────────────────────────────────────
+# indicators.csv 讀取與 append
+# ─────────────────────────────────────────────
+
+def _read_indicators_csv(ticker: str) -> Optional[pd.DataFrame]:
+    """讀取現有 indicators.csv，不存在返回 None。"""
+    path = f"{HF_TICKER_DIR}/{ticker}/indicators.csv"
+    raw  = _hf_download(path)
+    if raw is None:
+        return None
+    try:
+        df = pd.read_csv(io.BytesIO(raw), dtype=str)
+        df.columns = [c.lower() for c in df.columns]
+        return df
+    except Exception as e:
+        print(f"  ⚠️ {ticker}: indicators.csv 解析失敗: {e}")
+        return None
+
+
+def _build_new_row(today_str: str, d1: dict, w1: dict) -> dict:
+    """組裝今日一行（所有欄位，缺失填空字串）。"""
+    now_str = datetime.now(EST_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+    row = {"date": today_str, "updated_at": now_str}
+    for col in INDICATOR_COLS[2:]:  # 跳過 date, updated_at
+        if col in d1:
+            row[col] = d1[col]
+        elif col in w1:
+            row[col] = w1[col]
+        else:
+            row[col] = ""
+    return row
+
+
+def _append_or_update_row(existing: Optional[pd.DataFrame],
+                           new_row: dict,
+                           today_str: str) -> pd.DataFrame:
+    """
+    將新行 append 到 existing（舊在前新在後）。
+    若最後一行 date == today_str，覆蓋（upsert 語義，防止重複 append）。
+    """
+    new_df = pd.DataFrame([new_row], columns=INDICATOR_COLS)
+    # 確保所有欄位存在
+    for col in INDICATOR_COLS:
+        if col not in new_df.columns:
+            new_df[col] = ""
+
+    if existing is None or existing.empty:
+        return new_df
+
+    # 補齊 existing 缺少的欄位
+    for col in INDICATOR_COLS:
+        if col not in existing.columns:
+            existing[col] = ""
+    existing = existing[INDICATOR_COLS]
+
+    # 最後一行若是今天，覆蓋
+    if len(existing) > 0 and str(existing.iloc[-1].get("date", "")) == today_str:
+        existing = existing.iloc[:-1]
+
+    return pd.concat([existing, new_df], ignore_index=True)
+
+
+def _df_to_csv_b64(df: pd.DataFrame) -> str:
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    return base64.b64encode(csv_bytes).decode()
+
+
+# ─────────────────────────────────────────────
+# 單 ticker 處理
+# ─────────────────────────────────────────────
+
+def _process_ticker(ticker: str,
+                    today_str: str,
+                    is_week_complete: bool) -> Optional[dict]:
+    """
+    處理單個 ticker，返回 {"path": ..., "content_b64": ...} 或 None（跳過）。
+    """
+    # 讀 d.csv
+    df_d = _read_d_csv(ticker)
+    if df_d is None:
+        print(f"  ⚠️ {ticker}: d.csv 缺失或不足，跳過")
+        return None
+
+    # 計算 D1
+    d1 = _calc_d1(df_d)
+
+    # resample W1
+    w1 = {}
+    try:
+        # d.csv 的 date 欄位是 pd.Timestamp，resample 前需確保 datetime index
+        df_d_for_resample = df_d.copy()
+        # date 已是 pd.Timestamp（_read_d_csv 做了 pd.to_datetime）
+        df_w = _resample_weekly(df_d_for_resample)
+
+        if is_week_complete:
+            w1 = _calc_w1(df_w)
+            w1_note = "完整"
+        else:
+            # 截斷最後一根未收盤週線
+            if len(df_w) > 1:
+                df_w_trimmed = df_w.iloc[:-1].reset_index(drop=True)
+                w1 = _calc_w1(df_w_trimmed)
+            w1_note = "截斷(partial)"
+    except Exception as e:
+        w1_note = f"W1計算異常:{e}"
+        w1 = {}
+
+    # 讀現有 indicators.csv
+    existing = _read_indicators_csv(ticker)
+
+    # 組裝新行
+    new_row = _build_new_row(today_str, d1, w1)
+
+    # Append / upsert
+    updated_df = _append_or_update_row(existing, new_row, today_str)
+
+    # 轉 CSV base64
+    content_b64 = _df_to_csv_b64(updated_df)
+
+    print(f"  ✅ {ticker} | D1:{len(d1)}欄 W1:{len(w1)}欄({w1_note}) | "
+          f"indicators.csv 共 {len(updated_df)} 行")
+
+    return {
+        "path":        f"{HF_TICKER_DIR}/{ticker}/indicators.csv",
+        "content_b64": content_b64,
+    }
+
+
+# ─────────────────────────────────────────────
+# 主入口
+# ─────────────────────────────────────────────
+
+def main():
+    start_time = time.monotonic()
+    today_str  = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+
+    print(f"🚀 [mp_indicator_calc] 開始 | 日期: {today_str}")
+
+    # 初始化進度 DB
+    try:
+        pdb = ProgressDB()
+    except Exception as e:
+        print(f"❌ [mp_indicator_calc] MongoDB 連接失敗: {e}")
+        sys.exit(1)
+
+    # 讀 daily_status.json
+    daily_status     = _load_daily_status()
+    is_week_complete = daily_status.get("is_week_complete", True)  # 不存在時保守不截斷
+    if not daily_status:
+        print("⚠️ [mp_indicator_calc] STATUS_MISSING：W1 不截斷（保守處理）")
+    else:
+        print(f"📋 [mp_indicator_calc] daily_status: "
+              f"is_week_complete={is_week_complete} "
+              f"last_w={daily_status.get('last_complete_w_date', 'N/A')}")
+
+    # 讀或重置進度
+    progress = pdb.get()
+    all_tickers = progress.get("all_tickers", [])
+
+    if not all_tickers:
+        # 首次：掃描 HF 目錄
+        print(f"📂 [mp_indicator_calc] 首次運行，掃描 HF ticker 目錄...")
+        all_tickers = _hf_scan_ticker_dirs()
+        if not all_tickers:
+            print("❌ [mp_indicator_calc] 掃描結果為空，退出")
+            pdb.close()
+            sys.exit(1)
+        pdb.save_all_tickers(all_tickers)
+        print(f"✅ [mp_indicator_calc] 掃描完成，共 {len(all_tickers)} 個 ticker")
+
+    # 重置（新的一天）或斷點續跑
+    progress = pdb.reset_if_new_day(all_tickers)
+    completed = set(progress.get("completed_tickers", []))
+    total     = len(all_tickers)
+
+    print(f"📊 [mp_indicator_calc] 總計 {total} 個 ticker，已完成 {len(completed)}")
+
+    # 批次處理
+    remaining = [t for t in all_tickers if t not in completed]
+    print(f"▶️  [mp_indicator_calc] 剩餘 {len(remaining)} 個 ticker 待處理")
+
+    batch_num  = 0
+    ok_count   = 0
+    skip_count = 0
+    err_count  = 0
+
+    for i in range(0, len(remaining), BATCH_SIZE):
+        batch      = remaining[i: i + BATCH_SIZE]
+        batch_num += 1
+        hf_files   = []
+        batch_ok   = []
+        batch_skip = []
+        batch_err  = []
+
+        print(f"\n🔄 [mp_indicator_calc] 批次 {batch_num} | "
+              f"ticker {i+1}~{min(i+BATCH_SIZE, len(remaining))}/{len(remaining)}")
+
+        for ticker in batch:
+            try:
+                result = _process_ticker(ticker, today_str, is_week_complete)
+                if result is not None:
+                    hf_files.append(result)
+                    batch_ok.append(ticker)
+                else:
+                    batch_skip.append(ticker)
+            except Exception as e:
+                print(f"  ❌ {ticker}: 異常: {e}")
+                batch_err.append(ticker)
+
+        # HF commit
+        if hf_files:
+            commit_msg = (
+                f"mp_indicator_calc {today_str} "
+                f"batch {batch_num} ({len(hf_files)} tickers)"
+            )
+            print(f"💾 [mp_indicator_calc] commit {len(hf_files)} 個文件...")
+            commit_ok = _hf_batch_commit(hf_files, commit_msg)
+            if commit_ok:
+                print(f"✅ [mp_indicator_calc] commit 成功")
+                completed.update(batch_ok)
+                ok_count   += len(batch_ok)
+                skip_count += len(batch_skip)
+                err_count  += len(batch_err)
+                pdb.update_completed(completed)
+                time.sleep(SLEEP_AFTER_COMMIT)
+            else:
+                print(f"❌ [mp_indicator_calc] commit 失敗，本批進度不推進")
+                # 不更新 completed，下次重試
+        else:
+            # 全部跳過，進度也推進（跳過的 ticker 不需要重試）
+            completed.update(batch_ok + batch_skip)
+            skip_count += len(batch_skip)
+            err_count  += len(batch_err)
+            pdb.update_completed(completed)
+
+        elapsed = time.monotonic() - start_time
+        print(f"📊 [mp_indicator_calc] 進度: {len(completed)}/{total} | "
+              f"本批 OK:{len(batch_ok)} 跳過:{len(batch_skip)} ERR:{len(batch_err)} | "
+              f"耗時 {elapsed:.0f}s")
+
+    # 完成
+    pdb.mark_done()
+    pdb.close()
+
+    elapsed_total = time.monotonic() - start_time
+    print(f"\n✅ [mp_indicator_calc] 全部完成 | "
+          f"總計 {total} 個 ticker | "
+          f"OK:{ok_count} 跳過:{skip_count} ERR:{err_count} | "
+          f"耗時 {elapsed_total:.0f}s ({elapsed_total/60:.1f}min)")
+
+
+if __name__ == "__main__":
+    main()
+
+
+=== run_mp_reorganize_daily.py ===
+"""
+run_mp_reorganize_daily.py — BC job：MP 每日重組 v1.0
+
+職責：
+  讀 ./staging/ artifact（由 fetch_mp job 傳入）
+  → 並發下載所有 ticker 現有 d.csv 到記憶體
+  → 逐日 merge（缺口優先，今日最後）
+  → 寫本地 ./output/mp_data/ticker/*/d.csv
+  → upload_folder 一次寫回 HF Dataset（SDK 自動處理 429）
+  → 全量核查 verify_log
+  → 更新 MP_Full_Progress + Task_Log
+
+模式（從 summary.json 讀取，對應 fetch_mp 的 mode）：
+  daily   — 正常模式，處理 summary.json 中所有 dates_fetched
+  rebuild — 單日強制重覆寫，同樣走此腳本，無特殊分支
+
+核查邏輯：
+  每個 ticker d.csv 最新日期應 == trading_date（或至少包含 dates_fetched 中最大日期）
+  核查失敗 → status=partial, resolved=False → 下次 fetch_mp daily 自動補跑
+
+環境變量（GitHub Actions Secrets）：
+  HF_TOKEN     → HF Dataset 讀寫
+  HF_REPO_ID   → HF Dataset repo
+  MONGO_URI    → MongoDB 進度存取
+  TRADING_DATE → 目標交易日（workflow input）
+  COMM_HUB_URL → GAS Telegram proxy（可選）
+  WEBHOOK_SECRET → GAS 鑒權（可選）
+
+依賴：
+  huggingface_hub>=0.20（upload_folder SDK）
+  pandas, pytz, pymongo, requests
+
+Python 3.9 兼容。
+"""
+
+import io
+import json
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import pandas as pd
+import pymongo
+import pytz
+import requests
+from huggingface_hub import HfApi
+
+# ─────────────────────────────────────────────
+# 常數
+# ─────────────────────────────────────────────
+
+HF_TICKER_DIR  = "mp_data/ticker"
+STAGING_DIR    = "./staging"
+OUTPUT_DIR     = "./output"
+DOWNLOAD_WORKERS = 10   # 並發下載線程數（不超過 20，HF CDN 隱性限速）
+
+EST_TZ = pytz.timezone("US/Eastern")
+
+
+# ─────────────────────────────────────────────
+# 環境變量
+# ─────────────────────────────────────────────
+
+def _hf_token() -> str:
+    return os.environ.get("HF_TOKEN", "")
+
+def _hf_repo() -> str:
+    return os.environ.get("HF_REPO_ID", "zhujun0511-AI/ai-telegram-bot-dataset")
+
+def _mongo_uri() -> str:
+    return os.environ.get("MONGO_URI", "")
+
+def _trading_date() -> str:
+    return os.environ.get("TRADING_DATE", "")
+
+
+# ─────────────────────────────────────────────
+# 時間工具
+# ─────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(EST_TZ).isoformat()
+
+
+# ─────────────────────────────────────────────
+# MongoDB
+# ─────────────────────────────────────────────
+
+class ReorganizeDB:
+    def __init__(self):
+        uri = _mongo_uri()
+        if not uri:
+            raise RuntimeError("MONGO_URI 未設定")
+        self.client   = pymongo.MongoClient(uri)
+        self.stock_db = self.client["StockData"]
+        self.progress = self.stock_db["MP_Full_Progress"]
+        self.task_log = self.stock_db["Task_Log"]
+
+    def close(self):
+        self.client.close()
+
+    def get_last_processed_date(self) -> str:
+        doc = self.progress.find_one({"date": "_reorganize_daily_checkpoint"})
+        return (doc or {}).get("last_processed_date", "")
+
+    def save_checkpoint(self, last_processed_date: str):
+        self.progress.update_one(
+            {"date": "_reorganize_daily_checkpoint"},
+            {"$set": {
+                "date":                 "_reorganize_daily_checkpoint",
+                "last_processed_date":  last_processed_date,
+                "updated_at":           _now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def mark_done(self, date_str: str, ticker_count: int):
+        self.progress.update_one(
+            {"date": date_str},
+            {"$set": {
+                "status":     "done",
+                "resolved":   True,
+                "row_count":  ticker_count,
+                "updated_at": _now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def mark_partial(self, date_str: str, failed_tickers: list):
+        groups = {}
+        for t in failed_tickers:
+            key = t[0].upper() if t else "?"
+            groups.setdefault(key, []).append(t)
+
+        self.progress.update_one(
+            {"date": date_str},
+            {"$set": {
+                "status":         "partial",
+                "resolved":       False,
+                "failed_tickers": failed_tickers,
+                "failed_groups":  groups,
+                "reason":         "verify_failed",
+                "updated_at":     _now_iso(),
+            }},
+            upsert=True,
+        )
+
+    def write_task_log(self, task: str, status: str, detail: dict):
+        self.task_log.insert_one({
+            "task":       task,
+            "status":     status,
+            "detail":     detail,
+            "created_at": _now_iso(),
+        })
+
+
+# ─────────────────────────────────────────────
+# Telegram
+# ─────────────────────────────────────────────
+
+def _send_telegram(msg: str):
+    url    = os.environ.get("COMM_HUB_URL", "")
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    if not url:
+        print(f"  ⚠️ COMM_HUB_URL 未設定，跳過 Telegram")
+        return
+    try:
+        resp = requests.post(
+            url,
+            json={"message": msg, "secret": secret},
+            timeout=15,
+        )
+        print(f"  📨 Telegram: {resp.status_code}")
+    except Exception as e:
+        print(f"  ⚠️ Telegram 發送失敗: {e}")
+
+
+# ─────────────────────────────────────────────
+# 讀取 staging artifact
+# ─────────────────────────────────────────────
+
+def _load_summary() -> dict:
+    path = os.path.join(STAGING_DIR, "summary.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"summary.json 不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_staging_data(dates_fetched: list) -> dict:
+    """
+    讀取 ./staging/*.parquet，按日期 → {ticker: DataFrame} 結構組裝。
+    返回 { date_str: { symbol: df_single_row } }
+    """
+    staging_by_date = {}
+
+    for date_str in dates_fetched:
+        path = os.path.join(STAGING_DIR, f"{date_str}.parquet")
+        if not os.path.exists(path):
+            print(f"  ⚠️ staging 文件不存在: {path}")
+            continue
+        try:
+            df = pd.read_parquet(path)
+            df.columns = [c.lower() for c in df.columns]
+            if "symbol" not in df.columns:
+                print(f"  ⚠️ {date_str}.parquet 缺少 symbol 欄位")
+                continue
+            df["symbol"] = df["symbol"].str.upper().str.strip()
+            # 按 ticker 分組成 {symbol: single-row DataFrame}
+            by_ticker = {}
+            for _, row in df.iterrows():
+                sym = row.get("symbol", "")
+                if not sym:
+                    continue
+                by_ticker[sym] = pd.DataFrame([{
+                    "date":   row.get("date", date_str),
+                    "open":   row.get("open"),
+                    "high":   row.get("high"),
+                    "low":    row.get("low"),
+                    "close":  row.get("close"),
+                    "volume": row.get("volume"),
+                }])
+            staging_by_date[date_str] = by_ticker
+            print(f"  📂 staging {date_str}: {len(by_ticker)} tickers")
+        except Exception as e:
+            print(f"  ❌ 讀取 staging {date_str}: {e}")
+
+    return staging_by_date
+
+
+# ─────────────────────────────────────────────
+# HF Dataset 下載（並發）
+# ─────────────────────────────────────────────
+
+def _download_one_ticker_d_csv(ticker: str) -> tuple:
+    """
+    下載單個 ticker d.csv，返回 (ticker, df or None)。
+    供 ThreadPoolExecutor 調用。
+    """
+    url = (
+        f"https://huggingface.co/datasets/{_hf_repo()}"
+        f"/resolve/main/{HF_TICKER_DIR}/{ticker}/d.csv"
+    )
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {_hf_token()}"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                df = pd.read_csv(io.BytesIO(resp.content), dtype=str)
+                df.columns = [c.lower() for c in df.columns]
+                return ticker, df
+            if resp.status_code == 404:
+                return ticker, None
+            if resp.status_code == 429:
+                print(f"  ⚠️ 下載 {ticker} d.csv 429，等待 70s 重試")
+                time.sleep(70)
+                continue
+            return ticker, None
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                print(f"  ❌ 下載 {ticker} d.csv 異常: {e}")
+    return ticker, None
+
+
+def _download_all_tickers(all_tickers: list) -> dict:
+    """
+    並發下載所有 ticker 的 d.csv 到記憶體。
+    返回 { ticker: df or None }（None = 404 / 失敗）
+    """
+    print(f"📥 並發下載 d.csv（{DOWNLOAD_WORKERS} threads）| ticker: {len(all_tickers)}")
+    t0 = time.monotonic()
+    cache = {}
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as exe:
+        futures = {exe.submit(_download_one_ticker_d_csv, t): t for t in all_tickers}
+        done_count = 0
+        for future in as_completed(futures):
+            ticker, df = future.result()
+            cache[ticker] = df
+            done_count += 1
+            if done_count % 500 == 0:
+                print(f"  ⏳ 下載進度: {done_count}/{len(all_tickers)}")
+
+    elapsed = time.monotonic() - t0
+    found   = sum(1 for v in cache.values() if v is not None)
+    print(f"✅ 下載完成 | 已有: {found} | 新建: {len(all_tickers) - found} | 耗時: {elapsed:.0f}s")
+    return cache
+
+
+# ─────────────────────────────────────────────
+# Merge 邏輯
+# ─────────────────────────────────────────────
+
+def _merge_ticker(
+    ticker: str,
+    existing_df,  # pd.DataFrame or None
+    new_rows_by_date: dict,  # { date_str: single-row DataFrame }
+) -> pd.DataFrame:
+    """
+    將現有 d.csv 與新數據合併：
+    - 現有為 None → 只用新數據
+    - 現有有數據 → concat + drop_duplicates(date) + sort
+    - 結果：date 升序，drop_duplicates
+    """
+    frames = []
+    if existing_df is not None and not existing_df.empty:
+        frames.append(existing_df)
+
+    for date_str, new_df in new_rows_by_date.items():
+        if new_df is not None and not new_df.empty:
+            frames.append(new_df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined.columns = [c.lower() for c in combined.columns]
+
+    if "date" not in combined.columns:
+        return pd.DataFrame()
+
+    combined = (
+        combined
+        .sort_values("date")
+        .drop_duplicates("date")
+        .reset_index(drop=True)
+    )
+    return combined
+
+
+# ─────────────────────────────────────────────
+# 本地輸出目錄寫入
+# ─────────────────────────────────────────────
+
+def _write_output_d_csv(ticker: str, df: pd.DataFrame):
+    """寫到 ./output/mp_data/ticker/{ticker}/d.csv。"""
+    dir_path = os.path.join(OUTPUT_DIR, HF_TICKER_DIR, ticker)
+    os.makedirs(dir_path, exist_ok=True)
+    path = os.path.join(dir_path, "d.csv")
+    df.to_csv(path, index=False)
+
+
+# ─────────────────────────────────────────────
+# HF upload_folder
+# ─────────────────────────────────────────────
+
+def _upload_to_hf(output_path: str):
+    """
+    用 huggingface_hub upload_folder 一次性上傳 output/ 到 HF Dataset。
+    SDK 自動分批、自動重試 429。
+    """
+    print(f"⬆️ upload_folder 開始 | 目錄: {output_path}")
+    t0  = time.monotonic()
+    api = HfApi(token=_hf_token())
+    api.upload_folder(
+        folder_path=output_path,
+        repo_id=_hf_repo(),
+        repo_type="dataset",
+        commit_message=f"mp_reorganize_daily: batch upload",
+        # path_in_repo 不指定 → 保持目錄結構對齊 output/ 的子路徑
+    )
+    elapsed = time.monotonic() - t0
+    print(f"✅ upload_folder 完成 | 耗時: {elapsed:.0f}s")
+
+
+# ─────────────────────────────────────────────
+# 主邏輯
+# ─────────────────────────────────────────────
+
+def main() -> int:
+    trading_date = _trading_date()
+    if not trading_date:
+        print("❌ TRADING_DATE 未設定")
+        return 1
+
+    print(f"🚀 run_mp_reorganize_daily.py 啟動 | trading_date={trading_date}")
+    t_start = time.monotonic()
+
+    # ── 1. 讀 summary.json ──
+    try:
+        summary = _load_summary()
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        return 1
+
+    dates_fetched = summary.get("dates_fetched", [])
+    if not dates_fetched:
+        skipped = summary.get("skipped", False)
+        if skipped:
+            print(f"✅ summary.json 標記 skipped=True（fetch 階段已 done），reorganize 無需執行")
+            return 0
+        print(f"⚠️ dates_fetched 為空，無數據可 reorganize")
+        return 0
+
+    print(f"📋 待 reorganize 日期: {dates_fetched}")
+
+    # ── 2. 讀 staging 數據 ──
+    staging_by_date = _load_staging_data(dates_fetched)
+    if not staging_by_date:
+        print("❌ staging 無有效數據，退出")
+        return 1
+
+    # 所有出現過的 ticker
+    all_tickers = set()
+    for date_str, by_ticker in staging_by_date.items():
+        all_tickers.update(by_ticker.keys())
+    all_tickers = sorted(all_tickers)
+    print(f"📊 涉及 ticker: {len(all_tickers)}")
+
+    # ── 3. 並發下載所有 ticker 現有 d.csv ──
+    ticker_cache = _download_all_tickers(all_tickers)
+
+    # ── 4. 逐日 merge ──
+    print(f"\n🔀 開始 merge（{len(dates_fetched)} 個日期 × {len(all_tickers)} 個 ticker）")
+    t_merge = time.monotonic()
+
+    # verify_log: { ticker: 最新 date }
+    verify_log = {}
+
+    for ticker in all_tickers:
+        existing_df = ticker_cache.get(ticker)  # None or DataFrame
+        new_rows_by_date = {}
+        for date_str in dates_fetched:
+            by_ticker = staging_by_date.get(date_str, {})
+            if ticker in by_ticker:
+                new_rows_by_date[date_str] = by_ticker[ticker]
+
+        if not new_rows_by_date:
+            # 此 ticker 在所有 dates_fetched 中均無數據（已被過濾掉）
+            continue
+
+        merged = _merge_ticker(ticker, existing_df, new_rows_by_date)
+        if merged.empty:
+            continue
+
+        _write_output_d_csv(ticker, merged)
+
+        # 記錄最新日期用於核查
+        if "date" in merged.columns:
+            verify_log[ticker] = str(merged["date"].max())
+
+    elapsed_merge = time.monotonic() - t_merge
+    print(f"✅ merge 完成 | 涉及 ticker: {len(verify_log)} | 耗時: {elapsed_merge:.0f}s")
+
+    # ── 5. upload_folder → HF ──
+    output_path = os.path.join(OUTPUT_DIR, HF_TICKER_DIR)
+    if not os.path.exists(output_path):
+        print("⚠️ output 目錄為空，無文件可上傳")
+        return 1
+
+    try:
+        _upload_to_hf(OUTPUT_DIR)
+    except Exception as e:
+        print(f"❌ upload_folder 失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    # ── 6. 全量核查 ──
+    # 核查：所有已 merge 的 ticker，最新日期應包含 trading_date
+    # （如果 trading_date 不在 dates_fetched 則核查對象是 dates_fetched 最大日期）
+    expected_latest = max(dates_fetched) if dates_fetched else trading_date
+
+    failed_tickers = [
+        t for t, latest in verify_log.items()
+        if latest < expected_latest
+    ]
+
+    total_tickers  = len(verify_log)
+    passed_tickers = total_tickers - len(failed_tickers)
+    print(f"\n🔍 全量核查: {passed_tickers}/{total_tickers} 通過")
+
+    # ── 7. 更新 MongoDB ──
+    db_obj = None
+    try:
+        db_obj = ReorganizeDB()
+
+        if failed_tickers:
+            print(f"⚠️ 核查失敗 ticker: {len(failed_tickers)} 個")
+            print(f"   前 10 個: {failed_tickers[:10]}")
+            db_obj.mark_partial(trading_date, failed_tickers)
+            _send_telegram(
+                f"⚠️ MP reorganize_daily 完整性告警\n"
+                f"日期: {trading_date}\n"
+                f"失敗 ticker: {len(failed_tickers)} 個\n"
+                f"已記錄 partial，下次自動補跑"
+            )
+        else:
+            db_obj.mark_done(trading_date, total_tickers)
+            # 同時更新 checkpoint
+            db_obj.save_checkpoint(trading_date)
+
+        elapsed_total = time.monotonic() - t_start
+        status_str = "PARTIAL" if failed_tickers else "SUCCESS"
+
+        db_obj.write_task_log("run_mp_reorganize_daily", status_str, {
+            "trading_date":    trading_date,
+            "dates_fetched":   dates_fetched,
+            "total_tickers":   total_tickers,
+            "passed_tickers":  passed_tickers,
+            "failed_tickers":  len(failed_tickers),
+            "elapsed_s":       round(elapsed_total, 1),
+        })
+
+        if not failed_tickers:
+            _send_telegram(
+                f"✅ MP reorganize_daily 完成\n"
+                f"日期: {trading_date}\n"
+                f"核查: {passed_tickers}/{total_tickers} 通過\n"
+                f"耗時: {elapsed_total:.0f}s"
+            )
+
+        print(f"\n✅ reorganize_daily ALL_DONE | "
+              f"total: {total_tickers} | "
+              f"failed: {len(failed_tickers)} | "
+              f"耗時: {elapsed_total:.0f}s")
+
+    finally:
+        if db_obj:
+            db_obj.close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+=== run_mp_reorganize_wm.py ===
+"""
+run_mp_reorganize_wm.py — BC job：MP 週/月線重組 v1.0
+
+職責：
+  讀 ./staging/summary.json 取得本次涉及 ticker 列表
+  → 並發下載這些 ticker 的最新 d.csv
+  → 從 d.csv resample → w.csv / m.csv（嚴格跳過未收盤最後一根）
+  → 寫本地 ./output_wm/mp_data/ticker/*/w.csv + m.csv
+  → upload_folder 一次寫回 HF Dataset
+  → dispatch mp_nightly.yml
+  → 寫 Task_Log
+
+規則（DANGER_ZONES 全局約定）：
+  W1 必須從 d.csv resample，禁止讀現有 w.csv（partial bar 污染風險）
+  週線時間戳標準：週一（W-MON anchor，closed="left", label="left"）
+  未完整最後一根嚴格跳過（is_week_complete=False → iloc[:-1]）
+  月線同樣跳過未完整最後一根（is_month_complete=False → iloc[:-1]）
+  is_week_complete / is_month_complete 由 trading_date 推算（週五=true，月末=true）
+
+環境變量（GitHub Actions Secrets）：
+  HF_TOKEN      → HF Dataset 讀寫
+  HF_REPO_ID    → HF Dataset repo
+  MONGO_URI     → MongoDB 寫 Task_Log
+  GH_TOKEN      → GitHub API（dispatch mp_nightly.yml）
+  GH_REPO       → BC repo 全名（如 zhujun0511-moi/ai-telegram-bot-BC）
+  TRADING_DATE  → 目標交易日（workflow input）
+  COMM_HUB_URL  → GAS Telegram proxy（可選）
+  WEBHOOK_SECRET → GAS 鑒權（可選）
+
+依賴：
+  huggingface_hub>=0.20（upload_folder SDK）
+  pandas, pytz, pymongo, requests
+
+Python 3.9 兼容。
+"""
+
+import io
+import json
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+
+import pandas as pd
+import pymongo
+import pytz
+import requests
+from huggingface_hub import HfApi
+
+# ─────────────────────────────────────────────
+# 常數
+# ─────────────────────────────────────────────
+
+HF_TICKER_DIR    = "mp_data/ticker"
+STAGING_DIR      = "./staging"
+OUTPUT_WM_DIR    = "./output_wm"
+DOWNLOAD_WORKERS = 10
+
+BC_BRANCH  = "main"
+BC_WORKFLOW = "mp_nightly.yml"
+
+EST_TZ = pytz.timezone("US/Eastern")
+
+
+# ─────────────────────────────────────────────
+# 環境變量
+# ─────────────────────────────────────────────
+
+def _hf_token() -> str:
+    return os.environ.get("HF_TOKEN", "")
+
+def _hf_repo() -> str:
+    return os.environ.get("HF_REPO_ID", "zhujun0511-AI/ai-telegram-bot-dataset")
+
+def _mongo_uri() -> str:
+    return os.environ.get("MONGO_URI", "")
+
+def _trading_date() -> str:
+    return os.environ.get("TRADING_DATE", "")
+
+def _gh_token() -> str:
+    return os.environ.get("GH_TOKEN", "")
+
+def _gh_repo() -> str:
+    return os.environ.get("GH_REPO", "zhujun0511-moi/ai-telegram-bot-BC")
+
+
+# ─────────────────────────────────────────────
+# 時間工具
+# ─────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(EST_TZ).isoformat()
+
+
+# ─────────────────────────────────────────────
+# 週/月完整性推算
+# ─────────────────────────────────────────────
+
+def _calc_week_month_complete(trading_date: str) -> tuple:
+    """
+    根據 trading_date 推算 is_week_complete / is_month_complete。
+
+    is_week_complete:
+      trading_date 是週五（weekday=4）→ True
+      其他交易日 → False
+
+    is_month_complete:
+      trading_date 是當月最後一個交易日（下一個交易日跨月）→ True
+      簡化判斷：trading_date 是當月最後一天，或 trading_date 是週五且
+      date + 3 天已是下個月 → True
+      此處用保守判斷：date 是當月最後一個週五或月末日
+    """
+    try:
+        dt = datetime.strptime(trading_date, "%Y-%m-%d")
+    except ValueError:
+        return False, False
+
+    weekday = dt.weekday()  # 0=Mon, 4=Fri
+
+    is_week_complete = (weekday == 4)  # 週五
+
+    # 月完整性：下一個自然日（跳過週末）是否跨月
+    next_day = dt + timedelta(days=1)
+    while next_day.weekday() >= 5:  # 跳過週末
+        next_day += timedelta(days=1)
+    is_month_complete = (next_day.month != dt.month)
+
+    return is_week_complete, is_month_complete
+
+
+# ─────────────────────────────────────────────
+# MongoDB
+# ─────────────────────────────────────────────
+
+class WmDB:
+    def __init__(self):
+        uri = _mongo_uri()
+        if not uri:
+            raise RuntimeError("MONGO_URI 未設定")
+        self.client   = pymongo.MongoClient(uri)
+        self.stock_db = self.client["StockData"]
+        self.task_log = self.stock_db["Task_Log"]
+
+    def close(self):
+        self.client.close()
+
+    def write_task_log(self, task: str, status: str, detail: dict):
+        self.task_log.insert_one({
+            "task":       task,
+            "status":     status,
+            "detail":     detail,
+            "created_at": _now_iso(),
+        })
+
+
+# ─────────────────────────────────────────────
+# Telegram
+# ─────────────────────────────────────────────
+
+def _send_telegram(msg: str):
+    url    = os.environ.get("COMM_HUB_URL", "")
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    if not url:
+        return
+    try:
+        resp = requests.post(
+            url,
+            json={"message": msg, "secret": secret},
+            timeout=15,
+        )
+        print(f"  📨 Telegram: {resp.status_code}")
+    except Exception as e:
+        print(f"  ⚠️ Telegram 失敗: {e}")
+
+
+# ─────────────────────────────────────────────
+# 讀 summary.json
+# ─────────────────────────────────────────────
+
+def _load_summary() -> dict:
+    path = os.path.join(STAGING_DIR, "summary.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"summary.json 不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ─────────────────────────────────────────────
+# HF Dataset 下載（並發）
+# ─────────────────────────────────────────────
+
+def _download_one_d_csv(ticker: str) -> tuple:
+    url = (
+        f"https://huggingface.co/datasets/{_hf_repo()}"
+        f"/resolve/main/{HF_TICKER_DIR}/{ticker}/d.csv"
+    )
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {_hf_token()}"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                df = pd.read_csv(io.BytesIO(resp.content), dtype=str)
+                df.columns = [c.lower() for c in df.columns]
+                return ticker, df
+            if resp.status_code == 404:
+                return ticker, None
+            if resp.status_code == 429:
+                print(f"  ⚠️ 下載 {ticker} d.csv 429，等待 70s")
+                time.sleep(70)
+                continue
+            return ticker, None
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                print(f"  ❌ 下載 {ticker} d.csv: {e}")
+    return ticker, None
+
+
+def _download_tickers(tickers: list) -> dict:
+    print(f"📥 並發下載 d.csv（{DOWNLOAD_WORKERS} threads）| ticker: {len(tickers)}")
+    t0 = time.monotonic()
+    cache = {}
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as exe:
+        futures = {exe.submit(_download_one_d_csv, t): t for t in tickers}
+        done = 0
+        for future in as_completed(futures):
+            ticker, df = future.result()
+            cache[ticker] = df
+            done += 1
+            if done % 500 == 0:
+                print(f"  ⏳ {done}/{len(tickers)}")
+
+    elapsed = time.monotonic() - t0
+    found = sum(1 for v in cache.values() if v is not None)
+    print(f"✅ 下載完成 | 有數據: {found} | 耗時: {elapsed:.0f}s")
+    return cache
+
+
+# ─────────────────────────────────────────────
+# Resample 計算（與 DC mp_reorganize.py 完全一致）
+# ─────────────────────────────────────────────
+
+def _build_ohlcv_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").drop_duplicates("date")
+    df = df.set_index("date")
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+    return df
+
+
+def _resample_weekly(df_d: pd.DataFrame) -> pd.DataFrame:
+    """日線 → 週線（W-MON 錨點，DANGER_ZONES 規定）"""
+    df = _build_ohlcv_df(df_d)
+    resampled = df.resample("W-MON", label="left", closed="left").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
+    resampled = resampled.reset_index()
+    resampled["date"] = resampled["date"].dt.strftime("%Y-%m-%d")
+    return resampled[["date", "open", "high", "low", "close", "volume"]]
+
+
+def _resample_monthly(df_d: pd.DataFrame) -> pd.DataFrame:
+    """日線 → 月線（MS 錨點，DANGER_ZONES 規定）"""
+    df = _build_ohlcv_df(df_d)
+    resampled = df.resample("MS", label="left", closed="left").agg({
+        "open":   "first",
+        "high":   "max",
+        "low":    "min",
+        "close":  "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
+    resampled = resampled.reset_index()
+    resampled["date"] = resampled["date"].dt.strftime("%Y-%m-%d")
+    return resampled[["date", "open", "high", "low", "close", "volume"]]
+
+
+# ─────────────────────────────────────────────
+# 本地輸出寫入
+# ─────────────────────────────────────────────
+
+def _write_output_csv(ticker: str, filename: str, df: pd.DataFrame):
+    dir_path = os.path.join(OUTPUT_WM_DIR, HF_TICKER_DIR, ticker)
+    os.makedirs(dir_path, exist_ok=True)
+    df.to_csv(os.path.join(dir_path, filename), index=False)
+
+
+# ─────────────────────────────────────────────
+# HF upload_folder
+# ─────────────────────────────────────────────
+
+def _upload_to_hf():
+    print(f"⬆️ upload_folder 開始 | 目錄: {OUTPUT_WM_DIR}")
+    t0  = time.monotonic()
+    api = HfApi(token=_hf_token())
+    api.upload_folder(
+        folder_path=OUTPUT_WM_DIR,
+        repo_id=_hf_repo(),
+        repo_type="dataset",
+        commit_message="mp_reorganize_wm: weekly/monthly update",
+    )
+    elapsed = time.monotonic() - t0
+    print(f"✅ upload_folder 完成 | 耗時: {elapsed:.0f}s")
+
+
+# ─────────────────────────────────────────────
+# Dispatch mp_nightly.yml
+# ─────────────────────────────────────────────
+
+def _dispatch_mp_nightly(trading_date: str) -> bool:
+    token = _gh_token()
+    repo  = _gh_repo()
+    if not token:
+        print("❌ GH_TOKEN 未設定，無法 dispatch mp_nightly.yml")
+        return False
+
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{BC_WORKFLOW}/dispatches"
+    payload = {
+        "ref":    BC_BRANCH,
+        "inputs": {"trigger_date": trading_date},
+    }
+    headers = {
+        "Authorization":        f"Bearer {token}",
+        "Accept":               "application/vnd.github+json",
+        "Content-Type":         "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code == 204:
+            print(f"✅ dispatch mp_nightly.yml 成功 | trading_date={trading_date}")
+            return True
+        print(f"❌ dispatch 失敗: {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"❌ dispatch 異常: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────
+# 主邏輯
+# ─────────────────────────────────────────────
+
+def main() -> int:
+    trading_date = _trading_date()
+    if not trading_date:
+        print("❌ TRADING_DATE 未設定")
+        return 1
+
+    print(f"🚀 run_mp_reorganize_wm.py 啟動 | trading_date={trading_date}")
+    t_start = time.monotonic()
+
+    # ── 1. 讀 summary.json 取得本次 ticker 列表 ──
+    try:
+        summary = _load_summary()
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        return 1
+
+    dates_fetched = summary.get("dates_fetched", [])
+    if not dates_fetched:
+        if summary.get("skipped"):
+            print("✅ summary skipped=True，wm 無需執行，直接 dispatch mp_nightly")
+            _dispatch_mp_nightly(trading_date)
+            return 0
+        print("⚠️ dates_fetched 為空，wm 無數據可處理")
+        return 0
+
+    # 從 staging parquet 取得所有涉及 ticker
+    all_tickers = set()
+    for date_str in dates_fetched:
+        path = os.path.join(STAGING_DIR, f"{date_str}.parquet")
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_parquet(path)
+            df.columns = [c.lower() for c in df.columns]
+            if "symbol" in df.columns:
+                all_tickers.update(df["symbol"].str.upper().str.strip().tolist())
+        except Exception as e:
+            print(f"  ⚠️ 讀取 staging {date_str}: {e}")
+
+    if not all_tickers:
+        print("⚠️ 無 ticker 可處理")
+        return 0
+
+    all_tickers = sorted(all_tickers)
+    print(f"📊 涉及 ticker: {len(all_tickers)}")
+
+    # ── 2. 推算週/月完整性 ──
+    is_week_complete, is_month_complete = _calc_week_month_complete(trading_date)
+    print(f"📅 is_week_complete={is_week_complete} | is_month_complete={is_month_complete}")
+
+    # ── 3. 並發下載最新 d.csv（reorganize_daily 已更新過） ──
+    ticker_cache = _download_tickers(all_tickers)
+
+    # ── 4. 計算 w.csv / m.csv ──
+    print(f"\n📊 計算 w/m.csv（ticker: {len(all_tickers)}）")
+    t_calc = time.monotonic()
+
+    ok_count = 0
+    skip_count = 0
+    err_count = 0
+
+    for ticker in all_tickers:
+        df_d = ticker_cache.get(ticker)
+        if df_d is None or df_d.empty:
+            skip_count += 1
+            continue
+
+        try:
+            # W1（必須從 d.csv resample，禁止讀 w.csv）
+            df_w = _resample_weekly(df_d)
+            if df_w.empty:
+                skip_count += 1
+                continue
+
+            # 未完整週嚴格跳過最後一根
+            if not is_week_complete and len(df_w) > 0:
+                df_w = df_w.iloc[:-1].reset_index(drop=True)
+
+            if df_w.empty:
+                skip_count += 1
+                continue
+
+            _write_output_csv(ticker, "w.csv", df_w)
+
+            # M1
+            df_m = _resample_monthly(df_d)
+            if not df_m.empty:
+                # 未完整月嚴格跳過最後一根
+                if not is_month_complete and len(df_m) > 0:
+                    df_m = df_m.iloc[:-1].reset_index(drop=True)
+                if not df_m.empty:
+                    _write_output_csv(ticker, "m.csv", df_m)
+
+            ok_count += 1
+
+        except Exception as e:
+            print(f"  ❌ {ticker} 計算失敗: {e}")
+            err_count += 1
+
+    elapsed_calc = time.monotonic() - t_calc
+    print(f"✅ 計算完成 | ok: {ok_count} | skip: {skip_count} | err: {err_count} | 耗時: {elapsed_calc:.0f}s")
+
+    # ── 5. upload_folder → HF ──
+    output_path = os.path.join(OUTPUT_WM_DIR, HF_TICKER_DIR)
+    if not os.path.exists(output_path):
+        print("⚠️ output_wm 目錄為空，無文件可上傳")
+    else:
+        try:
+            _upload_to_hf()
+        except Exception as e:
+            print(f"❌ upload_folder 失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            # 繼續執行 dispatch（不因 upload 失敗阻塞 mp_nightly）
+
+    # ── 6. dispatch mp_nightly.yml ──
+    dispatch_ok = _dispatch_mp_nightly(trading_date)
+    if not dispatch_ok:
+        _send_telegram(
+            f"⚠️ MP reorganize_wm 完成但 dispatch mp_nightly 失敗\n"
+            f"日期: {trading_date}\n請手動觸發 mp_nightly.yml"
+        )
+
+    # ── 7. Task_Log ──
+    elapsed_total = time.monotonic() - t_start
+    db_obj = None
+    try:
+        db_obj = WmDB()
+        db_obj.write_task_log("run_mp_reorganize_wm", "SUCCESS", {
+            "trading_date":      trading_date,
+            "dates_fetched":     dates_fetched,
+            "total_tickers":     len(all_tickers),
+            "ok_count":          ok_count,
+            "skip_count":        skip_count,
+            "err_count":         err_count,
+            "is_week_complete":  is_week_complete,
+            "is_month_complete": is_month_complete,
+            "dispatch_ok":       dispatch_ok,
+            "elapsed_s":         round(elapsed_total, 1),
+        })
+    except Exception as e:
+        print(f"⚠️ Task_Log 寫入失敗: {e}")
+    finally:
+        if db_obj:
+            db_obj.close()
+
+    print(f"\n✅ reorganize_wm ALL_DONE | "
+          f"ok: {ok_count} | 耗時: {elapsed_total:.0f}s")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+=== run_phase_calc_gha.py ===
+"""
+run_phase_calc_gha.py — phase_calc GitHub Actions 入口 v1.2
+
+職責：
+  取代原 HF Space app.py 的 /webhook/phase-calc 端點 + 自激發機制。
+  GitHub Actions 沒有「自己」可以打 HTTP 自激發，改為單次 job 內部
+  while 迴圈連續跑多個 batch，靠 schedule（每小時一次）觸發下一個 job
+  接續未完成的輪次。
+
+與原 HF Space 版本的差異：
+  - 進程內鎖（_phase_calc_lock）→ MongoDB 層級鎖（跨進程有效）
+  - HTTP 自激發（_self_trigger_phase_calc）→ 本檔案內 while 迴圈
+  - 5.5 小時主動逾時收尾（GitHub Actions job 上限 6 小時，留 30 分鐘緩衝）
+
+v1.2 修復（2026-06-21 實測修復）：
+  搶鎖 find_one_and_update 出現 E11000 DuplicateKeyError（run_id_1 唯一索引）。
+  根因：upsert=True 搭配 $or 條件的 filter，在併發場景下是 MongoDB 已知陷阱——
+    1. Process A 搶鎖成功（filter 匹配，純更新，非 insert 路徑）
+    2. Process B 幾乎同時搶鎖，此時 Process A 已把 is_running 改成 True，
+       Process B 的 $or 條件全部不匹配
+    3. MongoDB 判定無文檔符合 filter，觸發 upsert 插入路徑，
+       但 run_id 唯一索引已有文檔存在（即 Process A 剛更新那筆，
+       只是內容不滿足 Process B 的 $or 條件），插入撞唯一索引 → DuplicateKeyError
+  觸發場景：手動 workflow_dispatch 觸發時間點與每小時 cron 排程接近，
+    或上一個 job 收尾（_release_lock）與下一個 job 搶鎖時序非常接近時。
+  修復：捕捉 DuplicateKeyError，retry 同一個 find_one_and_update 但
+    upsert=False——此時文檔確定已存在，純更新不會再觸發 insert 路徑，
+    不可能再次撞唯一索引。單次 retry 即足夠正確，不需要迴圈重試。
+
+v1.1 修復（保留，2026-06-21）：
+  搶鎖驗證邏輯改用唯一 token 比對，取代原本的時間戳差距比對。
+  根因：pymongo 讀回的 datetime 預設不帶時區資訊（且數值為 UTC），
+  與寫入時的 EST-aware datetime 比較會產生約 4-5 小時的時區誤判，
+  導致搶鎖實際成功卻被誤判為失敗，鎖留在 is_running=True 無人釋放，
+  阻塞後續所有排程觸發。已在生產 MongoDB 上實際發生過一次
+  （2026-06-21 03:55 UTC 手動觸發測試時發現）。
+
+不改動的部分：
+  - run_phase_calc_batch() 內部邏輯完全沿用 tasks/phase_calculator.py，
+    本檔案只負責「怎麼呼叫它、呼叫幾次、什麼時候停」
+  - PhaseCalcDB 的 Phase_History / Ticker_Sector_Map 等讀寫邏輯不變
+
+Python 3.9 兼容。
+"""
+
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta
+
+import pytz
+from pymongo.errors import DuplicateKeyError
+
+from tasks.phase_calculator import run_phase_calc_batch, PhaseCalcDB
+
+EST_TZ = pytz.timezone("US/Eastern")
+
+# 單次 job 最長運行時間（秒）。GitHub Actions 硬上限 6 小時，
+# 留 30 分鐘緩衝，避免被強殺在 HF commit 寫到一半的中間態。
+MAX_JOB_SECONDS = 5.5 * 3600
+
+# 鎖佔用視為「失效」的時間門檻（秒）。
+# 正常情況 finally 區塊一定會釋放鎖；這個門檻只在 job 異常被砍、
+# finally 沒機會執行時，讓下一次排程能夠自行解除死鎖。
+# 設為略大於 MAX_JOB_SECONDS，確保不會誤判一個仍在合法運行中的 job。
+LOCK_STALE_SECONDS = MAX_JOB_SECONDS + 15 * 60
+
+
+def _now_est() -> str:
+    return datetime.now(EST_TZ).strftime("%Y-%m-%d %H:%M:%S EST")
+
+
+def _try_lock_update(col, filter_query: dict, update_doc: dict, upsert: bool):
+    """
+    v1.2 新增：抽出單次 find_one_and_update 呼叫，供 _acquire_lock
+    在 upsert 路徑撞 DuplicateKeyError 時重試（upsert=False）。
+    """
+    return col.find_one_and_update(filter_query, update_doc, upsert=upsert)
+
+
+def _acquire_lock(db: PhaseCalcDB) -> bool:
+    """
+    嘗試搶佔 MongoDB 層級鎖。
+
+    搶鎖邏輯（原子操作，find_one_and_update）：
+      條件：is_running 不存在，或為 False，或鎖已過期（stale）
+      動作：設 is_running=True，記錄 lock_acquired_at（人類可讀，僅供查閱）、
+            lock_token（本次運行的唯一識別碼，用於後續驗證）
+
+    v1.2 修復：upsert=True 搭配 $or 條件，併發時有機率撞 E11000
+    DuplicateKeyError（run_id 唯一索引）——詳見檔案頂部說明。
+    捕捉該例外後，retry 同一呼叫但 upsert=False，此時文檔確定已存在，
+    不會再觸發 insert 路徑，不可能再次撞唯一索引。
+
+    v1.1 修復：原先用「比對 lock_acquired_at 時間戳差距」判斷是否搶鎖成功，
+    但 pymongo 讀回的 datetime 預設不帶時區資訊（且數值為 UTC），與寫入時的
+    EST-aware datetime 比較會產生約 4-5 小時的時區誤判，導致搶鎖實際成功
+    但被誤判為失敗（鎖留在 True 卻無人釋放）。
+    改為唯一 token 比對，不涉及任何時間運算，徹底避開時區陷阱。
+
+    返回 True = 搶鎖成功，可以開始運算
+    返回 False = 上一個 job 仍在合法運行中，本次直接退出
+    """
+    col = db.stock_db["Phase_Calc_Progress"]
+    now = datetime.now(EST_TZ)
+    stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
+    token = uuid.uuid4().hex
+
+    filter_query = {
+        "run_id": db.RUN_ID,
+        "$or": [
+            {"is_running": {"$exists": False}},
+            {"is_running": False},
+            {"lock_acquired_at": {"$lt": stale_before}},
+        ],
+    }
+    update_doc = {
+        "$set": {
+            "is_running": True,
+            "lock_acquired_at": now,
+            "lock_token": token,
+        }
+    }
+
+    try:
+        _try_lock_update(col, filter_query, update_doc, upsert=True)
+    except DuplicateKeyError:
+        # 文檔已被另一個併發 process 建立（即使其內容不滿足 $or 條件），
+        # 確定存在，改用 upsert=False 重試一次即可，不會再次撞唯一索引。
+        print(f"[{_now_est()}] ⚠️ 搶鎖 upsert 撞 DuplicateKeyError（併發場景），"
+              f"以 upsert=False 重試一次")
+        _try_lock_update(col, filter_query, update_doc, upsert=False)
+
+    # find_one_and_update 在條件不匹配時不會執行 $set，
+    # 重新讀取後比對 lock_token 是否為本次寫入的值，
+    # 是 = 搶鎖成功（無論原本是 upsert 新建還是更新既有文檔）；
+    # 否 = 條件不匹配，鎖被別人（或仍在合法運行中的舊狀態）持有，搶鎖失敗。
+    doc = col.find_one({"run_id": db.RUN_ID})
+    return bool(doc) and doc.get("lock_token") == token
+
+
+def _release_lock(db: PhaseCalcDB):
+    """釋放 MongoDB 層級鎖。無論本次運算成功或失敗都必須呼叫（finally）。"""
+    col = db.stock_db["Phase_Calc_Progress"]
+    col.update_one(
+        {"run_id": db.RUN_ID},
+        {"$set": {"is_running": False}},
+    )
+
+
+def main() -> int:
+    """
+    主入口。返回值作為 process exit code：
+      0 = 正常結束（含 ALL_ROUNDS_DONE / ALREADY_DONE / 正常逾時收尾）
+      1 = 異常（連線失敗、未預期例外）
+    GitHub Actions 不需要靠 exit code 判斷是否要重試，排程本來就是
+    每小時固定觸發，這裡的 exit code 只影響 workflow run 的成功/失敗標記，
+    方便在 GitHub Actions 介面上肉眼看出歷史執行是否正常。
+    """
+    try:
+        db = PhaseCalcDB()
+    except Exception as e:
+        print(f"[{_now_est()}] ❌ 初始化 PhaseCalcDB 失敗: {e}")
+        return 1
+
+    if db.is_done():
+        print(f"[{_now_est()}] ✅ 全部輪次已完成（ALL_ROUNDS_DONE），無需執行")
+        return 0
+
+    if not _acquire_lock(db):
+        print(f"[{_now_est()}] ⏸️ 搶鎖失敗，上一個 job 仍在合法運行中，本次跳過")
+        return 0
+
+    print(f"[{_now_est()}] 🔒 搶鎖成功，開始執行 phase_calc")
+
+    start_time = time.monotonic()
+    batch_count = 0
+    last_status = "UNKNOWN"
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= MAX_JOB_SECONDS:
+                print(f"[{_now_est()}] ⏰ 已運行 {elapsed/3600:.2f} 小時，"
+                      f"達到主動逾時門檻（{MAX_JOB_SECONDS/3600:.1f} 小時），"
+                      f"收尾結束，等待下次排程接續")
+                last_status = "TIMEOUT_GRACEFUL_STOP"
+                break
+
+            result = run_phase_calc_batch(db)
+            status = result.get("status", "UNKNOWN")
+            last_status = status
+            batch_count += 1
+
+            round_num = result.get("round", "?")
+            completed = result.get("completed_count", "?")
+            total = result.get("total_tickers", "?")
+            print(f"[{_now_est()}] batch #{batch_count} | {status} | "
+                  f"R{round_num} | {completed}/{total}")
+
+            if status == "BATCH_DONE":
+                # 原 HF 版本這裡會 sleep(2.0) 再自激發；GitHub Actions 是
+                # 單進程內迴圈，不需要這個延遲（沒有 HTTP round-trip 開銷），
+                # 直接進下一輪迴圈即可。HF commit 速率限制仍由
+                # _hf_batch_commit 內部的 429 重試邏輯處理，不需要在這裡額外等待。
+                continue
+
+            elif status == "ALL_DONE":
+                next_round = result.get("next_round", "?")
+                print(f"[{_now_est()}] ✅ 第 {round_num} 輪完成，"
+                      f"進入第 {next_round} 輪")
+                continue
+
+            elif status == "ALL_ROUNDS_DONE":
+                print(f"[{_now_est()}] 🏁 全部輪次相位計算完成（共 {round_num} 輪），停止")
+                break
+
+            elif status == "ALREADY_DONE":
+                print(f"[{_now_est()}] 相位計算所有輪次已完成，跳過")
+                break
+
+            elif status == "COMMIT_FAILED":
+                print(f"[{_now_est()}] ⚠️ HF commit 失敗，本次 job 結束，"
+                      f"進度未推進，等待下次排程重試")
+                break
+
+            elif status == "SCAN_ERROR":
+                print(f"[{_now_est()}] ⚠️ HF 目錄掃描失敗，本次 job 結束，"
+                      f"等待下次排程重試")
+                break
+
+            else:
+                print(f"[{_now_est()}] ⚠️ 未預期狀態 {status}，本次 job 結束")
+                break
+
+    except Exception as e:
+        print(f"[{_now_est()}] ❌ phase_calc 執行異常: {e}")
+        last_status = "EXCEPTION"
+        return 1
+
+    finally:
+        _release_lock(db)
+        elapsed_total = time.monotonic() - start_time
+        print(f"[{_now_est()}] 🔓 鎖已釋放 | 本次 job 共執行 {batch_count} 個 batch | "
+              f"耗時 {elapsed_total/3600:.2f} 小時 | 最終狀態: {last_status}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

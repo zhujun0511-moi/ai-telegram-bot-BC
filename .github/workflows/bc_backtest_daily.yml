@@ -1,0 +1,42 @@
+name: BC Backtest Daily
+
+# 每日回測（取代 LC /webhook/daily）——拉模式：梯次輪詢 + 截止告警 + 自動補課
+# 設計依據：handoff_20260703_bc_buildout.md
+# 四班崗目標 22:00 / 23:30 / 01:00 / 03:00 EST（cron 為 UTC 近似，
+# 冬令時各漂移 1h，末班/截止判斷由腳本內 EST 自算）
+# 冪等：backtest_done_{date} 鍵，只有第一個等到 DC 完工的班次真跑
+
+on:
+  schedule:
+    - cron: "0 2 * * *"    # ~22:00 EST（前一日）
+    - cron: "30 3 * * *"   # ~23:30 EST
+    - cron: "0 5 * * *"    # ~01:00 EST
+    - cron: "0 7 * * *"    # ~03:00 EST（末班：截止告警崗）
+  workflow_dispatch:
+
+concurrency:
+  group: bc-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz
+
+      - name: Run daily backtest
+        env:
+          MONGO_URI:      ${{ secrets.MONGO_URI }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:   ${{ vars.COMM_HUB_URL }}
+        run: python run_backtest_daily.py

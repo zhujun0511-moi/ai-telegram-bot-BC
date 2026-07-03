@@ -1,0 +1,42 @@
+name: BC Verify Weekend
+
+# 週末 V3 數據完整性核查（取代 DC 平日多輪 verify）
+# 設計依據：handoff_20260703_bc_buildout.md
+# - 週六 08:00 EDT（12:00 UTC）主跑；冬令時漂移為 07:00 EST，可接受，
+#   一切時刻判斷由腳本內 EST 自算
+# - 週日同時刻條件兜底：verdict 冪等，無 blocked 殘留時自動空轉秒退
+# - workflow_dispatch 永遠保留（手動測試/補跑）
+
+on:
+  schedule:
+    - cron: "0 12 * * 6"   # 週六
+    - cron: "0 12 * * 0"   # 週日兜底
+  workflow_dispatch:
+
+concurrency:
+  group: bc-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355    # 腳本 5.5h 自行優雅收尾，此為外層保險
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz
+
+      - name: Run weekend verify
+        env:
+          MONGO_URI:      ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:    ${{ secrets.POLYGON_KEY }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:   ${{ vars.COMM_HUB_URL }}
+        run: python run_verify_weekend.py
