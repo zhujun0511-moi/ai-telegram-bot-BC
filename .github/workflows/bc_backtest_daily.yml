@@ -49,4 +49,5 @@ jobs:
           COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
           GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           NEXT_WORKFLOW:  ${{ inputs.chain_next || '' }}
+          PYTHONUNBUFFERED: "1"
         run: python run_backtest_daily.py

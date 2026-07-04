@@ -79,10 +79,42 @@ def _log(msg: str):
 # 日期工具（16:00 翻轉語義，與 handoff 對照表一致）
 # ─────────────────────────────────────────────
 
+FALLBACK_HOLIDAYS = {
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+}
+_HOLIDAY_CACHE = {"holidays": None}
+
+
+def load_market_calendar(stock_db):
+    """
+    自 Configs {type:"market_calendar"} 載入假日表（與 AC timectx 同源）。
+    失敗回落 FALLBACK_HOLIDAYS。main() 於 DB 初始化後、任何日期計算前呼叫。
+    """
+    try:
+        doc = stock_db["Configs"].find_one({"type": "market_calendar"})
+        if doc and doc.get("holidays"):
+            _HOLIDAY_CACHE["holidays"] = set(doc["holidays"])
+            _log(f"market_calendar 載入 {len(_HOLIDAY_CACHE['holidays'])} 個假日")
+            return
+    except Exception as e:
+        _log(f"market_calendar 讀取失敗，使用內建兜底表: {e}")
+    _HOLIDAY_CACHE["holidays"] = None
+
+
+def _is_trading_day(d) -> bool:
+    if d.weekday() >= 5:
+        return False
+    hol = _HOLIDAY_CACHE["holidays"] or FALLBACK_HOLIDAYS
+    return d.strftime("%Y-%m-%d") not in hol
+
+
 def _prev_trading_day(d):
-    """前一個交易日，只排週末（與既有系統一致的簡化，假日由 canary 兜底）"""
+    """前一個交易日（假日感知，v1.2：不再只排週末）"""
     d -= timedelta(days=1)
-    while d.weekday() >= 5:
+    while not _is_trading_day(d):
         d -= timedelta(days=1)
     return d
 
@@ -97,9 +129,7 @@ def get_completed_trading_date(now_est: Optional[datetime] = None) -> str:
     if now_est is None:
         now_est = _now_est()
     today = now_est.date()
-    if today.weekday() >= 5:
-        return _prev_trading_day(today).strftime("%Y-%m-%d")
-    if now_est.hour < 16:
+    if not _is_trading_day(today) or now_est.hour < 16:
         return _prev_trading_day(today).strftime("%Y-%m-%d")
     return today.strftime("%Y-%m-%d")
 
@@ -408,6 +438,8 @@ def main() -> int:
         _log(f"❌ 初始化 VerifyDB 失敗: {e}")
         return 1
 
+    load_market_calendar(db.stock_db)
+
     # ── 輸入回聲塊 ──
     all_tickers = db.get_all_tickers()
     _log("=== 輸入回聲 ===")
@@ -415,6 +447,8 @@ def main() -> int:
     _log(f"  Mongo ping: {db.client.admin.command('ping')}")
     _log(f"  POLYGON_DELAY={POLYGON_DELAY}s | 熔斷: 樣本≥{BLOCK_MIN_SAMPLE} "
          f"且 blocked≥{BLOCK_RATIO:.0%} → 冷卻 {BLOCK_COOLDOWN}s")
+    _log(f"  假日表來源: {'Mongo' if _HOLIDAY_CACHE['holidays'] else '內建兜底'} | "
+         f"今日是否交易日: {_is_trading_day(_now_est().date())}")
 
     if not all_tickers:
         _log("❌ ticker 清單為空（Configs.full_set），中止")
