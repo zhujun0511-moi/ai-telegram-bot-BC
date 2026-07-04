@@ -1,10 +1,9 @@
 name: BC Backtest Daily
 
 # 每日回測（取代 LC /webhook/daily）——拉模式：梯次輪詢 + 截止告警 + 自動補課
-# 設計依據：handoff_20260703_bc_buildout.md
+# v1.1：單次 run 循環吃光全部欠課；可選 workflow 接力（chain_next）
 # 四班崗目標 22:00 / 23:30 / 01:00 / 03:00 EST（cron 為 UTC 近似，
-# 冬令時各漂移 1h，末班/截止判斷由腳本內 EST 自算）
-# 冪等：backtest_done_{date} 鍵，只有第一個等到 DC 完工的班次真跑
+# 末班/截止判斷由腳本內 EST 自算）
 
 on:
   schedule:
@@ -13,6 +12,15 @@ on:
     - cron: "0 5 * * *"    # ~01:00 EST
     - cron: "0 7 * * *"    # ~03:00 EST（末班：截止告警崗）
   workflow_dispatch:
+    inputs:
+      chain_next:
+        description: "完成後接力的 workflow 檔名（如 bc_verify_weekend.yml，留空不接力）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write    # workflow 接力所需（GITHUB_TOKEN dispatch）
 
 concurrency:
   group: bc-backtest
@@ -39,4 +47,6 @@ jobs:
           MONGO_URI:      ${{ secrets.MONGO_URI }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          NEXT_WORKFLOW:  ${{ inputs.chain_next || '' }}
         run: python run_backtest_daily.py

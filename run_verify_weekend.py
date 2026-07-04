@@ -132,6 +132,34 @@ def _notify(msg: str):
         _log(f"[notify] 推送失敗: {e}")
 
 
+def _dispatch_next_workflow():
+    """
+    workflow 接力：乾淨完成後 dispatch 下一個 workflow。
+    NEXT_WORKFLOW = 目標 yml 檔名（空值 = 不接力）。
+    使用 GHA 內建 GITHUB_TOKEN（yml 需 permissions: actions: write）。
+    """
+    wf = os.getenv("NEXT_WORKFLOW", "").strip()
+    if not wf:
+        return
+    repo  = os.getenv("GITHUB_REPOSITORY", "")
+    token = os.getenv("GITHUB_TOKEN", "")
+    ref   = os.getenv("GITHUB_REF_NAME", "main")
+    if not (repo and token):
+        _log(f"[chain] 缺 GITHUB_REPOSITORY/GITHUB_TOKEN，無法接力 {wf}")
+        return
+    try:
+        resp = requests.post(
+            f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+            json={"ref": ref},
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        _log(f"[chain] 接力 dispatch {wf}: {resp.status_code}")
+    except Exception as e:
+        _log(f"[chain] 接力失敗 {wf}: {e}")
+
+
 # ─────────────────────────────────────────────
 # DB
 # ─────────────────────────────────────────────
@@ -487,6 +515,7 @@ def main() -> int:
         _notify(summary)
         db.write_task_log(status, counts["filled"] + counts["confirmed_empty"],
                           total_points, last_error, started_at)
+        _dispatch_next_workflow()   # 乾淨完成才接力
         return 0
 
     except Exception as e:

@@ -1,5 +1,5 @@
 """
-run_backtest_daily.py — 每日回測 GitHub Actions 版 v1.0（取代 LC /webhook/daily）
+run_backtest_daily.py — 每日回測 GitHub Actions 版 v1.1（取代 LC /webhook/daily）
 
 觸發模式：拉（輪詢），不是推。設計依據：handoff_20260703_bc_buildout.md
 
@@ -86,6 +86,34 @@ def _notify(msg: str):
         _log(f"[notify] 推送: {resp.status_code}")
     except Exception as e:
         _log(f"[notify] 推送失敗: {e}")
+
+
+def _dispatch_next_workflow():
+    """
+    workflow 接力：乾淨完成後 dispatch 下一個 workflow。
+    NEXT_WORKFLOW = 目標 yml 檔名（如 bc_verify_weekend.yml），空值 = 不接力。
+    使用 GHA 內建 GITHUB_TOKEN（yml 需 permissions: actions: write）。
+    """
+    wf = os.getenv("NEXT_WORKFLOW", "").strip()
+    if not wf:
+        return
+    repo  = os.getenv("GITHUB_REPOSITORY", "")
+    token = os.getenv("GITHUB_TOKEN", "")
+    ref   = os.getenv("GITHUB_REF_NAME", "main")
+    if not (repo and token):
+        _log(f"[chain] 缺 GITHUB_REPOSITORY/GITHUB_TOKEN，無法接力 {wf}")
+        return
+    try:
+        resp = requests.post(
+            f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+            json={"ref": ref},
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        _log(f"[chain] 接力 dispatch {wf}: {resp.status_code}")
+    except Exception as e:
+        _log(f"[chain] 接力失敗 {wf}: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -264,9 +292,7 @@ def main() -> int:
     _log(f"  補課視窗: 最近 {BACKFILL_MAX_DAYS} 天 | 末班判定: "
          f"{_is_last_shift(started_at)}")
 
-    owed = _find_owed_date(state)
-
-    if not owed:
+    if not _find_owed_date(state):
         expected = get_completed_trading_date(started_at)
         chain_ok = bool(state.get(f"after_hours_done_{expected}"))
         if _is_last_shift(started_at) and not chain_ok:
@@ -281,45 +307,67 @@ def main() -> int:
                  f"done={chain_ok}），靜默退出")
         return 0
 
-    _log(f"📌 欠課日期: {owed}，開始回測")
-
     if not _acquire_lock(db):
         _log("⏸️ 搶鎖失敗，另一個 backtest job 仍在合法運行中，本次跳過")
         return 0
     _log("🔒 搶鎖成功")
 
     last_error = ""
+    processed  = []       # [(date, batches, signals)]
+    timed_out  = False
     try:
-        result = _run_backtest_for_date(db, owed, start_mono)
-        status = result["status"]
+        # ── v1.1：循環吃光全部欠課（由老到新）──
+        while True:
+            if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
+                timed_out = True
+                break
+            owed = _find_owed_date(_get_global_state(db))
+            if not owed:
+                break
+            _log(f"📌 欠課日期: {owed}，開始回測 "
+                 f"（已完成 {len(processed)} 個）")
+            result = _run_backtest_for_date(db, owed, start_mono)
+            status = result["status"]
+            if status == "TIMEOUT_GRACEFUL_STOP":
+                timed_out = True
+                break
+            if status not in ("ALL_DONE", "ALREADY_DONE"):
+                raise RuntimeError(f"回測異常終態: {status} @ {owed}")
+            _set_global_key(db, f"backtest_done_{owed}", True)
+            processed.append((owed, result["batches"], result["signals"]))
+            _log(f"✅ {owed} 完成 | 批次 {result['batches']} | "
+                 f"新信號 {result['signals']}")
 
-        if status == "TIMEOUT_GRACEFUL_STOP":
-            _log("⏰ 5.5h 優雅逾時，進度已存檔，下一班崗續跑（不設 done 鍵）")
-            _write_task_log(db, status, result["batches"], 0,
+        if timed_out:
+            _log("⏰ 5.5h 優雅逾時，進度已存檔，下一班崗續跑"
+                 "（當前日期不設 done 鍵，不接力）")
+            if processed:
+                _notify(f"⏰ [BC backtest] 逾時暫停：本輪已完成 "
+                        f"{len(processed)} 個日期"
+                        f"（{processed[0][0]} ~ {processed[-1][0]}），"
+                        f"餘量下班崗續跑")
+            _write_task_log(db, "TIMEOUT_GRACEFUL_STOP", len(processed), 0,
                             "graceful timeout", started_at)
             return 0
 
-        if status not in ("ALL_DONE", "ALREADY_DONE"):
-            raise RuntimeError(f"回測異常終態: {status}")
-
-        # ── 統計分析 ──
+        # ── 統計分析（循環結束後執行一次）──
         stats_result = run_stats_analysis(StatsDB())
         stats_status = stats_result.get("status", "UNKNOWN")
 
-        # ── 冪等鍵 + 摘要 ──
-        _set_global_key(db, f"backtest_done_{owed}", True)
         elapsed = (time.monotonic() - start_mono) / 60
+        dates_line = "、".join(p[0] for p in processed)
         summary = (
-            f"📚 [BC backtest] {owed} 回測完成\n"
-            f"批次 {result['batches']} | 新信號 {result['signals']} | "
+            f"📚 [BC backtest] 完成 {len(processed)} 個日期：{dates_line}\n"
+            f"新信號合計 {sum(p[2] for p in processed)} | "
             f"統計 {stats_status}"
             f"（事件總數 {stats_result.get('total_events', 'N/A')}）\n"
             f"耗時 {elapsed:.1f} 分鐘"
         )
         _log(summary.replace("\n", " | "))
         _notify(summary)
-        _write_task_log(db, "DONE", result["batches"], result["batches"],
+        _write_task_log(db, "DONE", len(processed), len(processed),
                         last_error, started_at)
+        _dispatch_next_workflow()   # 乾淨完成才接力
         return 0
 
     except Exception as e:

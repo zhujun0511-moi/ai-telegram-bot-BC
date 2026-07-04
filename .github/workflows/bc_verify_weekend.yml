@@ -1,17 +1,22 @@
 name: BC Verify Weekend
 
 # 週末 V3 數據完整性核查（取代 DC 平日多輪 verify）
-# 設計依據：handoff_20260703_bc_buildout.md
-# - 週六 08:00 EDT（12:00 UTC）主跑；冬令時漂移為 07:00 EST，可接受，
-#   一切時刻判斷由腳本內 EST 自算
-# - 週日同時刻條件兜底：verdict 冪等，無 blocked 殘留時自動空轉秒退
-# - workflow_dispatch 永遠保留（手動測試/補跑）
+# 判準退一天 + verdict 持久化 + 金絲雀假日防禦；可選 workflow 接力
 
 on:
   schedule:
-    - cron: "0 12 * * 6"   # 週六
-    - cron: "0 12 * * 0"   # 週日兜底
+    - cron: "0 12 * * 6"   # 週六 ~08:00 EST
+    - cron: "0 12 * * 0"   # 週日兜底（verdict 冪等，自動空轉）
   workflow_dispatch:
+    inputs:
+      chain_next:
+        description: "完成後接力的 workflow 檔名（留空不接力）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
 
 concurrency:
   group: bc-verify
@@ -20,7 +25,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 355    # 腳本 5.5h 自行優雅收尾，此為外層保險
+    timeout-minutes: 355
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,4 +44,6 @@ jobs:
           POLYGON_KEY:    ${{ secrets.POLYGON_KEY }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          NEXT_WORKFLOW:  ${{ inputs.chain_next || '' }}
         run: python run_verify_weekend.py
