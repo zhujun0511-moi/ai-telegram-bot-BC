@@ -1,8 +1,22 @@
 """
-run_verify_weekend.py — V3 數據完整性核查 GitHub Actions 版 v1.0
+run_verify_weekend.py — V3 數據完整性核查 GitHub Actions 版 v1.1
 
 取代 DC tasks/v3_processor.process_v3_verify_task 的多輪自激發設計。
 設計依據：handoff_20260703_bc_buildout.md
+
+v1.1 新增（2026-07-05）：
+  Ticker 身份核對（Ticker_Identity）——防禦「舊ticker下市後被新公司重新
+  註冊、Polygon Aggregates API 把兩段不相關歷史資料拼接」的資料污染問題
+  （2026-07-04 SPCX 事故：SpaceX 借用已下市的 SPAC and New Issue ETF 舊代碼）。
+
+  設計原則（低頻任務，只搭週六BC verify順風車）：
+  - Ticker_Identity 只記錄 338 支核心ticker
+  - list_date 只在該 ticker 第一次沒有記錄時才打 Polygon Reference API，
+    一旦寫入永久快取，之後每週不再重查（list_date 不會變）
+  - 每週核對本身完全不打 Polygon，純 MongoDB 內部比較「最舊 bar 日期」
+    vs「list_date」，成本趨近於零
+  - 只標記、寫入告警，不自動刪除任何資料——刪除需要人工核實
+    （SPCX 這次是人工查證 SpaceX 實際上市日後才動手刪的，模式延續）
 
 舊版為什麼跑很多輪（本版逐條消滅）：
   1. 判準「最後 D bar == 今天」撞上 Polygon 免費層當日數據延遲
@@ -206,6 +220,11 @@ class VerifyDB:
              ("target_date", pymongo.ASCENDING)],
             unique=True,
         )
+        # v1.1 新增：Ticker_Identity 唯一索引
+        self.stock_db["Ticker_Identity"].create_index(
+            [("ticker", pymongo.ASCENDING)],
+            unique=True,
+        )
 
     # ── ticker 清單（與 DC get_all_tickers 同源：Configs.full_set）──
     def get_all_tickers(self) -> List[str]:
@@ -279,6 +298,28 @@ class VerifyDB:
         ]):
             out[row["_id"]] = row["n"]
         return out
+
+    # ── Ticker_Identity（v1.1 新增：ticker 重複使用防禦）──
+    def get_ticker_identity(self, ticker: str) -> Optional[dict]:
+        return self.stock_db["Ticker_Identity"].find_one({"ticker": ticker.upper()})
+
+    def set_ticker_identity(self, ticker: str, list_date, cik, company_name):
+        self.stock_db["Ticker_Identity"].update_one(
+            {"ticker": ticker.upper()},
+            {"$set": {
+                "list_date":    list_date,
+                "cik":          cik,
+                "company_name": company_name,
+                "checked_at":   _now_est(),
+            }},
+            upsert=True,
+        )
+
+    def get_oldest_bar_date(self, ticker: str, period: str) -> Optional[str]:
+        bars = self.get_bars(ticker, period)
+        if not bars:
+            return None
+        return min(b["t"][:10] for b in bars)
 
     # ── Task_Log（標準欄位）──
     def write_task_log(self, status: str, progress: int, total: int,
@@ -364,6 +405,8 @@ def _fetch_polygon(ticker: str, period_label: str,
             for r in results:
                 dt_obj = datetime.fromtimestamp(r["t"] / 1000, EST_TZ)
                 # W period：Polygon 返回週日戳，統一修正為當週週一（W-MON 錨定）
+                # v12.35 修復：週日 weekday()==6，減6天會退到上一週的週一，不是這週。
+                # 正確做法：週日 +1 天 = 這週的週一。
                 if period_label == "W":
                     dt_obj = dt_obj + timedelta(days=1)
                 processed.append({
@@ -378,6 +421,39 @@ def _fetch_polygon(ticker: str, period_label: str,
                 return None
             time.sleep(POLYGON_WAIT)
     return None
+
+
+def _fetch_polygon_reference(ticker: str) -> Optional[dict]:
+    """
+    查詢 Polygon Reference API 取得 ticker 上市日期等身份資訊（v1.1 新增）。
+
+    只在 Ticker_Identity 裡沒有這支 ticker 記錄時才會被呼叫一次，
+    之後永久快取，不重複查詢（list_date 不會變）。
+
+    回傳 None → 狀態未知（限速/連線異常），下次再試
+    回傳 {}   → Polygon 確認查無此 ticker 的身份資料
+    回傳 dict → 正常取得 {list_date, cik, company_name}
+    """
+    url = f"https://api.polygon.io/v3/reference/tickers/{ticker}?apiKey={POLYGON_KEY}"
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code in (429, 403):
+            _log(f"  ⚠️ [{ticker}] Reference API 限速/封鎖 ({resp.status_code})")
+            return None
+        if resp.status_code != 200:
+            _log(f"  ❌ [{ticker}] Reference API HTTP {resp.status_code}")
+            return None
+        data = resp.json().get("results")
+        if not data:
+            return {}
+        return {
+            "list_date":    data.get("list_date"),
+            "cik":          data.get("cik"),
+            "company_name": data.get("name"),
+        }
+    except Exception as e:
+        _log(f"  ❌ [{ticker}] Reference API 連線異常: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -501,7 +577,6 @@ def main() -> int:
             if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
                 _log("⏱️ 逼近時限，提前結束本輪補抓")
                 break
-
             # v12.35 修復：W period 用單日窗口查詢是錯的，會抓到/寫入錯誤的舊週線資料
             if period == "W":
                 fetch_start = (
@@ -525,14 +600,11 @@ def main() -> int:
                 db.set_verdict(ticker, period, target_date,
                                "confirmed_empty", "polygon_200_empty")
                 empty += 1
-
             window_processed += 1
             if (i + 1) % 20 == 0:
                 _log(f"  進度 {i+1}/{len(to_fetch)} | "
                      f"補抓成功 {fetched} | 確認空 {empty} | blocked {blocked}")
-
             time.sleep(POLYGON_DELAY)
-
             # ── 熔斷：改為冷卻等待而非中止（GHA 時間便宜）──
             if (window_processed >= BLOCK_MIN_SAMPLE
                     and window_blocked / window_processed >= BLOCK_RATIO):
@@ -541,37 +613,43 @@ def main() -> int:
                 time.sleep(BLOCK_COOLDOWN)
                 window_processed = 0
                 window_blocked   = 0
-            if bars:
-                result = db.push_bars(ticker, period, bars)
-                db.set_verdict(ticker, period, target_date,
-                               "filled", f"polygon_{result}")
-                filled  += 1
-                fetched += 1
-            elif bars is None:
-                db.set_verdict(ticker, period, target_date,
-                               "blocked", "polygon_unknown")
-                blocked        += 1
-                window_blocked += 1
-            else:
-                db.set_verdict(ticker, period, target_date,
-                               "confirmed_empty", "polygon_200_empty")
-                empty += 1
 
-            window_processed += 1
-            if (i + 1) % 20 == 0:
-                _log(f"  進度 {i+1}/{len(to_fetch)} | "
-                     f"補抓成功 {fetched} | 確認空 {empty} | blocked {blocked}")
+        # ── Ticker 身份核對（Ticker_Identity，v1.1 新增，週六BC專屬低頻任務）──
+        _log("=== Ticker 身份核對開始 ===")
+        identity_fetched = 0
+        identity_checked = 0
+        suspected_reuse  = []
 
-            time.sleep(POLYGON_DELAY)
+        for ticker in all_tickers:
+            identity = db.get_ticker_identity(ticker)
 
-            # ── 熔斷：改為冷卻等待而非中止（GHA 時間便宜）──
-            if (window_processed >= BLOCK_MIN_SAMPLE
-                    and window_blocked / window_processed >= BLOCK_RATIO):
-                _log(f"🚨 偵測系統性限速（{window_blocked}/{window_processed}），"
-                     f"冷卻 {BLOCK_COOLDOWN}s 後繼續")
-                time.sleep(BLOCK_COOLDOWN)
-                window_processed = 0
-                window_blocked   = 0
+            # 沒記錄過，才打一次 Polygon（之後永久快取，不重查）
+            if identity is None:
+                info = _fetch_polygon_reference(ticker)
+                time.sleep(POLYGON_DELAY)
+                if info is None:
+                    continue  # 狀態未知，下週再試
+                db.set_ticker_identity(
+                    ticker,
+                    info.get("list_date"),
+                    info.get("cik"),
+                    info.get("company_name"),
+                )
+                identity_fetched += 1
+                identity = db.get_ticker_identity(ticker)
+
+            list_date = identity.get("list_date")
+            if not list_date:
+                continue  # 這支查無上市日資料，跳過核對
+
+            identity_checked += 1
+            for period in VERIFY_PERIODS:
+                oldest = db.get_oldest_bar_date(ticker, period)
+                if oldest and oldest < list_date:
+                    suspected_reuse.append((ticker, period, oldest, list_date))
+
+        _log(f"  身份核對完成 | 新登記 {identity_fetched} | 已核對 {identity_checked} | "
+             f"疑似ticker重複使用 {len(suspected_reuse)}")
 
         # ── 收尾 ──
         counts  = db.count_verdicts(target_date)
@@ -583,6 +661,10 @@ def main() -> int:
             f"確認空 {counts['confirmed_empty']} | blocked {counts['blocked']}\n"
             f"本次補抓 {fetched} | 耗時 {elapsed:.1f} 分鐘"
         )
+        if suspected_reuse:
+            reuse_list = ", ".join(f"{t}/{p}" for t, p, _, _ in suspected_reuse[:10])
+            more = f" 等共{len(suspected_reuse)}個" if len(suspected_reuse) > 10 else ""
+            summary += f"\n⚠️ 疑似ticker重複使用: {reuse_list}{more}（需人工核實，未自動處理）"
         _log(summary.replace("\n", " | "))
         _notify(summary)
         db.write_task_log(status, counts["filled"] + counts["confirmed_empty"],
