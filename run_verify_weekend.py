@@ -498,11 +498,18 @@ def main() -> int:
         window_processed = 0
         window_blocked   = 0
         for i, (ticker, period) in enumerate(to_fetch):
-            if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
-                _log("⏰ 達到 5.5h 優雅逾時門檻，收尾（verdict 即斷點，下次續跑）")
-                break
+                              if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
+                                     _log("...")
+                                     break
 
-            bars = _fetch_polygon(ticker, period, target_date, target_date)
+                                     # v12.35 修復：W period 用單日窗口查詢是錯的，會抓到/寫入錯誤的舊週線資料
+                               if period == "W":
+                                       fetch_start = (
+                                                  datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=10)
+                                        ).strftime("%Y-%m-%d")
+                                else:
+                                          fetch_start = target_date
+                                bars = _fetch_polygon(ticker, period, fetch_start, target_date)
             if bars:
                 result = db.push_bars(ticker, period, bars)
                 db.set_verdict(ticker, period, target_date,
