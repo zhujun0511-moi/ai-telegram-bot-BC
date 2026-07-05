@@ -498,18 +498,49 @@ def main() -> int:
         window_processed = 0
         window_blocked   = 0
         for i, (ticker, period) in enumerate(to_fetch):
-                              if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
-                                     _log("...")
-                                     break
+            if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
+                _log("⏱️ 逼近時限，提前結束本輪補抓")
+                break
 
-                                     # v12.35 修復：W period 用單日窗口查詢是錯的，會抓到/寫入錯誤的舊週線資料
-                               if period == "W":
-                                       fetch_start = (
-                                                  datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=10)
-                                        ).strftime("%Y-%m-%d")
-                                else:
-                                          fetch_start = target_date
-                                bars = _fetch_polygon(ticker, period, fetch_start, target_date)
+            # v12.35 修復：W period 用單日窗口查詢是錯的，會抓到/寫入錯誤的舊週線資料
+            if period == "W":
+                fetch_start = (
+                    datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=10)
+                ).strftime("%Y-%m-%d")
+            else:
+                fetch_start = target_date
+            bars = _fetch_polygon(ticker, period, fetch_start, target_date)
+            if bars:
+                result = db.push_bars(ticker, period, bars)
+                db.set_verdict(ticker, period, target_date,
+                               "filled", f"polygon_{result}")
+                filled  += 1
+                fetched += 1
+            elif bars is None:
+                db.set_verdict(ticker, period, target_date,
+                               "blocked", "polygon_unknown")
+                blocked        += 1
+                window_blocked += 1
+            else:
+                db.set_verdict(ticker, period, target_date,
+                               "confirmed_empty", "polygon_200_empty")
+                empty += 1
+
+            window_processed += 1
+            if (i + 1) % 20 == 0:
+                _log(f"  進度 {i+1}/{len(to_fetch)} | "
+                     f"補抓成功 {fetched} | 確認空 {empty} | blocked {blocked}")
+
+            time.sleep(POLYGON_DELAY)
+
+            # ── 熔斷：改為冷卻等待而非中止（GHA 時間便宜）──
+            if (window_processed >= BLOCK_MIN_SAMPLE
+                    and window_blocked / window_processed >= BLOCK_RATIO):
+                _log(f"🚨 偵測系統性限速（{window_blocked}/{window_processed}），"
+                     f"冷卻 {BLOCK_COOLDOWN}s 後繼續")
+                time.sleep(BLOCK_COOLDOWN)
+                window_processed = 0
+                window_blocked   = 0
             if bars:
                 result = db.push_bars(ticker, period, bars)
                 db.set_verdict(ticker, period, target_date,
