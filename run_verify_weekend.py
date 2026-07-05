@@ -365,7 +365,7 @@ def _fetch_polygon(ticker: str, period_label: str,
                 dt_obj = datetime.fromtimestamp(r["t"] / 1000, EST_TZ)
                 # W period：Polygon 返回週日戳，統一修正為當週週一（W-MON 錨定）
                 if period_label == "W":
-                    dt_obj = dt_obj - timedelta(days=dt_obj.weekday())
+                    dt_obj = dt_obj + timedelta(days=1)
                 processed.append({
                     "t": dt_obj.strftime("%Y-%m-%d %H:%M:%S"),
                     "o": r["o"], "h": r["h"],
