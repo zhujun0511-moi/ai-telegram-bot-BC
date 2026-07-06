@@ -53,10 +53,11 @@ from pymongo.errors import DuplicateKeyError
 
 EST_TZ = pytz.timezone("US/Eastern")
 
-MONGO_URI      = os.getenv("MONGO_URI", "")
-POLYGON_KEY    = os.getenv("POLYGON_KEY", "")
-COMM_HUB_URL   = os.getenv("COMM_HUB_URL", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+MONGO_URI        = os.getenv("MONGO_URI", "")
+POLYGON_KEY      = os.getenv("POLYGON_KEY", "")
+COMM_HUB_URL     = os.getenv("COMM_HUB_URL", "").strip()
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "").strip()
+ANALYSIS_HUB_URL = os.getenv("ANALYSIS_HUB_URL", "").strip().rstrip("/")
 
 POLYGON_DELAY     = 13.5
 POLYGON_WAIT      = 65
@@ -174,6 +175,29 @@ def _notify(msg: str):
         _log(f"[notify] 推送: {resp.status_code}")
     except Exception as e:
         _log(f"[notify] 推送失敗: {e}")
+
+
+def _trigger_weekly_report(target_date: str):
+    """
+    週末核查完成後觸發 AC /webhook/weekly（此前這一步一直缺失，週報只能手動POST）。
+    ANALYSIS_HUB_URL 只存根網址，路徑由這裡自己拼接（2026-07-07 拍板的新慣例）。
+    header 用 WEBHOOK_SECRET（跟環境變數同名，才是全系統真正在用的header名稱；
+    x-webhook-secret 是歷史累積的誤用，AC端已有相容層兩種都收）。
+    """
+    if not ANALYSIS_HUB_URL:
+        _log("[weekly] ANALYSIS_HUB_URL 未設定，跳過觸發週報")
+        return
+    try:
+        resp = requests.post(
+            f"{ANALYSIS_HUB_URL}/webhook/weekly",
+            json={"trading_date": target_date},
+            headers={"WEBHOOK_SECRET": WEBHOOK_SECRET,
+                     "Content-Type": "application/json"},
+            timeout=10,
+        )
+        _log(f"[weekly] 觸發 AC /webhook/weekly: {resp.status_code}")
+    except Exception as e:
+        _log(f"[weekly] 觸發失敗: {e}")
 
 
 def _dispatch_next_workflow():
@@ -669,6 +693,7 @@ def main() -> int:
         _notify(summary)
         db.write_task_log(status, counts["filled"] + counts["confirmed_empty"],
                           total_points, last_error, started_at)
+        _trigger_weekly_report(target_date)   # 核查完成後觸發週報（此前缺失的一步）
         _dispatch_next_workflow()   # 乾淨完成才接力
         return 0
 

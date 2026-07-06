@@ -40,11 +40,12 @@ jobs:
 
       - name: Run weekend verify
         env:
-          MONGO_URI:      ${{ secrets.MONGO_URI }}
-          POLYGON_KEY:    ${{ secrets.POLYGON_KEY }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          COMM_HUB_URL:   ${{ secrets.COMM_HUB_URL }}
-          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
-          NEXT_WORKFLOW:  ${{ inputs.chain_next || '' }}
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          ANALYSIS_HUB_URL: ${{ secrets.ANALYSIS_HUB_URL }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          NEXT_WORKFLOW:    ${{ inputs.chain_next || '' }}
           PYTHONUNBUFFERED: "1"
         run: python run_verify_weekend.py

@@ -1,16 +1,15 @@
 name: BC Backtest Daily
 
-# 每日回測（取代 LC /webhook/daily）——拉模式：梯次輪詢 + 截止告警 + 自動補課
+# 每日回測（取代 LC /webhook/daily）——主觸發改為事件驅動：
+# DC after_hours ALL_DONE 後即時 dispatch 這個 workflow（見 DC
+# tasks/v3_processor.py._dispatch_bc_backtest），不再依賴多班崗輪詢。
+# v1.2（2026-07-07）：4班崗輪詢降級為 1 班安全網——事件驅動觸發若因
+# GH_TOKEN失效/DC鎖死等意外沒發出，末班 cron 仍會補跑+發截止告警。
 # v1.1：單次 run 循環吃光全部欠課；可選 workflow 接力（chain_next）
-# 四班崗目標 22:00 / 23:30 / 01:00 / 03:00 EST（cron 為 UTC 近似，
-# 末班/截止判斷由腳本內 EST 自算）
 
 on:
   schedule:
-    - cron: "0 2 * * *"    # ~22:00 EST（前一日）
-    - cron: "30 3 * * *"   # ~23:30 EST
-    - cron: "0 5 * * *"    # ~01:00 EST
-    - cron: "0 7 * * *"    # ~03:00 EST（末班：截止告警崗）
+    - cron: "0 7 * * *"    # ~03:00 EST 安全網（末班：找不到欠課且DC未完工時發截止告警）
   workflow_dispatch:
     inputs:
       chain_next:
