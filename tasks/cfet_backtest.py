@@ -22,6 +22,7 @@ Python 3.9 兼容，不用 str | None
 
 import os
 import pymongo
+import requests
 from datetime import datetime
 from typing import Optional, List, Dict
 import pytz
@@ -41,6 +42,26 @@ MAX_HOLD_BARS_D = 30
 MAX_HOLD_BARS_H = 60
 
 MIN_RR = 1.5
+
+
+def _send_signal_snapshot(ticker: str):
+    """中樞神經 Signal Snapshot 落地呼叫（回測用途）。deliver_to_telegram 不傳，
+    沿用通訊中心 bc_backtest 預設值 False（純落地供未來查詢/AI使用，不發送
+    Telegram），不影響回測主流程。"""
+    comm_hub_url   = os.getenv("COMM_HUB_URL", "").strip()
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if not comm_hub_url or not webhook_secret:
+        return
+    base = comm_hub_url[:-len("/comm/send")] if comm_hub_url.endswith("/comm/send") else comm_hub_url
+    try:
+        requests.post(
+            f"{base.rstrip('/')}/signal/snapshot",
+            json={"ticker": ticker, "triggered_by": "bc_backtest"},
+            headers={"WEBHOOK_SECRET": webhook_secret, "Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"⚠️ signal_snapshot 呼叫失敗（不影響回測主流程）: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -559,6 +580,7 @@ def _backtest_one_ticker(db: BacktestDB, ticker: str,
             }
 
             db.save_event(event)
+            _send_signal_snapshot(ticker)
             signals_found += 1
 
     return signals_found
