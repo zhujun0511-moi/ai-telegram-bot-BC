@@ -6,10 +6,11 @@ name: BC Backtest Daily
 # v1.2（2026-07-07）：4班崗輪詢降級為 1 班安全網——事件驅動觸發若因
 # GH_TOKEN失效/DC鎖死等意外沒發出，末班 cron 仍會補跑+發截止告警。
 # v1.1：單次 run 循環吃光全部欠課；可選 workflow 接力（chain_next）
+# v1.3（2026-07-09）：自己的 schedule cron 拿掉，改由 bc_refresh_models.yml
+# （BC排程鏈唯一自動觸發入口，先刷新免費模型再dispatch這裡）統一驅動；
+# workflow_dispatch 保留，DC事件驅動觸發、手動測試都不受影響。
 
 on:
-  schedule:
-    - cron: "0 7 * * *"    # ~03:00 EST 安全網（末班：找不到欠課且DC未完工時發截止告警）
   workflow_dispatch:
     inputs:
       chain_next:

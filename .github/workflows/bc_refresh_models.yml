@@ -1,0 +1,53 @@
+name: BC Refresh Models
+
+# BC 排程鏈唯一自動觸發入口（2026-07-09新增）。
+#
+# 背景：免費模型清單刷新（AC /admin/refresh-free-models）過去完全沒有
+# 自動排程觸發，只能靠人工手動呼叫，實測發現長期沒人記得刷新。
+#
+# 這個 workflow 同時把 BC 原本分散在 bc_backtest_daily.yml /
+# bc_verify_weekend.yml 各自的獨立 schedule cron 收斂成一個：
+#   本workflow（唯一自動觸發源）→ 先刷新模型 → dispatch bc_backtest_daily
+#   → 若今天是週六/週日，額外 dispatch bc_verify_weekend
+#
+# 下游兩個 workflow 的 schedule 已拿掉，但 workflow_dispatch（含 chain_next
+# 接力機制）保留，仍可單獨手動觸發測試；DC 事件驅動觸發 bc_backtest_daily
+# 走的也是 workflow_dispatch，不受影響。
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # ~03:00 EST，沿用原本 bc_backtest_daily 安全網的時段
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write    # dispatch 下游 workflow 所需
+
+concurrency:
+  group: bc-refresh-models
+  cancel-in-progress: false
+
+jobs:
+  refresh-and-dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install requests pytz
+
+      - name: Refresh models + dispatch chain
+        env:
+          ANALYSIS_HUB_URL: ${{ secrets.ANALYSIS_HUB_URL }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: python run_refresh_models.py

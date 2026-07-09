@@ -2,11 +2,12 @@ name: BC Verify Weekend
 
 # 週末 V3 數據完整性核查（取代 DC 平日多輪 verify）
 # 判準退一天 + verdict 持久化 + 金絲雀假日防禦；可選 workflow 接力
+# v1.1（2026-07-09）：自己的 schedule cron（含週六本跑+週日兜底）拿掉，
+# 改由 bc_refresh_models.yml（BC排程鏈唯一自動觸發入口）在偵測到當天是
+# 週六/週日時 dispatch 這裡，沿用同一套「本跑+兜底」邏輯，verdict冪等
+# 不受影響；workflow_dispatch 保留，仍可單獨手動觸發測試。
 
 on:
-  schedule:
-    - cron: "0 12 * * 6"   # 週六 ~08:00 EST
-    - cron: "0 12 * * 0"   # 週日兜底（verdict 冪等，自動空轉）
   workflow_dispatch:
     inputs:
       chain_next:
