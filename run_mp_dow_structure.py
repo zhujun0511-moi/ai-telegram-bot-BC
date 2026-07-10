@@ -22,7 +22,8 @@ run_mp_dow_structure.py — BC job2：MP 道氏結構計算 v1.0
 
 道氏算法：
   與 DC tasks/dow_structure.py 完全一致（禁止跨文件 import，複製核心函數）。
-  fractal 右側保護：range(2, n-2)（不是 CFET 的 n-3）。
+  fractal 右側保護：range(2, n-3)（2026-07-10統一：道氏跟CFET一律用n-3，
+  目的是防止組成分形的5根bar還沒走完就告警/回測誤判，不再保留n-2版本）。
   bars 輸入：新在前 list，每個 bar {"h": float, "l": float, "t": str}。
 
 進度追蹤：
@@ -335,11 +336,12 @@ def _find_top_fractals(bars_raw: list) -> list:
     """
     掃描頂部 fractal。
     bars_raw：新在前，每個 bar {"h": float, "l": float, "t": str}。
-    右側保護：range(2, n-2)（道氏用 n-2，不是 CFET 的 n-3）。
+    右側保護：range(2, n-3)（2026-07-10統一為跟CFET/DC dow_structure一致，
+    防止組成分形的5根bar還沒走完就告警/回測誤判）。
     """
     n      = len(bars_raw)
     result = []
-    for i in range(2, n - 2):
+    for i in range(2, n - 3):
         if (bars_raw[i]["h"] > bars_raw[i-1]["h"] and
                 bars_raw[i]["h"] > bars_raw[i-2]["h"] and
                 bars_raw[i]["h"] > bars_raw[i+1]["h"] and
@@ -350,10 +352,10 @@ def _find_top_fractals(bars_raw: list) -> list:
 
 
 def _find_bot_fractals(bars_raw: list) -> list:
-    """掃描底部 fractal，右側保護同 n-2。"""
+    """掃描底部 fractal，右側保護同 n-3（2026-07-10統一，理由同上）。"""
     n      = len(bars_raw)
     result = []
-    for i in range(2, n - 2):
+    for i in range(2, n - 3):
         if (bars_raw[i]["l"] < bars_raw[i-1]["l"] and
                 bars_raw[i]["l"] < bars_raw[i-2]["l"] and
                 bars_raw[i]["l"] < bars_raw[i+1]["l"] and
