@@ -47,15 +47,18 @@ MIN_RR = 1.5
 def _send_signal_snapshot(ticker: str):
     """中樞神經 Signal Snapshot 落地呼叫（回測用途）。deliver_to_telegram 不傳，
     沿用通訊中心 bc_backtest 預設值 False（純落地供未來查詢/AI使用，不發送
-    Telegram），不影響回測主流程。"""
-    comm_hub_url   = os.getenv("COMM_HUB_URL", "").strip()
+    Telegram），不影響回測主流程。
+
+    2026-07-10：COMM_HUB_URL 統一為根網址慣例，拿掉原本判斷結尾是否為
+    /comm/send 的防禦性拆解，比照DC/AC/BC tasks/outbound.py同一輪整頓。
+    """
+    base           = os.getenv("COMM_HUB_URL", "").strip().rstrip("/")
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
-    if not comm_hub_url or not webhook_secret:
+    if not base or not webhook_secret:
         return
-    base = comm_hub_url[:-len("/comm/send")] if comm_hub_url.endswith("/comm/send") else comm_hub_url
     try:
         requests.post(
-            f"{base.rstrip('/')}/signal/snapshot",
+            f"{base}/signal/snapshot",
             json={"ticker": ticker, "triggered_by": "bc_backtest"},
             headers={"WEBHOOK_SECRET": webhook_secret, "Content-Type": "application/json"},
             timeout=10,
