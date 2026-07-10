@@ -51,13 +51,14 @@ import pymongo
 import requests
 from pymongo.errors import DuplicateKeyError
 
+from tasks.outbound import notify as _notify_shared
+from tasks.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
+from tasks.outbound import trigger_ac_webhook as _trigger_ac_webhook_shared
+
 EST_TZ = pytz.timezone("US/Eastern")
 
 MONGO_URI        = os.getenv("MONGO_URI", "")
 POLYGON_KEY      = os.getenv("POLYGON_KEY", "")
-COMM_HUB_URL     = os.getenv("COMM_HUB_URL", "").strip()
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "").strip()
-ANALYSIS_HUB_URL = os.getenv("ANALYSIS_HUB_URL", "").strip().rstrip("/")
 
 POLYGON_DELAY     = 13.5
 POLYGON_WAIT      = 65
@@ -160,72 +161,18 @@ def _get_week_monday(date_str: str) -> str:
 # ─────────────────────────────────────────────
 
 def _notify(msg: str):
-    """推送到 Telegram（via AC /comm/send）。失敗只 print，不阻塞主流程。"""
-    if not COMM_HUB_URL:
-        _log(f"[notify] COMM_HUB_URL 未設定，跳過推送: {msg[:80]}")
-        return
-    try:
-        resp = requests.post(
-            COMM_HUB_URL,
-            json={"content": msg, "report_type": REPORT_TYPE},
-            headers={"x-webhook-secret": WEBHOOK_SECRET,
-                     "Content-Type": "application/json"},
-            timeout=10,
-        )
-        _log(f"[notify] 推送: {resp.status_code}")
-    except Exception as e:
-        _log(f"[notify] 推送失敗: {e}")
+    """2026-07-10改用 tasks/outbound.py 統一出口，report_type/行為不變（bc_verify，失敗只print不重試）。"""
+    _notify_shared(msg, report_type=REPORT_TYPE)
 
 
 def _trigger_weekly_report(target_date: str):
-    """
-    週末核查完成後觸發 AC /webhook/weekly（此前這一步一直缺失，週報只能手動POST）。
-    ANALYSIS_HUB_URL 只存根網址，路徑由這裡自己拼接（2026-07-07 拍板的新慣例）。
-    header 用 WEBHOOK_SECRET（跟環境變數同名，才是全系統真正在用的header名稱；
-    x-webhook-secret 是歷史累積的誤用，AC端已有相容層兩種都收）。
-    """
-    if not ANALYSIS_HUB_URL:
-        _log("[weekly] ANALYSIS_HUB_URL 未設定，跳過觸發週報")
-        return
-    try:
-        resp = requests.post(
-            f"{ANALYSIS_HUB_URL}/webhook/weekly",
-            json={"trading_date": target_date},
-            headers={"WEBHOOK_SECRET": WEBHOOK_SECRET,
-                     "Content-Type": "application/json"},
-            timeout=10,
-        )
-        _log(f"[weekly] 觸發 AC /webhook/weekly: {resp.status_code}")
-    except Exception as e:
-        _log(f"[weekly] 觸發失敗: {e}")
+    """2026-07-10改用 tasks/outbound.py 統一出口，行為不變（POST AC /webhook/weekly，WEBHOOK_SECRET header）。"""
+    _trigger_ac_webhook_shared("/webhook/weekly", {"trading_date": target_date})
 
 
 def _dispatch_next_workflow():
-    """
-    workflow 接力：乾淨完成後 dispatch 下一個 workflow。
-    NEXT_WORKFLOW = 目標 yml 檔名（空值 = 不接力）。
-    使用 GHA 內建 GITHUB_TOKEN（yml 需 permissions: actions: write）。
-    """
-    wf = os.getenv("NEXT_WORKFLOW", "").strip()
-    if not wf:
-        return
-    repo  = os.getenv("GITHUB_REPOSITORY", "")
-    token = os.getenv("GITHUB_TOKEN", "")
-    ref   = os.getenv("GITHUB_REF_NAME", "main")
-    if not (repo and token):
-        _log(f"[chain] 缺 GITHUB_REPOSITORY/GITHUB_TOKEN，無法接力 {wf}")
-        return
-    try:
-        resp = requests.post(
-            f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
-            json={"ref": ref},
-            headers={"Authorization": f"Bearer {token}",
-                     "Accept": "application/vnd.github+json"},
-            timeout=10,
-        )
-        _log(f"[chain] 接力 dispatch {wf}: {resp.status_code}")
-    except Exception as e:
-        _log(f"[chain] 接力失敗 {wf}: {e}")
+    """2026-07-10改用 tasks/outbound.py 統一出口，行為不變（讀NEXT_WORKFLOW env，同repo dispatch）。"""
+    _dispatch_next_workflow_shared()
 
 
 # ─────────────────────────────────────────────

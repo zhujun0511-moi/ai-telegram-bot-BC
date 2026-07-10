@@ -62,6 +62,8 @@ import pytz
 import time
 import pandas as pd
 
+from tasks.outbound import notify as _notify_shared
+
 
 # ─────────────────────────────────────────────
 # 常數
@@ -107,14 +109,6 @@ def _get_openrouter_key() -> str:
     return os.getenv("OPENROUTER_API_KEY", "")
 
 
-def _get_comm_hub_url() -> str:
-    return os.getenv("COMM_HUB_URL", "").strip()
-
-
-def _get_gha_webhook_secret() -> str:
-    return os.getenv("WEBHOOK_SECRET", "").strip()
-
-
 def _hf_headers() -> dict:
     return {
         "Authorization": f"Bearer {_get_hf_token()}",
@@ -128,33 +122,8 @@ def _hf_headers() -> dict:
 
 
 def _send_telegram_alert(text: str) -> bool:
-    secret = _get_gha_webhook_secret()
-    url    = _get_comm_hub_url()
-
-    if not secret:
-        print(f"⚠️ WEBHOOK_SECRET 未設定，提醒僅記錄日誌：{text}")
-        return False
-    if not url:
-        print(f"⚠️ COMM_HUB_URL 未設定，提醒僅記錄日誌：{text}")
-        return False
-
-    payload = {"content": text, "report_type": "brief"}
-    headers = {"x-webhook-secret": secret, "Content-Type": "application/json"}
-
-    for attempt in range(3):
-        try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                print(f"✅ Telegram 提醒已送出（經 AC /comm/send）")
-                return True
-            print(f"⚠️ Telegram 提醒送出失敗（第 {attempt+1} 次）: "
-                  f"{resp.status_code} {resp.text[:150]}")
-        except Exception as e:
-            print(f"⚠️ Telegram 提醒異常（第 {attempt+1} 次）: {e}")
-        time.sleep(2)
-
-    print(f"❌ Telegram 提醒已達最大重試次數，放棄本次推送")
-    return False
+    """2026-07-10改用 tasks/outbound.py 統一出口，重試行為不變（3次+2秒間隔）。"""
+    return _notify_shared(text, report_type="brief", retries=3, delay=2)
 
 
 # ─────────────────────────────────────────────

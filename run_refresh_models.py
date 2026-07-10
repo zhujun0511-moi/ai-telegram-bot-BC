@@ -32,14 +32,13 @@ from datetime import datetime
 import pytz
 import requests
 
+from tasks.outbound import notify as _notify_shared
+from tasks.outbound import dispatch_workflow as _dispatch_workflow_shared
+
 EST_TZ = pytz.timezone("US/Eastern")
 
 ANALYSIS_HUB_URL  = os.getenv("ANALYSIS_HUB_URL", "").strip()
 WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "").strip()
-COMM_HUB_URL      = os.getenv("COMM_HUB_URL", "").strip()
-GITHUB_TOKEN      = os.getenv("GITHUB_TOKEN", "").strip()
-GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()
-GITHUB_REF_NAME   = os.getenv("GITHUB_REF_NAME", "main").strip()
 
 
 def _now_est() -> datetime:
@@ -51,21 +50,8 @@ def _log(msg: str):
 
 
 def _notify(msg: str):
-    """比照 run_backtest_daily.py 同款設計：失敗只 print，不阻塞主流程。"""
-    if not COMM_HUB_URL:
-        _log(f"[notify] COMM_HUB_URL 未設定，跳過推送: {msg[:80]}")
-        return
-    try:
-        resp = requests.post(
-            COMM_HUB_URL,
-            json={"content": msg, "report_type": "bc_backtest"},
-            headers={"x-webhook-secret": WEBHOOK_SECRET,
-                     "Content-Type": "application/json"},
-            timeout=10,
-        )
-        _log(f"[notify] 推送: {resp.status_code}")
-    except Exception as e:
-        _log(f"[notify] 推送失敗: {e}")
+    """2026-07-10改用 tasks/outbound.py 統一出口，report_type/行為不變（bc_backtest，失敗只print不重試）。"""
+    _notify_shared(msg, report_type="bc_backtest")
 
 
 def refresh_free_models() -> bool:
@@ -106,24 +92,8 @@ def refresh_free_models() -> bool:
 
 
 def dispatch_workflow(workflow_file: str) -> bool:
-    """透過 GitHub API dispatch 同一個 repo 內的另一個 workflow。"""
-    if not (GITHUB_REPOSITORY and GITHUB_TOKEN):
-        _log(f"❌ 缺 GITHUB_REPOSITORY/GITHUB_TOKEN，無法 dispatch {workflow_file}")
-        return False
-    try:
-        resp = requests.post(
-            f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
-            f"/actions/workflows/{workflow_file}/dispatches",
-            json={"ref": GITHUB_REF_NAME},
-            headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
-                     "Accept": "application/vnd.github+json"},
-            timeout=10,
-        )
-        _log(f"→ dispatch {workflow_file}: {resp.status_code}")
-        return resp.status_code == 204
-    except Exception as e:
-        _log(f"❌ dispatch {workflow_file} 異常: {e}")
-        return False
+    """2026-07-10改用 tasks/outbound.py 統一出口，同repo dispatch行為不變。"""
+    return _dispatch_workflow_shared(workflow_file)
 
 
 def main() -> int:

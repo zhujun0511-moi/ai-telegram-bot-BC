@@ -37,16 +37,14 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import pytz
-import requests
 from pymongo.errors import DuplicateKeyError
 
 from tasks.cfet_backtest import BacktestDB, run_backtest_batch
 from tasks.backtest_stats import StatsDB, run_stats_analysis
+from tasks.outbound import notify as _notify_shared
+from tasks.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
 
 EST_TZ = pytz.timezone("US/Eastern")
-
-COMM_HUB_URL   = os.getenv("COMM_HUB_URL", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 MAX_JOB_SECONDS    = 5.5 * 3600
 LOCK_STALE_SECONDS = MAX_JOB_SECONDS + 15 * 60
@@ -72,48 +70,13 @@ def _log(msg: str):
 
 
 def _notify(msg: str):
-    if not COMM_HUB_URL:
-        _log(f"[notify] COMM_HUB_URL 未設定，跳過推送: {msg[:80]}")
-        return
-    try:
-        resp = requests.post(
-            COMM_HUB_URL,
-            json={"content": msg, "report_type": REPORT_TYPE},
-            headers={"x-webhook-secret": WEBHOOK_SECRET,
-                     "Content-Type": "application/json"},
-            timeout=10,
-        )
-        _log(f"[notify] 推送: {resp.status_code}")
-    except Exception as e:
-        _log(f"[notify] 推送失敗: {e}")
+    """2026-07-10改用 tasks/outbound.py 統一出口，report_type/行為不變（bc_backtest，失敗只print不重試）。"""
+    _notify_shared(msg, report_type=REPORT_TYPE)
 
 
 def _dispatch_next_workflow():
-    """
-    workflow 接力：乾淨完成後 dispatch 下一個 workflow。
-    NEXT_WORKFLOW = 目標 yml 檔名（如 bc_verify_weekend.yml），空值 = 不接力。
-    使用 GHA 內建 GITHUB_TOKEN（yml 需 permissions: actions: write）。
-    """
-    wf = os.getenv("NEXT_WORKFLOW", "").strip()
-    if not wf:
-        return
-    repo  = os.getenv("GITHUB_REPOSITORY", "")
-    token = os.getenv("GITHUB_TOKEN", "")
-    ref   = os.getenv("GITHUB_REF_NAME", "main")
-    if not (repo and token):
-        _log(f"[chain] 缺 GITHUB_REPOSITORY/GITHUB_TOKEN，無法接力 {wf}")
-        return
-    try:
-        resp = requests.post(
-            f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
-            json={"ref": ref},
-            headers={"Authorization": f"Bearer {token}",
-                     "Accept": "application/vnd.github+json"},
-            timeout=10,
-        )
-        _log(f"[chain] 接力 dispatch {wf}: {resp.status_code}")
-    except Exception as e:
-        _log(f"[chain] 接力失敗 {wf}: {e}")
+    """2026-07-10改用 tasks/outbound.py 統一出口，行為不變（讀NEXT_WORKFLOW env，同repo dispatch）。"""
+    _dispatch_next_workflow_shared()
 
 
 # ─────────────────────────────────────────────
