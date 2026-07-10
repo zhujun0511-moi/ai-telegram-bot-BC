@@ -1,0 +1,39 @@
+name: BC CFET Fanout
+
+# 極簡fan-out：DC after_hours ALL_DONE 觸發這裡（沿用DC既有GH_TOKEN/GH_REPO
+# dispatch機制，跟_dispatch_bc_backtest同一種模式），本workflow收到後立刻
+# 轉發dispatch到 ai-telegram-bot-BC.p 的 cfet_judge.yml，讓CFET即時掃描
+# 幾乎在after_hours完成的同時開始跑，不用等cfet_judge.yml自己的00:00
+# EST排程安全網。
+#
+# 不跟 bc_backtest_daily.yml 合併：後者是真正的CFET回測，觸發時機/耗時/
+# 逾時欠課補跑邏輯都是完全不同性質的東西，混在一起會讓回測的狀態機
+# 意外影響到這裡的即時告警fan-out。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  fanout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Dispatch CFET judge repo
+        env:
+          GH_TOKEN:  ${{ secrets.GH_TOKEN }}
+          CFET_REPO: ${{ secrets.CFET_REPO }}
+        run: python run_cfet_fanout.py
