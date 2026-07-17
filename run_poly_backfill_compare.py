@@ -323,11 +323,20 @@ def _fetch_polygon_daily(ticker: str, start_date: str, end_date: str):
     end_date 由呼叫端主動設為「昨天」，不主動嘗試「今天」——backfill是2年大範圍，
     免費版對「今天」NOT_AUTHORIZED會讓整個range請求失敗，主動避開比事後fallback划算
     （DC小範圍增量用/prev補一天的策略在這裡不適用，見檔頭docstring）。
+
+    ⚠️ adjusted=false（2026-07-17 修復，取代原本的 adjusted=true）：實測 ADTX
+    （反覆反向分割的仙股）用 adjusted=true 時，2年前的歷史收盤價被 Polygon
+    回填成「以現在股數結構換算的等值價格」，數字誇張到6.49億（真實最新價僅
+    $0.0027），跟 MP 記錄的原始未調整成交價（$14.79）完全不是同一種東西，
+    比較出來的「差距」是adjustment假影，不是MP資料真的有問題。改用
+    adjusted=false 拿原始未調整價格，才跟MP的比較基準一致。見
+    DANGER_ZONES_master.md「Polygon adjusted=true 對頻繁反向分割的仙股
+    產生的adjustment假影」章節。
     """
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/"
         f"{start_date}/{end_date}"
-        f"?adjusted=true&extended_hours=false&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
+        f"?adjusted=false&extended_hours=false&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
     )
     try:
         resp = requests.get(url, timeout=15)

@@ -1,0 +1,51 @@
+name: BC Poly Cleanup (one-off)
+
+# 一次性清理（2026-07-17新增，用完即刪，非常駐workflow）。
+#
+# 背景：Poly長尾backfill的Polygon fetch原本用adjusted=true，對頻繁反向
+# 分割的仙股產生adjustment假影（見DANGER_ZONES_master.md），已改用
+# adjusted=false重寫 run_poly_backfill_compare.py。這個workflow跑
+# poly_cleanup_stale.py，清空舊的、用adjusted=true抓的錯誤基準資料
+# （d-p.csv/compare_report.json/mp_poly_compare_summary.json），讓下一輪
+# fetch/compare重新抓取。跑完一次、確認HF Dataset乾淨後，這個workflow
+# 跟 poly_cleanup_stale.py 都應該被刪除，不是留著常駐的東西。
+#
+# 用法：workflow_dispatch 先用預設 dry_run=true 跑一次確認目標檔案數量
+# 對得上預期（本次事故是1389個d-p.csv + 1245個compare_report.json + 1個
+# 全域彙總 = 2635個），確認無誤後再手動改 dry_run=false 重新觸發一次
+# 真的執行刪除。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true=只列出目標不刪除（預設，先跑這個確認數量），false=真的執行刪除"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  poly-cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install huggingface_hub
+
+      - name: Run cleanup
+        env:
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          DRY_RUN:          ${{ inputs.dry_run == 'false' && '0' || '1' }}
+          PYTHONUNBUFFERED: "1"
+        run: python poly_cleanup_stale.py
