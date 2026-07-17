@@ -1,0 +1,55 @@
+name: BC Poly Compare
+
+# Poly長尾backfill + MP資料稽核——Compare階段（2026-07-17新增，同日二次
+# 改版：拆成獨立workflow，取代原本單一job內接力的 poly_backfill_compare.yml）。
+#
+# 觸發：只由 bc_poly_fetch.yml 結束時自鏈dispatch（run_poly_backfill_
+# compare.py --phase fetch 判斷還有compare backlog且未過16:00才會觸發），
+# 不掛自己的schedule/cron。完成後 run_poly_backfill_compare.py --phase
+# compare 自己判斷是否還有fetch backlog、是否已過16:00 EST，決定要不要
+# dispatch bc_poly_fetch.yml 接力，跟fetch互相自鏈直到當天16:00 EST。
+#
+# 停止條件（腳本內部判斷，這裡的 timeout-minutes 只是安全網）：
+# compare自己的預算30分鐘（暫定值，2026-07-17當天compare從未真正執行過、
+# 無歷史耗時數據，用「無節流+小檔案下載」推理+50%安全邊界訂出來，第一輪
+# 真跑完後待回頭核對Mongo poly_compare_progress實際耗時再調準）或
+# wall-clock 16:00 EST，先到者為準。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write    # workflow 接力所需（GITHUB_TOKEN dispatch bc_poly_fetch.yml）
+
+concurrency:
+  group: bc-poly-compare
+  cancel-in-progress: false
+
+jobs:
+  poly-compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz pandas huggingface_hub
+
+      - name: Run Poly compare
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: python run_poly_backfill_compare.py --phase compare

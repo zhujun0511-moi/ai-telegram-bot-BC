@@ -1,0 +1,59 @@
+name: BC Poly Fetch
+
+# Poly長尾backfill + MP資料稽核——Fetch階段（2026-07-17新增，同日二次改版：
+# 拆成獨立workflow，取代原本單一job內接力的 poly_backfill_compare.yml）。
+#
+# 觸發：bc_refresh_models.yml（唯一03:00 EST cron）在平日額外dispatch本
+# workflow，作為fetch/compare互相自鏈的每日起點。之後由
+# run_poly_backfill_compare.py --phase fetch 自己結束時判斷是否還有compare
+# backlog、是否已過16:00 EST，決定要不要 dispatch bc_poly_compare.yml
+# 接力（同DC after_hours自激發模式的精神，這裡是GitHub Actions
+# workflow_dispatch跨job版本）。
+#
+# 也刻意不自己另掛 schedule cron：refresh_models是唯一入口的設計原則，
+# 新增的排程觸發一律掛在它底下，不另開分散的觸發源（治「BC進程把時間
+# 切碎」問題，用戶2026-07-16拍板）。
+#
+# 停止條件（腳本內部判斷，這裡的 timeout-minutes 只是安全網）：
+# fetch自己的預算5小時 或 wall-clock 16:00 EST，先到者為準（保底預留寫法，
+# 不是「算完才發現剩多少」，見腳本檔頭docstring「停止條件」）。斷點續傳
+# 靠HF Dataset檔案存在性 + Mongo System_State進度心跳。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write    # workflow 接力所需（GITHUB_TOKEN dispatch bc_poly_compare.yml）
+
+concurrency:
+  group: bc-poly-fetch
+  cancel-in-progress: false
+
+jobs:
+  poly-fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz pandas huggingface_hub
+
+      - name: Run Poly fetch
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: python run_poly_backfill_compare.py --phase fetch
