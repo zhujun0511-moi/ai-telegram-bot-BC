@@ -1,0 +1,40 @@
+name: BC Poly Release Lock (one-off)
+
+# 一次性工具（2026-07-17新增）：手動cancel一輪fetch/compare後，Python行程
+# 被直接殺掉、finally區塊的release_lock()沒機會執行，鎖會卡在Mongo裡直到
+# staleness threshold才自動解除。這個workflow強制把指定鎖的is_running設
+# 為False，供人工介入時使用。見 poly_release_lock.py 檔頭docstring。
+
+on:
+  workflow_dispatch:
+    inputs:
+      lock_id:
+        description: "要釋放的鎖id（poly_fetch_lock 或 poly_compare_lock）"
+        required: true
+        default: "poly_fetch_lock"
+
+permissions:
+  contents: read
+
+jobs:
+  release-lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo
+
+      - name: Release lock
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          LOCK_ID:           ${{ inputs.lock_id }}
+          PYTHONUNBUFFERED: "1"
+        run: python poly_release_lock.py
