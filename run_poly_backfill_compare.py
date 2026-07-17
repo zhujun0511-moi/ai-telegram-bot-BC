@@ -626,7 +626,11 @@ def _run_fetch_cycle(db: "PolyDB", api: HfApi, cutoff_today: datetime) -> int:
     finally:
         db.release_lock(FETCH_LOCK_ID)
 
-    if _now_est() < cutoff_today and _has_compare_backlog(api):
+    # compare不打Polygon，不受16:00「盤後禁止」規則限制，隨時可以dispatch
+    # （2026-07-17發現並修正：舊版這裡誤把16:00限制一併套在compare身上，
+    # 導致fetch幾乎每次都撞wall-clock才停、事後這個判斷永遠是False，
+    # fetch→compare這個方向的自鏈實務上等於從未真正生效過）
+    if _has_compare_backlog(api):
         dispatch_workflow(COMPARE_WORKFLOW_FILE)
     return 0
 
@@ -638,11 +642,13 @@ def _run_compare_cycle(db: "PolyDB", api: HfApi, cutoff_today: datetime) -> int:
 
     try:
         start_mono = time.monotonic()
-        deadline_mono = _phase_deadline_mono(start_mono, COMPARE_BUDGET_SECONDS, cutoff_today)
+        # compare不打Polygon，deadline只受自己的固定預算限制，不跟16:00
+        # wall-clock比較（那條規則的原意是「盤後禁止跑Polygon抓取」，compare
+        # 純粹讀已抓好的檔案做本地比對，不該被這條規則卡住）
+        deadline_mono = start_mono + COMPARE_BUDGET_SECONDS
         _notify(
             f"🚀 [poly-compare] 開始（本輪預算至多"
-            f"{(deadline_mono - start_mono) / 60:.0f}分鐘，"
-            f"{DAY_CUTOFF_HOUR}:00 EST 前必收工）"
+            f"{(deadline_mono - start_mono) / 60:.0f}分鐘，不受16:00 EST限制）"
         )
         compare_stats = run_compare_phase(db, api, deadline_mono)
         summary = None
@@ -657,6 +663,7 @@ def _run_compare_cycle(db: "PolyDB", api: HfApi, cutoff_today: datetime) -> int:
     finally:
         db.release_lock(COMPARE_LOCK_ID)
 
+    # fetch會打Polygon，仍受16:00「盤後禁止」規則限制
     if _now_est() < cutoff_today and _has_fetch_backlog(api):
         dispatch_workflow(FETCH_WORKFLOW_FILE)
     return 0
@@ -673,7 +680,9 @@ def main() -> int:
 
     now = _now_est()
     cutoff_today = now.replace(hour=DAY_CUTOFF_HOUR, minute=0, second=0, microsecond=0)
-    if now >= cutoff_today:
+    # 16:00「盤後禁止」規則只針對會打Polygon的fetch階段，compare不受限制
+    # （2026-07-17修正，見_run_fetch_cycle/_run_compare_cycle註解）
+    if args.phase == "fetch" and now >= cutoff_today:
         _log(f"⏭️ 已過 {DAY_CUTOFF_HOUR}:00 EST，今日不再啟動新一輪（phase={args.phase}）")
         _notify(f"⏭️ [poly-{args.phase}] 已過{DAY_CUTOFF_HOUR}:00 EST，本次跳過，等下次觸發")
         return 0
