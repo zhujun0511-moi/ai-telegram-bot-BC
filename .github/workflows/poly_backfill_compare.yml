@@ -1,0 +1,55 @@
+name: BC Poly Backfill Compare
+
+# Poly長尾backfill + MP資料稽核（2026-07-17新增）。
+#
+# 觸發：僅 workflow_dispatch，由 bc_refresh_models.yml（唯一03:00 EST cron，
+# BC排程鏈唯一自動觸發入口）在 dispatch bc_backtest_daily 之餘平行額外
+# dispatch本workflow。刻意不掛在 bc_backtest_daily 後面——backtest同時被
+# DC晚上事件驅動觸發，接在它後面會讓Poly抓取工作被牽連到晚上執行，違反
+# 「盤後禁止跑Polygon抓取」的規則（見 run_poly_backfill_compare.py 檔頭
+# docstring、handoff_master.md「Poly長尾backfill+MP稽核」章節）。
+#
+# 也刻意不自己另掛 schedule cron：refresh_models是唯一入口的設計原則，
+# 新增的排程觸發一律掛在它底下，不另開分散的觸發源（治「BC進程把時間
+# 切碎」問題，用戶2026-07-16拍板）。
+#
+# 停止條件（腳本內部雙重判斷，這裡的 timeout-minutes 只是安全網）：
+# 5小時預算 或 wall-clock 16:00 EST，先到者為準；斷點續傳靠HF Dataset
+# 檔案存在性 + Mongo System_State 進度心跳，見腳本檔頭docstring。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bc-poly-backfill
+  cancel-in-progress: false
+
+jobs:
+  poly-backfill-compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz pandas huggingface_hub
+
+      - name: Run Poly backfill + compare
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          PYTHONUNBUFFERED: "1"
+        run: python run_poly_backfill_compare.py
