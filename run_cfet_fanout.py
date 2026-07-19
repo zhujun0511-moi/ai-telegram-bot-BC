@@ -32,7 +32,12 @@ def main() -> int:
         print("❌ GH_TOKEN 或 CFET_REPO 未設定，無法 fan-out 到 CFET judge repo")
         return 1
 
-    ok = dispatch_workflow("cfet_judge.yml", token=token, repo=cfet_repo)
+    # 2026-07-19：帶 trigger_source=after_hours，讓 BC.p cfet_judge.yml 的
+    # Key Level phase 知道這次是 after_hours fan-out 觸發，可以更新 touch_state
+    # （見 keylevel_driver.py AFTER_TRIGGER_SOURCES；cfet_judge.yml 已宣告對應
+    # workflow_dispatch.inputs.trigger_source）。
+    ok = dispatch_workflow("cfet_judge.yml", token=token, repo=cfet_repo,
+                           inputs={"trigger_source": "after_hours"})
     return 0 if ok else 1
 
 

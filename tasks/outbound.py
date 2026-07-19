@@ -62,7 +62,7 @@ def notify(msg: str, report_type: str = "bc_backtest", retries: int = 1, delay: 
 
 
 def dispatch_workflow(workflow_file: str, token: str = None, repo: str = None,
-                       ref: str = None) -> bool:
+                       ref: str = None, inputs: dict = None) -> bool:
     """
     透過 GitHub API 觸發 workflow_dispatch。
 
@@ -73,6 +73,12 @@ def dispatch_workflow(workflow_file: str, token: str = None, repo: str = None,
 
     傳token/repo時做跨repo dispatch——對應run_cfet_fanout.py用GH_TOKEN
     （PAT）+CFET_REPO 跨repo dispatch到 ai-telegram-bot-BC.p 的場景。
+
+    inputs（2026-07-19新增，可選）：透傳給 GitHub workflow_dispatch API 的
+    inputs 欄位（目標 workflow 的 yml 必須先宣告對應的 workflow_dispatch.inputs，
+    否則 GitHub API 會拒絕）——例如 run_cfet_fanout.py 用它帶
+    {"trigger_source": "after_hours"} 告訴 ai-telegram-bot-BC.p 的
+    cfet_judge.yml 這次是 after_hours 觸發的。不傳時沿用舊行為（body 只有 ref）。
     """
     token = token or os.getenv("GITHUB_TOKEN", "").strip()
     repo  = repo or os.getenv("GITHUB_REPOSITORY", "").strip()
@@ -80,10 +86,13 @@ def dispatch_workflow(workflow_file: str, token: str = None, repo: str = None,
     if not (token and repo):
         print(f"❌ [dispatch] 缺 token/repo，無法 dispatch {workflow_file}")
         return False
+    body = {"ref": ref}
+    if inputs:
+        body["inputs"] = inputs
     try:
         resp = requests.post(
             f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches",
-            json={"ref": ref},
+            json=body,
             headers={"Authorization": f"Bearer {token}",
                      "Accept": "application/vnd.github+json"},
             timeout=10,
