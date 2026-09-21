@@ -79,7 +79,9 @@ def refresh_free_models() -> bool:
         resp = requests.get(
             f"{ANALYSIS_HUB_URL.rstrip('/')}/admin/refresh-free-models",
             headers={"x-webhook-secret": WEBHOOK_SECRET},
-            timeout=30,
+            # 2026-09-21：新 refresh 要逐個「金融題實測」~13 模型（併發4、每個上限20s）→ 總耗時可達 ~90s，
+            # 30s 會假逾時（AC 其實照樣跑完存+自發告警，不影響功能，但 BC 日誌難看、拿不到結果）。放寬到 180s。
+            timeout=180,
         )
         if resp.status_code == 200:
             body = resp.json()
