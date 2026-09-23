@@ -42,6 +42,7 @@ jobs:
         env:
           GH_TOKEN:          ${{ secrets.GH_TOKEN }}
           COMM_HUB_URL:      ${{ secrets.COMM_HUB_URL }}
+          WEBHOOK_SECRET:    ${{ secrets.WEBHOOK_SECRET }}   # notify() 用 x-webhook-secret，漏了會 403
           # 以下可調（不設就用預設）：
           MINUTES_LIMIT:     "2000"     # Free 2000 / Pro 3000。billing API 可用時以其 included 為準
           WARN_PCT:          "0.75"     # 用到 75% 就告警
