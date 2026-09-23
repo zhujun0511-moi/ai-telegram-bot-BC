@@ -1,0 +1,52 @@
+name: Actions Minutes Watchdog
+
+# 2026-09-23 新增（長期）：BC.p(私有)的 Actions 分鐘用盡會被 GitHub 無預警擋下
+# （job "was not started"），整批 job 靜默失敗。此 watchdog 每日在 BC(公開/免費)跑，
+# 估算受監測私有 repo 本週期已用分鐘，接近上限或疑似已被擋就 Telegram 告警。
+# 幾秒鐘、幾乎不吃分鐘（且 BC 公開＝免費）。
+
+on:
+  schedule:
+    - cron: "0 13 * * *"    # 每日 ~08:00-09:00 EST
+  workflow_dispatch:
+    inputs:
+      always_notify:
+        description: "1=不論是否超警戒都推當日用量（手動查用）"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actions-minutes-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run minutes watchdog
+        env:
+          GH_TOKEN:          ${{ secrets.GH_TOKEN }}
+          COMM_HUB_URL:      ${{ secrets.COMM_HUB_URL }}
+          # 以下可調（不設就用預設）：
+          MINUTES_LIMIT:     "2000"     # Free 2000 / Pro 3000。billing API 可用時以其 included 為準
+          WARN_PCT:          "0.75"     # 用到 75% 就告警
+          BILLING_RESET_DAY: "1"        # 你的帳單週期重置日(1-28)；不確定就 1。Billing 頁面可查
+          WATCH_REPOS:       "zhujun0511-moi/ai-telegram-bot-BC.p"
+          ALWAYS_NOTIFY:     ${{ github.event.inputs.always_notify || '0' }}
+          PYTHONUNBUFFERED:  "1"
+        run: python actions_minutes_watch.py
