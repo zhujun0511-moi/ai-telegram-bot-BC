@@ -1,0 +1,66 @@
+name: TEMP · CommData Daily Cleanup
+
+# ⚠️⚠️ 臨時 workflow（2026-09-23）：BC.p 帳單被擋期間，搬來公開 BC 頂著。
+# 帳單修好後整包刪除 bcp_temp/ + temp_bcp_*.yml，BC.p 恢復。CFET 不在此列。
+# 純刪 log（Telegram_Outbound/AI_Narrative_Failures/Cross_Center_Relay 殘留），只需 MONGO_URI、
+# delete_many 按 cutoff 冪等。不碰 Conversations。
+
+on:
+  schedule:
+    - cron: "0 8 * * *"    # 同 BC.p 原排程 ~03:00-04:00 EST
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full=清理 / dry_run=只算不刪"
+        required: false
+        default: "full"
+      telegram_keep_days:
+        description: "Telegram_Outbound 保留天數（預設 30）"
+        required: false
+        default: "30"
+      failures_keep_days:
+        description: "AI_Narrative_Failures 保留天數（預設 30）"
+        required: false
+        default: "30"
+      relay_keep_days:
+        description: "Cross_Center_Relay 已處理殘留保留天數（預設 3）"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-bcp-commdata-daily
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run commdata_cleanup
+        working-directory: bcp_temp
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          PYTHONUNBUFFERED: "1"
+          MODE:             ${{ github.event.inputs.mode || 'full' }}
+          TG_KEEP:          ${{ github.event.inputs.telegram_keep_days || '30' }}
+          FA_KEEP:          ${{ github.event.inputs.failures_keep_days || '30' }}
+          RE_KEEP:          ${{ github.event.inputs.relay_keep_days || '3' }}
+        run: |
+          ARGS="--telegram-keep-days $TG_KEEP --failures-keep-days $FA_KEEP --relay-keep-days $RE_KEEP"
+          if [ "$MODE" != "dry_run" ]; then ARGS="$ARGS --execute"; fi
+          echo "commdata_cleanup args: $ARGS  (MODE=$MODE)"
+          python commdata_cleanup.py $ARGS
