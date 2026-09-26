@@ -43,11 +43,12 @@ jobs:
           GH_TOKEN:          ${{ secrets.GH_TOKEN }}
           COMM_HUB_URL:      ${{ secrets.COMM_HUB_URL }}
           WEBHOOK_SECRET:    ${{ secrets.WEBHOOK_SECRET }}   # notify() 用 x-webhook-secret，漏了會 403
+          MONGO_URI:         ${{ secrets.MONGO_URI }}        # 2026-09-26：讀 FractalRadar.System_State 的 setup_scan 自計時
           # 以下可調（不設就用預設）：
           MINUTES_LIMIT:     "2000"     # Free 2000 / Pro 3000。billing API 可用時以其 included 為準
           WARN_PCT:          "0.75"     # 用到 75% 就告警
           BILLING_RESET_DAY: "1"        # 你的帳單週期重置日(1-28)；不確定就 1。Billing 頁面可查
           WATCH_REPOS:       "zhujun0511-moi/ai-telegram-bot-BC.p"
-          ALWAYS_NOTIFY:     ${{ github.event.inputs.always_notify || '0' }}
+          ALWAYS_NOTIFY:     ${{ github.event.inputs.always_notify || '1' }}   # 2026-09-26：改每日固定發一份（用戶要提前預警）
           PYTHONUNBUFFERED:  "1"
         run: python actions_minutes_watch.py

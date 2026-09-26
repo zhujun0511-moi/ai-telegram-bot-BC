@@ -187,6 +187,19 @@ def main() -> int:
         roll += m
     lines.append(f"近 30 天滾動 ~{roll} 分（≈ 月投影 pace）")
 
+    # ── BC.p setup_scan 上次自計時（從 FractalRadar.System_State 讀，供「job 跑多久」時間報告）──
+    _uri = os.getenv("MONGO_URI", "").strip()
+    if _uri:
+        try:
+            import pymongo
+            _st = pymongo.MongoClient(_uri, serverSelectionTimeoutMS=8000)[
+                "FractalRadar"]["System_State"].find_one({"_id": "state"})
+            if _st and _st.get("setup_scan_at"):
+                lines.append(f"CFET setup 上次跑：{_st.get('setup_scan_runtime_sec')}s、"
+                             f"watch {_st.get('setup_scan_watch_count')} 支（{_st.get('setup_scan_at')}）")
+        except Exception as _e:
+            print(f"[setup_runtime] 讀取略過: {_e}")
+
     # ── 疑似已被擋（快速失敗）──
     blocked_any, samples = False, []
     for repo in repos:
