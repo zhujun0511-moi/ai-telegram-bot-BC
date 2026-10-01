@@ -1,0 +1,48 @@
+name: Stale Bars Watch
+
+# 2026-10-01 新增（C）：每日日線停更看門狗。full_set 每支 D 最新日 vs SPY，落後 ≥2 個交易日、
+# 已標下市仍在清單、沒有日線 → Telegram。唯讀 Mongo。BC 公開＝Actions 免費，幾十秒。
+# 起因：AVB/EQR 下市後掛在清單六週、6 支日線被 DC 閘門擋卻無人知道（見 handoff 2026-10-01）。
+
+on:
+  schedule:
+    - cron: "30 23 * * 1-5"    # 平日 ~19:30 EDT / 18:30 EST（DC 盤後 D 約 17:30 ET 寫完）
+  workflow_dispatch:
+    inputs:
+      always_notify:
+        description: "1=沒問題也發一份（手動查用）"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stale-bars-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests
+
+      - name: Run stale bars watch
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}   # notify() 用 x-webhook-secret，漏了會 403
+          STALE_MIN_DAYS:   "2"
+          ALWAYS_NOTIFY:    ${{ github.event.inputs.always_notify || '0' }}
+          PYTHONUNBUFFERED: "1"
+        run: python stale_bars_watch.py

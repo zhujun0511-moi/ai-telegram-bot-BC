@@ -297,6 +297,11 @@ class VerifyDB:
             upsert=True,
         )
 
+    def update_ticker_identity(self, ticker: str, fields: dict):
+        """（2026-10-01 E）每週身份刷新寫入：只 $set 給定欄位（schema 見 MongoDB_Standard Ticker_Identity）。"""
+        self.stock_db["Ticker_Identity"].update_one(
+            {"ticker": ticker.upper()}, {"$set": fields}, upsert=True)
+
     def get_oldest_bar_date(self, ticker: str, period: str) -> Optional[str]:
         bars = self.get_bars(ticker, period)
         if not bars:
@@ -437,6 +442,111 @@ def _fetch_polygon_reference(ticker: str) -> Optional[dict]:
     except Exception as e:
         _log(f"  ❌ [{ticker}] Reference API 連線異常: {scrub(e)}")
         return None
+
+
+def _polygon_ref_get(url: str, params: dict) -> Optional[dict]:
+    """Polygon Reference GET，429 退避重試。失敗回 None。（2026-10-01 E）"""
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            if resp.status_code == 429:
+                _log(f"  ⚠️ Reference API 限速 429，等 {POLYGON_WAIT}s 重試")
+                time.sleep(POLYGON_WAIT)
+                continue
+            if resp.status_code != 200:
+                _log(f"  ❌ Reference API HTTP {resp.status_code}")
+                return None
+            return resp.json()
+        except Exception as e:
+            _log(f"  ❌ Reference API 連線異常: {scrub(e)}")
+            time.sleep(POLYGON_DELAY)
+    return None
+
+
+def _fetch_polygon_active_map() -> Optional[dict]:
+    """
+    （2026-10-01 E）分頁拉 Polygon 全部「現役」股票/ETF 代號 → {TICKER: {name, cik}}。
+    ~12 頁（每頁 1000），一週一次。失敗回 None＝本週不做身份刷新（不誤判下市）。
+    """
+    url = "https://api.polygon.io/v3/reference/tickers"
+    params = {"market": "stocks", "active": "true", "limit": 1000, "apiKey": POLYGON_KEY}
+    out, pages = {}, 0
+    while url and pages < 40:
+        data = _polygon_ref_get(url, params)
+        if data is None:
+            return None
+        for r in data.get("results") or []:
+            tk = (r.get("ticker") or "").upper()
+            if tk:
+                out[tk] = {"name": r.get("name"), "cik": r.get("cik")}
+        url = data.get("next_url")
+        params = {"apiKey": POLYGON_KEY}   # next_url 已帶其餘查詢參數
+        pages += 1
+        time.sleep(POLYGON_DELAY)
+    return out
+
+
+def _fetch_polygon_inactive(ticker: str) -> Optional[dict]:
+    """
+    （2026-10-01 E）查某代號的「已停止交易」紀錄。回 None＝狀態未知；{}＝查無；
+    dict＝最近一筆 {name, cik, delisted_utc}（同代號可能多次下市，取 delisted_utc 最新）。
+    """
+    data = _polygon_ref_get("https://api.polygon.io/v3/reference/tickers",
+                            {"ticker": ticker, "active": "false", "limit": 10, "apiKey": POLYGON_KEY})
+    if data is None:
+        return None
+    rows = [r for r in (data.get("results") or []) if r.get("delisted_utc")]
+    if not rows:
+        return {}
+    r = max(rows, key=lambda x: x.get("delisted_utc") or "")
+    return {"name": r.get("name"), "cik": r.get("cik"), "delisted_utc": r.get("delisted_utc")}
+
+
+def _same_cik(a, b) -> bool:
+    return str(a).lstrip("0") == str(b).lstrip("0")
+
+
+def _refresh_identity(db, ticker: str, identity: Optional[dict], active_map: dict,
+                      newly_delisted: list, cik_changed: list, ref_missing: list) -> Optional[dict]:
+    """
+    （2026-10-01 E）單支每週身份刷新。已標 delisted 的不再查。回傳刷新後的 identity。
+      - 在 Polygon 現役名單 → 刷新 active/polygon_name/polygon_cik；cik 與既存不同 → identity_flag
+        ＝cik_changed（只標記＋通知，不改 cik/list_date）；既存缺 cik → 補上
+      - 不在現役名單 → 查 inactive：有 delisted_utc → 自動 delisted=true（用戶 2026-10-01 拍板）；
+        查無 → 只記 ref_missing（不標記）；狀態未知 → 下週再查
+    """
+    if (identity or {}).get("delisted"):
+        return identity
+    tku = ticker.upper()
+    a = active_map.get(tku)
+    if a:
+        upd = {"active": True, "polygon_name": a.get("name"),
+               "polygon_cik": a.get("cik"), "identity_checked_at": _now_est()}
+        old_cik = (identity or {}).get("cik")
+        if old_cik and a.get("cik") and not _same_cik(old_cik, a["cik"]):
+            upd["identity_flag"] = "cik_changed"
+            cik_changed.append((tku, (identity or {}).get("company_name"), a.get("name")))
+        elif not old_cik and a.get("cik"):
+            upd["cik"] = a["cik"]
+        db.update_ticker_identity(tku, upd)
+        return identity
+    info = _fetch_polygon_inactive(tku)
+    time.sleep(POLYGON_DELAY)
+    if info is None:
+        return identity            # 狀態未知，下週再查
+    if info.get("delisted_utc"):
+        db.update_ticker_identity(tku, {
+            "active": False, "delisted": True,
+            "delisted_reason": "polygon_inactive",
+            "delisted_utc": info["delisted_utc"],
+            "delisted_at": _now_est(),
+            "polygon_name": info.get("name"), "polygon_cik": info.get("cik"),
+            "identity_checked_at": _now_est(),
+        })
+        newly_delisted.append((tku, info["delisted_utc"][:10]))
+        return db.get_ticker_identity(tku)
+    ref_missing.append(tku)        # 現役/下市都查無 → 只通知、不標記
+    return identity
 
 
 # ─────────────────────────────────────────────
@@ -697,9 +807,22 @@ def main() -> int:
         identity_fetched = 0
         identity_checked = 0
         suspected_reuse  = []
+        # 2026-10-01 E：每週身份刷新（原設計「查一次永久快取」抓不到下市/代號換人——
+        # AVB/EQR 08-18 下市掛了六週沒人發現）。用戶拍板：Polygon 明確 active=false＋delisted_utc
+        # → 自動 delisted=true＋通知；cik 變更只標 identity_flag＋通知（需人工）。
+        newly_delisted, cik_changed, ref_missing = [], [], []
+        active_map = _fetch_polygon_active_map()
+        if active_map is None:
+            _log("  ⚠️ Polygon 現役列表取得失敗，本週跳過身份刷新（不做下市判定）")
+        else:
+            _log(f"  Polygon 現役代號 {len(active_map)} 支")
 
         for ticker in all_tickers:
             identity = db.get_ticker_identity(ticker)
+
+            if active_map is not None:
+                identity = _refresh_identity(db, ticker, identity, active_map,
+                                             newly_delisted, cik_changed, ref_missing)
 
             # 沒記錄過，才打一次 Polygon（之後永久快取，不重查）
             if identity is None:
@@ -727,7 +850,8 @@ def main() -> int:
                     suspected_reuse.append((ticker, period, oldest, list_date))
 
         _log(f"  身份核對完成 | 新登記 {identity_fetched} | 已核對 {identity_checked} | "
-             f"疑似ticker重複使用 {len(suspected_reuse)}")
+             f"疑似ticker重複使用 {len(suspected_reuse)} | 新下市 {len(newly_delisted)} | "
+             f"cik變更 {len(cik_changed)} | 查無 {len(ref_missing)}")
 
         # ── 收尾 ──
         counts  = db.count_verdicts(target_date)
@@ -749,6 +873,18 @@ def main() -> int:
             reuse_list = ", ".join(f"{t}/{p}" for t, p, _, _ in suspected_reuse[:10])
             more = f" 等共{len(suspected_reuse)}個" if len(suspected_reuse) > 10 else ""
             summary += f"\n⚠️ 疑似ticker重複使用: {reuse_list}{more}（需人工核實，未自動處理）"
+        # 2026-10-01 E：身份刷新結果
+        if active_map is None:
+            summary += "\n⚠️ 本週身份刷新未執行（Polygon 現役列表取得失敗）"
+        if newly_delisted:
+            summary += ("\n🪦 Polygon 確認下市（已自動標記 delisted，DC/CFET 將排除；請從清單移除）: "
+                        + ", ".join(f"{t}({d})" for t, d in newly_delisted))
+        if cik_changed:
+            summary += ("\n🔀 代號身份變更（cik 不同，需人工確認，未自動處理）: "
+                        + "; ".join(f"{t}: {o or '?'} → {n or '?'}" for t, o, n in cik_changed[:10]))
+        if ref_missing:
+            summary += ("\n❓ Polygon 現役/下市皆查無（未標記）: " + ", ".join(ref_missing[:20])
+                        + (f" 等共{len(ref_missing)}支" if len(ref_missing) > 20 else ""))
         _log(summary.replace("\n", " | "))
         _notify(summary)
         db.write_task_log(status, counts["filled"] + counts["confirmed_empty"],
