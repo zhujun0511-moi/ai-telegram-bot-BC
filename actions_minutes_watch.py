@@ -293,7 +293,32 @@ def freshness_section(mongo_client):
     else:
         lines.append(f"✅ CFET 觀察名單：{wl_date}（{len((wl or {}).get('watchlist') or [])} 支）")
 
-    # ⑤ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
+    # ⑤ dataset 列表內實際價（BC raw_writer，2026-10-02）：每日執行狀態＋首次補史進度
+    rw = sd["System_State"].find_one({"id": "raw_writer_status"})
+    if not rw:
+        alarm = True
+        lines.append("⚠️ 列表內實際價（raw_writer）：尚無執行紀錄")
+    else:
+        run_at = rw.get("run_at")
+        if isinstance(run_at, dt.datetime) and run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=dt.timezone.utc)
+        age_h = (dt.datetime.now(dt.timezone.utc) - run_at).total_seconds() / 3600 if isinstance(run_at, dt.datetime) else 999
+        seed = f"補史 {rw.get('seeded_total')}/{rw.get('universe')}"
+        errs = rw.get("errors") or []
+        newest_lag = _lag(ref_dates, rw.get("d_raw_newest_min")) if rw.get("d_raw_newest_min") else 0
+        if age_h > 30:
+            alarm = True
+            lines.append(f"🔴 列表內實際價（raw_writer）{age_h:.0f} 小時未執行（{seed}）")
+        elif newest_lag >= 2 or len(errs) > 5:
+            alarm = True
+            lines.append(f"⚠️ 列表內實際價：{seed}｜最舊一支只到 {rw.get('d_raw_newest_min')}｜錯誤 {len(errs)} 筆（"
+                         + "；".join(errs[:3]) + "）")
+        else:
+            tail = f"｜TD 缺日未補 {len(rw.get('gaps_unfilled') or [])} 支" if rw.get("gaps_unfilled") else ""
+            lines.append(f"✅ 列表內實際價：{seed}（待補 {rw.get('pending_seed')}）｜今日追加 {rw.get('appended')} 支"
+                         f"｜補缺日 {rw.get('gap_filled', 0)}{tail}" + (f"｜錯誤 {len(errs)} 筆" if errs else ""))
+
+    # ⑥ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
     last = {}
     for d in sd["Validation_Log"].find({"context": "dc_daily_d_gate", "trading_date": ref},
                                        {"problems": 1}).sort("run_at", 1):

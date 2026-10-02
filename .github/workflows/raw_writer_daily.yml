@@ -1,0 +1,58 @@
+name: Raw Writer Daily (列表內實際價)
+
+# 2026-10-02 新增：dataset 列表內（Mongo full_set）實際價 d_raw/w_raw/m_raw + actions。
+# 首次補史 TD adjust=none（每天上限 RAW_SEED_CAP 支，與 DC 共用 TD 額度）→ 之後每日從 Mongo D 追加。
+# 排在 BC.p bars_archive（~06:00 EST）之後，避免兩邊同時改地圖；美東盤前跑，不與 DC 盤中 TD 用量撞車。
+# 只新增/覆蓋自己的檔，絕不刪除。設計見 handoff_subsystem_dataset_map.md 2026-10-02 節。
+
+on:
+  schedule:
+    - cron: "30 12 * * *"    # 每日 12:30 UTC（08:30 EDT / 07:30 EST）
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "1=正式寫入 HF；0=試跑（只在 runner 產生檔案，不上傳）"
+        required: false
+        default: "1"
+      tickers:
+        description: "只跑指定代號（逗號分隔；正式寫入只允許列表內）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: raw-writer
+  cancel-in-progress: false
+
+jobs:
+  write:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz huggingface_hub
+
+      - name: Run raw writer
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          TWELVE_KEY:       ${{ secrets.TWELVE_KEY }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          RAW_SEED_CAP:     "120"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.write }}" = "1" ]; then ARGS="--write"; fi
+          if [ -n "${{ github.event.inputs.tickers }}" ]; then ARGS="$ARGS --tickers ${{ github.event.inputs.tickers }}"; fi
+          python raw_writer.py $ARGS
