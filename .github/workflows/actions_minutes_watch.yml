@@ -36,7 +36,7 @@ jobs:
           python-version: "3.9"
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests pymongo   # 2026-10-02：GCP/Mongo 段＋CFET 自計時要讀 Mongo（原只裝 requests→靜默略過）
 
       - name: Run minutes watchdog
         env:
