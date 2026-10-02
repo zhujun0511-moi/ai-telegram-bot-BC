@@ -220,6 +220,104 @@ def mongo_section(mongo_client):
             "（" + "、".join(parts) + " MB）"], alarm
 
 
+_D_GATE_LABEL = {
+    "blocked":                          "⛔ 被擋未寫（保留舊值，請查）",
+    "trimmed_but_shrink_guard_skipped": "⚠️ 剪齊後疑截斷（保留舊值，請查）",
+    "trimmed_too_short":                "🆕 剪齊後不足 20 根（新上市）",
+    "trimmed_to_list_date":             "✂️ 自動剪齊上市日（已寫入）",
+}
+
+
+def _lag(ref_dates, d):
+    """d 落後基準幾個交易日（d 為空＝視為落後整個窗口）。"""
+    if not d:
+        return len(ref_dates)
+    return sum(1 for x in ref_dates if x > str(d)[:10])
+
+
+def freshness_section(mongo_client):
+    """
+    （2026-10-02）資料新鮮度：所有「該每天更新」的東西有沒有跟上基準交易日（SPY 最新日線）。
+    起因：這幾週的問題幾乎都是「停了／壞了卻沒通知」——日線被閘門擋、AVB/EQR 下市、
+    Key Level 自 09-23 凍結、盤中 CFET 摘要轉播過期資料。回 (lines, alarm)。
+    """
+    import stale_bars_watch as S
+    sd = mongo_client["StockData"]
+    ref_dates = S.ref_trading_dates(sd)
+    if not ref_dates:
+        return ["🔴 基準 SPY 無日線，無法判斷新鮮度"], True
+    ref = ref_dates[0]
+    full = S.full_set(sd)
+    delisted = {d["ticker"].upper() for d in sd["Ticker_Identity"].find({"delisted": True}, {"ticker": 1})}
+    live = [t for t in full if t not in delisted]
+    lines, alarm = [f"基準交易日 {ref}（SPY 最新日線）｜清單 {len(full)} 支"], False
+
+    # ① 日線停更（原 stale_bars_watch）
+    sl, sa = S.stale_section(sd, ref_dates, full)
+    lines += sl
+    alarm = alarm or sa
+
+    # ② 指標（扁平 Indicators 每票最新日）
+    ind = {r["_id"]: r["d"] for r in sd["Indicators"].aggregate([
+        {"$match": {"ticker": {"$in": live}}},
+        {"$group": {"_id": "$ticker", "d": {"$max": "$date"}}}])}
+    behind = sorted(t for t in live if _lag(ref_dates, ind.get(t)) >= 1)
+    if behind:
+        alarm = True
+        lines.append(f"⚠️ 指標未更新到 {ref}：{len(behind)} 支（" + "、".join(behind[:15])
+                     + (" …" if len(behind) > 15 else "") + "）")
+    else:
+        lines.append(f"✅ 指標：全部更新到 {ref}")
+
+    # ③ Key Level（2026-10-02 起由 DC after_hours 計算）
+    kl = {d["ticker"]: d.get("trading_date") for d in sd["Bars"].find(
+        {"period": "KEY_LEVELS", "ticker": {"$in": live}}, {"ticker": 1, "trading_date": 1})}
+    kl_behind = sorted(t for t in live if _lag(ref_dates, kl.get(t)) >= 1)
+    kl_newest = max((v for v in kl.values() if v), default=None)
+    # 無擺動點資料的年輕股本來就不會有 KL → 只在「整體落後」或「多數落後」時亮燈
+    if kl_newest is None or _lag(ref_dates, kl_newest) >= 1:
+        alarm = True
+        lines.append(f"🔴 關鍵位（Key Level）停在 {kl_newest or '無資料'}，未更新到 {ref}")
+    elif len(kl_behind) > max(10, len(live) * 0.05):
+        alarm = True
+        lines.append(f"⚠️ 關鍵位：{len(kl_behind)} 支未更新到 {ref}（" + "、".join(kl_behind[:15]) + " …）")
+    else:
+        lines.append(f"✅ 關鍵位：更新到 {ref}（未更新 {len(kl_behind)} 支，多為無擺動點的新股）")
+
+    # ④ 新版 CFET 觀察名單（BC.p setup_scan → FractalRadar.Watchlist）
+    wl = mongo_client["FractalRadar"]["Watchlist"].find_one({"_id": "current"}, {"date": 1, "watchlist": 1})
+    wl_date = (wl or {}).get("date")
+    if _lag(ref_dates, wl_date) >= 1:
+        alarm = True
+        lines.append(f"🔴 CFET 觀察名單停在 {wl_date or '無資料'}，未更新到 {ref}")
+    else:
+        lines.append(f"✅ CFET 觀察名單：{wl_date}（{len((wl or {}).get('watchlist') or [])} 支）")
+
+    # ⑤ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
+    last = {}
+    for d in sd["Validation_Log"].find({"context": "dc_daily_d_gate", "trading_date": ref},
+                                       {"problems": 1}).sort("run_at", 1):
+        for p in d.get("problems") or []:
+            if p.get("ticker"):
+                last[p["ticker"]] = p
+    if last:
+        groups = {}
+        for tk, p in sorted(last.items()):
+            groups.setdefault(p.get("action", "?"), []).append(p)
+        for action in list(_D_GATE_LABEL) + [a for a in groups if a not in _D_GATE_LABEL]:
+            ps = groups.get(action) or []
+            if not ps:
+                continue
+            if action != "trimmed_to_list_date":
+                alarm = True
+            if action == "blocked":
+                items = "、".join(f"{p['ticker']}({','.join(p.get('codes') or [])})" for p in ps)
+            else:
+                items = "、".join(f"{p['ticker']}({p.get('n_before')}→{p.get('n_after')})" for p in ps)
+            lines.append(f"🧪 日線閘門 {_D_GATE_LABEL.get(action, action)} {len(ps)} 支：{items}")
+    return lines, alarm
+
+
 def main() -> int:
     if not _token():
         print("❌ GH_TOKEN 未設定，無法查詢")
@@ -315,7 +413,8 @@ def main() -> int:
         try:
             import pymongo
             _mc = pymongo.MongoClient(_uri, serverSelectionTimeoutMS=8000)
-            for title, fn in (("GCP VM", gcp_section), ("Mongo Atlas", mongo_section)):
+            for title, fn in (("資料新鮮度", freshness_section), ("GCP VM", gcp_section),
+                              ("Mongo Atlas", mongo_section)):
                 try:
                     sec, alarm = fn(_mc)
                 except Exception as e:
@@ -330,7 +429,7 @@ def main() -> int:
 
     today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     alert = "🔴 有項目需注意" if (over or other_alarm) else "🟢 全部正常"
-    msg = f"📊 每日用量報告 {today}｜{alert}\n\n{msg}"
+    msg = f"📊 每日健康報告 {today}｜{alert}\n\n{msg}"
     print(msg)
 
     if over or other_alarm or always:

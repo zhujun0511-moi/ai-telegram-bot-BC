@@ -1,4 +1,7 @@
-name: Actions Minutes Watchdog
+name: Daily Health Report
+
+# 2026-10-02：擴成「📊 每日健康報告」一則——GitHub Actions(BC.p)＋資料新鮮度（日線停更〔原 stale_bars_watch 獨立排程已併入〕/
+# 指標/Key Level/CFET 觀察名單/DC 日線閘門）＋GCP VM＋Mongo Atlas。用戶要求所有看門狗每天合併成一條。
 
 # 2026-09-23 新增（長期）：BC.p(私有)的 Actions 分鐘用盡會被 GitHub 無預警擋下
 # （job "was not started"），整批 job 靜默失敗。此 watchdog 每日在 BC(公開/免費)跑，

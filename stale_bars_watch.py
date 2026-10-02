@@ -12,7 +12,7 @@ stale_bars_watch.py — 每日「日線停更」看門狗（2026-10-01 新增，
   - 另列「已標 delisted 卻仍在清單」「沒有 D 資料」
   - 有問題才發 Telegram（ALWAYS_NOTIFY=1 則一律發一份）
 
-排程：BC（公開＝Actions 免費），平日 DC 盤後寫完 D 之後。Python 3.9 相容。
+排程：2026-10-02 起併入 actions_minutes_watch「📊 每日健康報告」（stale_section），本檔 main 只供手動執行。Python 3.9 相容。
 """
 import os
 import sys
@@ -39,28 +39,21 @@ def _newest_d(sd, tickers):
     return out
 
 
-def main() -> int:
-    if not MONGO_URI:
-        print("❌ MONGO_URI 未設定")
-        return 1
-    sd = pymongo.MongoClient(MONGO_URI)["StockData"]
-
-    cfg = sd["Configs"].find_one({"type": "ticker_lists"}) or {}
-    full = sorted({t.upper() for t in cfg.get("full_set", []) if isinstance(t, str)})
-    if not full:
-        notify("❌ [停更看門狗] Configs.full_set 為空，無法檢查", report_type=REPORT_TYPE)
-        return 1
-
+def ref_trading_dates(sd):
+    """基準 SPY 最近 REF_WINDOW 個交易日（新在前）；空＝無法判斷。"""
     ref = sd["Bars"].find_one({"ticker": REF_TICKER, "period": "D"}, {"bars": {"$slice": REF_WINDOW}})
-    ref_dates = [str(b.get("t"))[:10] for b in (ref or {}).get("bars") or []]
-    if not ref_dates:
-        notify(f"❌ [停更看門狗] 基準 {REF_TICKER} 無日線，無法檢查", report_type=REPORT_TYPE)
-        return 1
-    ref_latest = ref_dates[0]
+    return [str(b.get("t"))[:10] for b in (ref or {}).get("bars") or []]
 
+
+def full_set(sd):
+    cfg = sd["Configs"].find_one({"type": "ticker_lists"}) or {}
+    return sorted({t.upper() for t in cfg.get("full_set", []) if isinstance(t, str)})
+
+
+def stale_section(sd, ref_dates, full):
+    """（2026-10-02 併入每日健康報告）日線停更檢查。回 (lines, alarm)。"""
     delisted = {d["ticker"].upper() for d in sd["Ticker_Identity"].find({"delisted": True}, {"ticker": 1})}
     newest = _newest_d(sd, full)
-
     stale, no_data, delisted_in_list = [], [], []
     for tk in full:
         if tk in delisted:
@@ -76,8 +69,7 @@ def main() -> int:
         if lag >= STALE_MIN_DAYS:
             stale.append((lag, tk, nd))
     stale.sort(key=lambda x: (-x[0], x[1]))
-
-    lines = [f"📉 [停更看門狗] 基準 {REF_TICKER} 最新日線 {ref_latest}｜清單 {len(full)} 支"]
+    lines = []
     if stale:
         lines.append(f"⚠️ 日線落後 ≥{STALE_MIN_DAYS} 個交易日 {len(stale)} 支："
                      + "、".join(f"{tk}(停在{nd}，落後{lag if lag < REF_WINDOW else str(REF_WINDOW) + '+'}天)"
@@ -88,11 +80,31 @@ def main() -> int:
                      + "、".join(delisted_in_list))
     if no_data:
         lines.append(f"❓ 沒有日線資料 {len(no_data)} 支：" + "、".join(no_data[:30]))
-    problems = bool(stale or delisted_in_list or no_data)
-    if not problems:
-        lines.append("✅ 全部日線新鮮")
+    alarm = bool(stale or delisted_in_list or no_data)
+    if not alarm:
+        lines.append(f"✅ 日線：{len(full)} 支全部新鮮")
+    return lines, alarm
 
-    msg = "\n".join(lines)
+
+def main() -> int:
+    """單獨手動執行用（2026-10-02 起排程已併入 actions_minutes_watch 每日健康報告）。"""
+    if not MONGO_URI:
+        print("❌ MONGO_URI 未設定")
+        return 1
+    sd = pymongo.MongoClient(MONGO_URI)["StockData"]
+
+    full = full_set(sd)
+    if not full:
+        notify("❌ [停更看門狗] Configs.full_set 為空，無法檢查", report_type=REPORT_TYPE)
+        return 1
+
+    ref_dates = ref_trading_dates(sd)
+    if not ref_dates:
+        notify(f"❌ [停更看門狗] 基準 {REF_TICKER} 無日線，無法檢查", report_type=REPORT_TYPE)
+        return 1
+    ref_latest = ref_dates[0]
+    lines, problems = stale_section(sd, ref_dates, full)
+    msg = "\n".join([f"📉 [停更看門狗] 基準 {REF_TICKER} 最新日線 {ref_latest}｜清單 {len(full)} 支"] + lines)
     print(msg)
     if problems or ALWAYS_NOTIFY:
         notify(msg, report_type=REPORT_TYPE)
