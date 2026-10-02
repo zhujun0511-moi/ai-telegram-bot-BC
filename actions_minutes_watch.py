@@ -146,6 +146,80 @@ def detect_block(repo: str):
     return (len(fast_fail) >= 2, fast_fail[:5])
 
 
+GCP_STALE_HOURS   = 26          # VM 回報超過此時數未更新＝視為未回報
+GCP_PROBE_URL     = "https://comm-hub.zhujun.date/"
+MONGO_LIMIT_MB    = 512         # Atlas M0 儲存上限，滿了會拒絕寫入
+MONGO_WARN_PCT    = 0.75
+MONGO_DBS         = ("StockData", "CommData", "FractalRadar")
+
+
+def gcp_section(mongo_client):
+    """（2026-10-02）讀 VM 每日回報 StockData.System_State{id:gcp_vm_usage}。回 (lines, alarm)。
+    VM 掛了＝這筆不會更新 → 報「未回報」＋外部探測 comm-hub（報告由 GitHub 發，VM 死了也收得到）。"""
+    lines, alarm = [], False
+    doc = mongo_client["StockData"]["System_State"].find_one({"id": "gcp_vm_usage"})
+    now = dt.datetime.now(dt.timezone.utc)
+    rep = (doc or {}).get("reported_at")
+    if isinstance(rep, dt.datetime) and rep.tzinfo is None:
+        rep = rep.replace(tzinfo=dt.timezone.utc)
+    age_h = max(0.0, (now - rep).total_seconds() / 3600) if isinstance(rep, dt.datetime) else None
+    if age_h is None or age_h > GCP_STALE_HOURS:
+        alarm = True
+        try:
+            code = requests.get(GCP_PROBE_URL, timeout=15).status_code
+        except Exception as e:
+            code = type(e).__name__
+        lines.append(f"🔴 VM 未回報（上次 {rep.strftime('%m-%d %H:%M UTC') if rep else '從無'}）"
+                     f"｜外部探測 comm-hub：{code}")
+        if not doc:
+            return lines, alarm
+    else:
+        lines.append(f"回報時間 {rep.strftime('%m-%d %H:%M UTC')}（{age_h:.0f} 小時前）")
+
+    free = doc.get("egress_free_mb") or 1024
+    proj = doc.get("egress_month_projected_mb")
+    if doc.get("vnstat_ok"):
+        flag = ""
+        if proj is not None and proj >= free:
+            flag = "⚠️ 超過免費額度（超出部分約 0.12 美元/GB）"
+            alarm = True
+        lines.append(f"出站流量：昨天 {doc.get('egress_yesterday_mb')}MB｜本月 {doc.get('egress_month_mb')}MB"
+                     f"｜月底推估 {proj}MB / 免費 {free}MB {flag}".rstrip())
+    else:
+        alarm = True
+        lines.append(f"⚠️ 流量讀取失敗：{doc.get('vnstat_error')}")
+
+    svc = doc.get("services") or {}
+    bad = [k for k, v in svc.items() if v != "active"]
+    if bad:
+        alarm = True
+    lines.append("服務：" + "、".join(f"{k} {'✅' if v == 'active' else '❌' + v}" for k, v in svc.items()))
+    mem_av, disk = doc.get("mem_available_mb"), doc.get("disk_used_pct")
+    if (mem_av is not None and mem_av < 100) or (disk is not None and disk >= 85):
+        alarm = True
+    lines.append(f"記憶體可用 {mem_av}/{doc.get('mem_total_mb')}MB｜交換區 {doc.get('swap_used_mb')}MB"
+                 f"｜硬碟 {disk}%｜開機 {doc.get('uptime_days')} 天")
+    return lines, alarm
+
+
+def mongo_section(mongo_client):
+    """（2026-10-02）Atlas M0 用量（dataSize+indexSize 加總）vs 512MB。回 (lines, alarm)。"""
+    total, parts = 0.0, []
+    for name in MONGO_DBS:
+        try:
+            st = mongo_client[name].command("dbStats")
+            mb = (st.get("dataSize", 0) + st.get("indexSize", 0)) / 1024 / 1024
+            total += mb
+            parts.append(f"{name} {mb:.0f}")
+        except Exception as e:
+            parts.append(f"{name} 讀取失敗({type(e).__name__})")
+    pct = total / MONGO_LIMIT_MB
+    alarm = pct >= MONGO_WARN_PCT
+    head = "🔴" if alarm else "🟢"
+    return [f"{head} 已用 {total:.0f}/{MONGO_LIMIT_MB}MB（{pct*100:.0f}%｜警戒 {int(MONGO_WARN_PCT*100)}%，滿了會拒絕寫入）",
+            "（" + "、".join(parts) + " MB）"], alarm
+
+
 def main() -> int:
     if not _token():
         print("❌ GH_TOKEN 未設定，無法查詢")
@@ -185,7 +259,18 @@ def main() -> int:
     for repo in repos:
         m, _ = sum_run_minutes(repo, start30)
         roll += m
-    lines.append(f"近 30 天滾動 ~{roll} 分（≈ 月投影 pace）")
+    lines.append(f"近 30 天滾動 ~{roll} 分（僅參考：會含上個週期的舊用量）")
+
+    # 2026-10-02：警報改用「本週期實際速度」推估週期末用量（原用 30 天滾動，新週期頭一個月
+    # 會被上週期殘留拖成整月假紅燈，例：10 月初 roll=2057 但本週期才 1 分）。週期滿 3 天才推估。
+    _cs = cycle_start(reset_d)
+    _today = dt.datetime.now(dt.timezone.utc).date()
+    _elapsed = (_today - _cs).days + 1
+    _next = (_cs.replace(day=1) + dt.timedelta(days=32)).replace(day=_cs.day)
+    _cycle_len = (_next - _cs).days
+    projected = int(used / _elapsed * _cycle_len) if _elapsed >= 3 else None
+    if projected is not None:
+        lines.append(f"本週期速度推估週期末 ~{projected} 分（已過 {_elapsed}/{_cycle_len} 天）")
 
     # ── BC.p setup_scan 上次自計時（從 FractalRadar.System_State 讀，供「job 跑多久」時間報告）──
     _uri = os.getenv("MONGO_URI", "").strip()
@@ -208,7 +293,7 @@ def main() -> int:
             blocked_any = True
             samples += [f"{repo}: {', '.join(s)}"]
 
-    over = (pct >= warn) or (roll >= limit) or blocked_any
+    over = (pct >= warn) or (projected is not None and projected >= limit) or blocked_any
     if blocked_any:
         head = "🔴🔴 GitHub Actions 疑似已被擋（額度/付款）"
     elif over:
@@ -222,10 +307,33 @@ def main() -> int:
         tail += "\n⚠️ 近日多個 run <90s 失敗＝job 沒起，去 GitHub Billing 看付款/額度"
         if samples:
             tail += "\n" + "\n".join(samples)
-    msg = f"{head}\n{body}\n{tail}"
+    msg = f"【GitHub Actions｜BC.p】\n{head}\n{body}\n{tail}"
+
+    # ── 2026-10-02：GCP VM + Mongo Atlas（合併成同一則每日用量報告）──
+    other_alarm = False
+    if _uri:
+        try:
+            import pymongo
+            _mc = pymongo.MongoClient(_uri, serverSelectionTimeoutMS=8000)
+            for title, fn in (("GCP VM", gcp_section), ("Mongo Atlas", mongo_section)):
+                try:
+                    sec, alarm = fn(_mc)
+                except Exception as e:
+                    sec, alarm = [f"⚠️ 讀取失敗：{type(e).__name__}: {str(e)[:100]}"], True
+                other_alarm = other_alarm or alarm
+                msg += f"\n\n【{title}】\n" + "\n".join(sec)
+        except Exception as e:
+            msg += f"\n\n⚠️ GCP/Mongo 段略過：{type(e).__name__}"
+            other_alarm = True
+    else:
+        msg += "\n\n⚠️ MONGO_URI 未設，GCP/Mongo 段略過"
+
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    alert = "🔴 有項目需注意" if (over or other_alarm) else "🟢 全部正常"
+    msg = f"📊 每日用量報告 {today}｜{alert}\n\n{msg}"
     print(msg)
 
-    if over or always:
+    if over or other_alarm or always:
         try:
             from tasks.outbound import notify
             ok = notify(msg, report_type="bc_backtest")
