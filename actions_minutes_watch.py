@@ -221,6 +221,7 @@ def mongo_section(mongo_client):
 
 
 _D_GATE_LABEL = {
+    "stale_latest_skip":                "⏭️ 沒有當日日線、當晚未算指標（TD 未發布）",
     "blocked":                          "⛔ 被擋未寫（保留舊值，請查）",
     "trimmed_but_shrink_guard_skipped": "⚠️ 剪齊後疑截斷（保留舊值，請查）",
     "trimmed_too_short":                "🆕 剪齊後不足 20 根（新上市）",
@@ -318,7 +319,24 @@ def freshness_section(mongo_client):
             lines.append(f"✅ 列表內實際價：{seed}（待補 {rw.get('pending_seed')}）｜今日追加 {rw.get('appended')} 支"
                          f"｜補缺日 {rw.get('gap_filled', 0)}{tail}" + (f"｜錯誤 {len(errs)} 筆" if errs else ""))
 
-    # ⑥ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
+    # ⑥ TD 定稿閘門（BC td_ready_gate，2026-10-02）：昨晚 TD 何時定稿、何時觸發 DC、DC 何時跑完
+    g = sd["System_State"].find_one({"id": "td_ready_gate"})
+    if not g or (g.get("date") or "") < ref:
+        alarm = True
+        lines.append(f"🔴 定稿閘門：{ref} 沒有執行紀錄（最後一次 {(g or {}).get('date') or '無'}；DC 只能靠 23:00 保底觸發）")
+    else:
+        fin, reason = g.get("finished"), g.get("ready_reason")
+        txt = (f"定稿閘門 {g.get('date')}：TD 定稿 {g.get('ready_at') or '—'}"
+               f"（{'穩定' if reason == 'stable' else '保底強制' if reason == 'deadline' else reason or '—'}）"
+               f"｜觸發 DC {g.get('triggered_at') or '—'}｜DC 完成 {g.get('done_at') or '—'}"
+               f"｜續打 {g.get('retriggers', 0)} 次｜查詢 {g.get('polls', 0)} 次")
+        if fin in ("done", "already_done", "holiday") and reason != "deadline" and not g.get("dry_run"):
+            lines.append("✅ " + txt)
+        else:
+            alarm = True
+            lines.append(f"⚠️ {txt}｜結果 {fin}" + ("（試跑）" if g.get("dry_run") else ""))
+
+    # ⑦ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
     last = {}
     for d in sd["Validation_Log"].find({"context": "dc_daily_d_gate", "trading_date": ref},
                                        {"problems": 1}).sort("run_at", 1):

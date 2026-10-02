@@ -1,0 +1,48 @@
+name: TD Ready Gate (日線定稿閘門)
+
+# 2026-10-02 新增：TD 當日日線定稿才觸發 DC /v3-update（取代 cron-job.org 17:00 固定觸發），
+# 觸發後盯到 DC 盤後完成（未完成每 30 分續打）。單一 job 內自己每 15 分輪詢（不靠多個排程，
+# GitHub 排程常延遲）。BC 公開＝Actions 免費。設計見 td_ready_gate.py 檔頭。
+# 21:10 UTC＝17:10 EDT／16:10 EST（冬令程式自己等到 17:15 ET 再開始）。
+
+on:
+  schedule:
+    - cron: "10 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1=只觀測不觸發 DC"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: td-ready-gate
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz
+
+      - name: Run gate
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          TWELVE_KEY:       ${{ secrets.TWELVE_KEY }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          GATE_DRY_RUN:     ${{ github.event.inputs.dry_run || '0' }}
+          PYTHONUNBUFFERED: "1"
+        run: python td_ready_gate.py
