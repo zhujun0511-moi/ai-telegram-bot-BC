@@ -69,6 +69,16 @@ def fmt_num(x, nd=4):
     return s[:-2] if s.endswith(".0") else s
 
 
+def fmt_px(x):
+    """價格：四捨五入 4 位、保留 Python 預設寫法（1208.88 / 121.0）——與 dataset 既有 d/w/m 及本地端一致（2026-10-02 對齊）。"""
+    return repr(round(float(x), 4))
+
+
+def fmt_vol(v):
+    """量：浮點寫法（41238600.0）——與 dataset 既有 d/w/m 及本地端（E23 約定）一致。"""
+    return repr(float(int(round(float(v or 0)))))
+
+
 def parse_csv(text):
     """CSV 文字 → {key(第一欄): [原字串欄位...]}；保留原字串（既有行優先、不重格式化）。"""
     out = {}
@@ -99,7 +109,7 @@ def merge_keep_existing(existing, new):
 
 
 def bar_row(date, o, h, l, c, v):
-    return [date, fmt_num(o), fmt_num(h), fmt_num(l), fmt_num(c), str(int(round(float(v or 0))))]
+    return [date, fmt_px(o), fmt_px(h), fmt_px(l), fmt_px(c), fmt_vol(v)]
 
 
 def td_rows(values, upto):
@@ -165,7 +175,7 @@ def aggregate(d_rows, kind, ref):
         l = min(float(r[3]) for r in rows)
         c = rows[-1][4]
         v = sum(int(float(r[5])) for r in rows)
-        out[lab] = [lab, o, fmt_num(h), fmt_num(l), c, str(v)]
+        out[lab] = [lab, o, fmt_px(h), fmt_px(l), c, fmt_vol(v)]
     return out
 
 
