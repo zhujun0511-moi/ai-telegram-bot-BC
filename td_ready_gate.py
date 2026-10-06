@@ -129,6 +129,12 @@ def trigger_dc(secret):
     return False
 
 
+def keep_existing(prev, today_iso):
+    """2026-10-06：cron-job.org 17:03／17:33 兩次觸發 → 第二輪排隊到第一輪結束才跑、一開始就發現 DC 已完成。
+    同一交易日已有實際觸發紀錄（triggered_at 有值）時，第二輪不要覆蓋它（否則健康報告看不到定稿／觸發／完成時間）。"""
+    return bool(prev) and prev.get("date") == today_iso and bool(prev.get("triggered_at")) and not prev.get("dry_run")
+
+
 def main():
     t0 = time.time()
     now = dt.datetime.now(ET)
@@ -164,6 +170,9 @@ def main():
     while True:
         now = dt.datetime.now(ET)
         if (st_col.find_one({"id": "global"}) or {}).get(done_key):
+            if keep_existing(st_col.find_one({"id": "td_ready_gate"}), today.isoformat()):
+                _log("DC 今日盤後已完成，且今天已有閘門觸發紀錄（例：17:03 那輪）→ 保留原紀錄、不覆蓋，收工")
+                return 0
             _log("DC 今日盤後已完成（可能被手動/保底觸發），閘門收工")
             rec["finished"] = "already_done"
             save()
