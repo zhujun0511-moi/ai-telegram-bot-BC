@@ -39,6 +39,7 @@ POLL_MIN    = 15
 WATCH_MIN   = 30
 START_AT_ET = (17, 15)
 FORCE_AT_ET = (22, 30)
+LATE_START_ET = (19, 0)      # 2026-10-05：晚於此時間才啟動（排程延遲／手動補跑），第一次查詢抽樣全有當日線即觸發，不再等 15 分比對
 END_AT_ET   = (23, 0)
 JOB_BUDGET_S = 5 * 3600 + 45 * 60   # GitHub job 上限 6h，留餘裕
 DC_URL      = os.getenv("DC_URL", "").strip().rstrip("/") or "https://zhujun0511-ai-ai-telegram-bot-dc.hf.space"
@@ -174,6 +175,11 @@ def main():
             for s, v in cur.items():
                 if v["date"] == today.isoformat() and s not in rec["first_seen"]:
                     rec["first_seen"][s] = _hm(now)
+            all_today = all((cur.get(s) or {}).get("date") == today.isoformat() for s in SAMPLES)
+            if rec["polls"] == 1 and all_today and now >= _at(today, LATE_START_ET):
+                rec["ready_at"], rec["ready_reason"] = _hm(now), "late_start"
+                _log("晚啟動（%02d:%02d ET 後）且抽樣全有當日線 → 視為已定稿，直接觸發" % LATE_START_ET)
+                break
             ok, bad = is_stable(prev, cur, SAMPLES, today.isoformat())
             _log(f"第 {rec['polls']} 次：{'✅ 定稿' if ok else '未定稿 ' + '、'.join(bad)}")
             if ok:

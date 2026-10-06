@@ -1,0 +1,56 @@
+name: Nightly Chain (夜間收尾鏈)
+
+# 2026-10-05 新增（用戶同意「GitHub 工作鏈式化」）：DC 盤後 ALL_DONE dispatch 本 workflow，
+# 依序觸發並等待 BC.p 四個歸檔 → BC raw_writer，上一步成功才叫下一步。設計見 nightly_chain.py 檔頭。
+# 指揮放公開 BC＝等待不花 BC.p 計費分鐘。各被叫工作的原排程全部保留作保底（各有今日 marker 防重複）。
+
+on:
+  schedule:
+    - cron: "0 5 * * 2-6"    # 保底：週二～六 05:00 UTC（01:00 EDT／00:00 EST）；DC 已完成而本鏈未跑才啟動
+  workflow_dispatch:
+    inputs:
+      trigger:
+        description: "觸發來源（dc／manual）"
+        required: false
+        default: "manual"
+      dry_run:
+        description: "1=試跑：各工作用試跑參數（BC.p mode=dry_run、raw_writer write=0），不寫資料"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+  actions: write          # 同倉庫 dispatch raw_writer_daily 與查詢 run 狀態
+
+concurrency:
+  group: nightly-chain
+  cancel-in-progress: false
+
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz
+
+      - name: Run nightly chain
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          GH_TOKEN:         ${{ secrets.GH_TOKEN }}
+          CFET_REPO:        ${{ secrets.CFET_REPO }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS="--trigger ${{ github.event_name == 'schedule' && 'schedule' || github.event.inputs.trigger || 'manual' }}"
+          if [ "${{ github.event_name }}" = "schedule" ]; then ARGS="$ARGS --if-needed"; fi
+          if [ "${{ github.event.inputs.dry_run }}" = "1" ]; then ARGS="$ARGS --dry-run"; fi
+          python nightly_chain.py $ARGS

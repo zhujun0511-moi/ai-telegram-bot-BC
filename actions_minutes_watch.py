@@ -327,7 +327,7 @@ def freshness_section(mongo_client):
     else:
         fin, reason = g.get("finished"), g.get("ready_reason")
         txt = (f"定稿閘門 {g.get('date')}：TD 定稿 {g.get('ready_at') or '—'}"
-               f"（{'穩定' if reason == 'stable' else '保底強制' if reason == 'deadline' else reason or '—'}）"
+               f"（{'穩定' if reason == 'stable' else '保底強制' if reason == 'deadline' else '晚啟動直接觸發' if reason == 'late_start' else reason or '—'}）"
                f"｜觸發 DC {g.get('triggered_at') or '—'}｜DC 完成 {g.get('done_at') or '—'}"
                f"｜續打 {g.get('retriggers', 0)} 次｜查詢 {g.get('polls', 0)} 次")
         if fin in ("done", "already_done", "holiday") and reason != "deadline" and not g.get("dry_run"):
@@ -335,6 +335,30 @@ def freshness_section(mongo_client):
         else:
             alarm = True
             lines.append(f"⚠️ {txt}｜結果 {fin}" + ("（試跑）" if g.get("dry_run") else ""))
+
+    # ⑥b 夜間收尾鏈（BC nightly_chain，2026-10-05）：DC 盤後完成 → BC.p 四個歸檔 → BC raw_writer，斷在哪一步
+    ch = sd["System_State"].find_one({"id": "nightly_chain"})
+    if not ch or (ch.get("date") or "") < ref:
+        alarm = True
+        lines.append(f"⚠️ 夜間鏈：{ref} 沒有執行紀錄（最後一次 {(ch or {}).get('date') or '無'}；各歸檔靠原排程保底）")
+    else:
+        _mark = {"success": "✅", "not_started": "·"}
+        seq = "→".join(f"{(st.get('name') or '?').replace('_daily', '')}{_mark.get(st.get('conclusion'), '❌')}"
+                       for st in (ch.get("steps") or []))
+        sa = ch.get("started_at")
+        if isinstance(sa, dt.datetime):
+            if sa.tzinfo is None:
+                sa = sa.replace(tzinfo=dt.timezone.utc)
+            from zoneinfo import ZoneInfo   # 自動處理夏令／冬令
+            sa = sa.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")
+        txt = (f"夜間鏈 {ch.get('date')}（{ch.get('trigger')} 觸發 {sa or '—'}→{ch.get('finished_at') or '—'}）：{seq}")
+        if ch.get("finished") == "done" and not ch.get("dry_run"):
+            lines.append("✅ " + txt)
+        else:
+            alarm = True
+            bad = next((st for st in (ch.get("steps") or []) if st.get("conclusion") not in ("success", "not_started")), None)
+            where = f"｜斷在 {bad.get('name')}（{bad.get('conclusion')}）" if bad else ""
+            lines.append(f"⚠️ {txt}｜結果 {ch.get('finished') or '進行中'}{where}" + ("（試跑）" if ch.get("dry_run") else ""))
 
     # ⑦ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
     last = {}
