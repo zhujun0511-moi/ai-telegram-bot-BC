@@ -336,7 +336,8 @@ def freshness_section(mongo_client):
             alarm = True
             lines.append(f"⚠️ {txt}｜結果 {fin}" + ("（試跑）" if g.get("dry_run") else ""))
 
-    # ⑥b 夜間收尾鏈（BC nightly_chain，2026-10-05）：DC 盤後完成 → BC.p 四個歸檔 → BC raw_writer，斷在哪一步
+    # ⑥b 夜間收尾鏈（BC nightly_chain，2026-10-05）：DC 盤後完成 → BC.p snapshot/indicators/commdata → BC raw_writer
+    #    → BC.p bars（2026-10-06 改順序；某步失敗不再整條停 → 列出全部失敗的步驟）
     ch = sd["System_State"].find_one({"id": "nightly_chain"})
     if not ch or (ch.get("date") or "") < ref:
         alarm = True
@@ -356,8 +357,8 @@ def freshness_section(mongo_client):
             lines.append("✅ " + txt)
         else:
             alarm = True
-            bad = next((st for st in (ch.get("steps") or []) if st.get("conclusion") not in ("success", "not_started")), None)
-            where = f"｜斷在 {bad.get('name')}（{bad.get('conclusion')}）" if bad else ""
+            bad = [st for st in (ch.get("steps") or []) if st.get("conclusion") not in ("success", "not_started")]
+            where = ("｜失敗：" + "、".join(f"{st.get('name')}（{st.get('conclusion')}）" for st in bad)) if bad else ""
             lines.append(f"⚠️ {txt}｜結果 {ch.get('finished') or '進行中'}{where}" + ("（試跑）" if ch.get("dry_run") else ""))
 
     # ⑦ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）

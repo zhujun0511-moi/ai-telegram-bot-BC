@@ -6,8 +6,14 @@ nightly_chain.py — 夜間收尾鏈（2026-10-05 用戶同意「GitHub 工作�
 
   DC 盤後 ALL_DONE ──dispatch──→ 本 workflow（trigger=dc）
       依序 dispatch 並等待完成：
-        BC.p bars_daily → BC.p snapshot_daily → BC.p indicators_daily → BC.p commdata_daily → BC raw_writer_daily
-      任何一步失敗就停（後面各步自己的原排程仍是保底，且各有「今天跑過就跳過」的 marker）
+        BC.p snapshot_daily → BC.p indicators_daily → BC.p commdata_daily → BC raw_writer_daily → BC.p bars_daily
+      2026-10-06 改順序：bars_daily 新股票第一次建 h.csv 要讀 raw_writer 寫的 actions.csv（最近拆股日），
+      原本 bars_daily 排第一、raw_writer 排最後 → 永遠讀到前一晚的，所以 bars_daily 移到 raw_writer 之後。
+      同日改：某一步失敗**不再整條停**，後面照跑——五步裡只有 bars_daily 依賴 raw_writer，且它自己有
+      「讀不到 actions.csv 就延後建檔」防呆；其餘互不依賴。有任何一步失敗，整條仍記 finished="failed"
+      （凌晨保底排程照舊重跑整條）。✅ 10-06 實查重跑的安全性：snapshot／indicators／bars 有「今天跑過就跳過」
+      的 marker（Archive_State）；commdata 按 cutoff 天生冪等（第二次刪 0）；raw_writer 沒有 marker，但
+      merge_keep_existing「既有行優先、只補缺的」＝冪等，重跑只多花時間。（原說明「各有 marker」不準確。）
   凌晨保底排程（trigger=schedule）：DC 已完成、本鏈對該交易日卻沒跑完 → 自己啟動；否則直接結束
 
 指揮放在公開 BC（Actions 免費）：等待期間只花 BC 的時間，不花 BC.p（私有、計費）的分鐘數。
@@ -35,11 +41,11 @@ POLL_S = 30
 FIND_RUN_S = 180                      # dispatch 後最多等幾秒找到對應的 run
 # (名稱, 倉庫別名, workflow 檔, 正式參數, 試跑參數, 單步上限分鐘)
 STEPS = [
-    ("bars_daily",       "BCP", "bars_daily.yml",       {"mode": "full"}, {"mode": "dry_run"}, 90),
     ("snapshot_daily",   "BCP", "snapshot_daily.yml",   {"mode": "full"}, {"mode": "dry_run"}, 75),
     ("indicators_daily", "BCP", "indicators_daily.yml", {"mode": "full"}, {"mode": "dry_run"}, 45),
     ("commdata_daily",   "BCP", "commdata_daily.yml",   {"mode": "full"}, {"mode": "dry_run"}, 30),
     ("raw_writer_daily", "BC",  "raw_writer_daily.yml", {"write": "1"},   {"write": "0"},      165),
+    ("bars_daily",       "BCP", "bars_daily.yml",       {"mode": "full"}, {"mode": "dry_run"}, 90),   # 要在 raw_writer 之後（讀 actions.csv）
 ]
 
 
@@ -141,6 +147,7 @@ def main():
 
     save()
     _log(f"夜間鏈開始：交易日 {date}｜觸發 {a.trigger}｜{'試跑' if a.dry_run else '正式'}")
+    failed = []
     for i, (name, alias, wf, inp_real, inp_dry, limit) in enumerate(STEPS):
         step = rec["steps"][i]
         repo, token = repos[alias], _token(alias)
@@ -158,10 +165,13 @@ def main():
         save()
         _log(f"{name}：{step['conclusion']}（{step['start']}→{step['end']}）")
         if step["conclusion"] != "success":
-            rec["finished"], rec["finished_at"] = "failed", _hm()
-            save()
-            _log(f"⛔ 在 {name} 停下；後面各步由各自原排程保底")
-            return 1
+            failed.append(name)
+            _log(f"⚠️ {name} 失敗，繼續跑後面各步（各步互不依賴；bars_daily 讀不到 actions.csv 會自己延後建檔）")
+    if failed:
+        rec["finished"], rec["finished_at"] = "failed", _hm()
+        save()
+        _log(f"⛔ 夜間鏈結束，失敗：{'、'.join(failed)}（凌晨保底排程會重跑；各步重跑皆安全）")
+        return 1
     rec["finished"], rec["finished_at"] = "done", _hm()
     save()
     _log("✅ 夜間鏈全部完成")
