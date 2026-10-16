@@ -1,0 +1,76 @@
+name: Swing Exam (擺動點考官)
+
+# 2026-10-16 新增（Jun 同意：正式考試在 GitHub 跑）。設計：擺動點主文件 §8.3.1／卡片考卷指導文件 §11。
+# 只有手動觸發。程式、配方、數據、成績都在私有 dataset（swing_ai/code、strategies、packs、results），
+# 本倉庫只放啟動器 swing_lab/bootstrap.py；日誌只印筆數、不印盈虧。鎖箱考試每份卷只能考一次（大腦先記帳才放行）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "train＝訓練段考試｜lockbox＝鎖箱考試（每份卷一次）｜distribution＝只看分組分布（不算盈虧）"
+        required: true
+        default: "train"
+        type: choice
+        options: [train, lockbox, distribution]
+      recipe:
+        description: "配方 id（私有 dataset swing_ai/strategies/{id}.json）"
+        required: true
+        default: "topic01_base"
+      pack:
+        description: "打包數據日期（latest＝最新）"
+        required: false
+        default: "latest"
+      pipeline_check:
+        description: "1＝流程檢查（只跑通流程）；0＝正式"
+        required: false
+        default: "0"
+      tickers:
+        description: "只考指定代號（逗號分隔；留空＝全市場）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swing-exam
+  cancel-in-progress: false
+
+jobs:
+  exam:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install huggingface_hub
+
+      - name: Run exam
+        env:
+          HF_TOKEN:                       ${{ secrets.HF_TOKEN }}
+          PYTHONUNBUFFERED:               "1"
+          HF_HUB_DISABLE_PROGRESS_BARS:   "1"
+          IN_MODE:     ${{ github.event.inputs.mode }}
+          IN_RECIPE:   ${{ github.event.inputs.recipe }}
+          IN_PACK:     ${{ github.event.inputs.pack }}
+          IN_CHECK:    ${{ github.event.inputs.pipeline_check }}
+          IN_TICKERS:  ${{ github.event.inputs.tickers }}
+        working-directory: swing_lab
+        run: |
+          # 輸入一律經環境變數、只允許安全字元（防指令注入）
+          case "$IN_MODE" in train|lockbox|distribution) ;; *) echo "mode 不合法"; exit 1;; esac
+          for v in "$IN_RECIPE" "$IN_PACK" "$IN_TICKERS"; do
+            if ! [[ "$v" =~ ^[A-Za-z0-9_.,-]*$ ]]; then echo "輸入含不允許的字元"; exit 1; fi
+          done
+          ARGS=("$IN_MODE" "$IN_RECIPE" --fetch-pack "$IN_PACK" --procs 4)
+          if [ "$IN_CHECK" = "1" ]; then ARGS+=(--pipeline-check); fi
+          if [ -n "$IN_TICKERS" ]; then ARGS+=(--tickers "$IN_TICKERS"); fi
+          python bootstrap.py "${ARGS[@]}"      # 程式包從私有 dataset 下載、驗指紋才執行
