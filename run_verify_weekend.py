@@ -47,23 +47,20 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 import pytz
-import pymongo
-import requests
-from pymongo.errors import DuplicateKeyError
 
-from tasks.outbound import notify as _notify_shared
-from tasks.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
-from tasks.outbound import trigger_ac_webhook as _trigger_ac_webhook_shared
-from bc_secutil import scrub
-
-# DAL 統一數據存取純核心（2026-08-23 vendored 自 DC canonical，逐字同步 + checksum audit）。
-# BC verify 的 Bars 讀寫走 data_core（get_bars/push_bars/replace_bars）。
-import data_core as dc
+# 2026-10-16「唯一的門」：Mongo（VerifyDB）、Polygon、通知、dispatch、AC webhook 一律經 courier。
+from courier import mongo as M
+from courier import polygon as PG
+from courier.mongo import DuplicateKeyError
+from courier.verify_db import VerifyDB
+from courier.outbound import notify as _notify_shared
+from courier.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
+from courier.outbound import trigger_ac_webhook as _trigger_ac_webhook_shared
+from courier.keys import scrub  # noqa: F401
 
 EST_TZ = pytz.timezone("US/Eastern")
 
-MONGO_URI        = os.getenv("MONGO_URI", "")
-POLYGON_KEY      = os.getenv("POLYGON_KEY", "")
+# MONGO_URI／POLYGON_KEY 改在門內讀（courier/verify_db、courier/polygon；2026-10-16）
 
 POLYGON_DELAY     = 13.5
 POLYGON_WAIT      = 65
@@ -123,7 +120,7 @@ def load_market_calendar(stock_db):
     失敗回落 FALLBACK_HOLIDAYS。main() 於 DB 初始化後、任何日期計算前呼叫。
     """
     try:
-        doc = stock_db["Configs"].find_one({"type": "market_calendar"})
+        doc = M.find_one("StockData", "Configs", {"type": "market_calendar"})
         if doc and doc.get("holidays"):
             _HOLIDAY_CACHE["holidays"] = set(doc["holidays"])
             _log(f"market_calendar 載入 {len(_HOLIDAY_CACHE['holidays'])} 個假日")
@@ -192,135 +189,7 @@ def _dispatch_next_workflow():
 # DB
 # ─────────────────────────────────────────────
 
-class VerifyDB:
-    def __init__(self):
-        if not MONGO_URI:
-            raise RuntimeError("MONGO_URI 未設定")
-        self.client   = pymongo.MongoClient(MONGO_URI)
-        self.stock_db = self.client["StockData"]
-        self.stock_db["Verify_Verdicts"].create_index(
-            [("ticker", pymongo.ASCENDING),
-             ("period", pymongo.ASCENDING),
-             ("target_date", pymongo.ASCENDING)],
-            unique=True,
-        )
-        # v1.1 新增：Ticker_Identity 唯一索引
-        self.stock_db["Ticker_Identity"].create_index(
-            [("ticker", pymongo.ASCENDING)],
-            unique=True,
-        )
-
-    # ── ticker 清單（與 DC get_all_tickers 同源：Configs.full_set）──
-    def get_all_tickers(self) -> List[str]:
-        cfg = self.stock_db["Configs"].find_one({"type": "ticker_lists"})
-        if not cfg:
-            return []
-        return cfg.get("full_set", [])
-
-    # ── bars 讀寫（語義克隆自 DC database.py）──
-    def get_bars(self, ticker: str, period: str) -> List[dict]:
-        ticker = ticker.upper()
-        doc = self.stock_db[dc.BARS].find_one(dc.bars_filter(ticker, period))
-        if doc and "bars" in doc:
-            return doc["bars"]
-        return []
-
-    def push_bars(self, ticker: str, period: str, new_bars: List[dict]) -> str:
-        """
-        與 DC push_bars 同語義（去重合併、新在前、截斷 limit），
-        唯一增強：合併後按 t 降序排序——強制執行『bars 新在前』系統標準，
-        防止補抓中段缺口時破壞排序（DC 版假設 new 恆比 existing 新）。
-        """
-        ticker = ticker.upper()
-        col = self.stock_db[dc.BARS]
-        col.create_index(
-            [("ticker", pymongo.ASCENDING), ("period", pymongo.ASCENDING)],
-            unique=True,
-        )
-        limit = BARS_LIMIT.get(period, dc.DEFAULT_BARS_LIMIT)
-        filt = dc.bars_filter(ticker, period)
-        doc = col.find_one(filt)
-        if doc:
-            # 2026-08-23 DAL：同 t 新贏合併走 data_core.merge_bars_by_t（皇冠邏輯共享 DC）。
-            merged = dc.merge_bars_by_t(doc.get("bars", []), new_bars, limit)
-            col.update_one(filt, dc.bars_set_update(merged))
-            return "updated"
-        # insert 分支：BC 強制新在前、排序不去重 → data_core.sort_cap_bars。
-        col.insert_one(dc.bars_insert_doc(ticker, period, dc.sort_cap_bars(new_bars, limit)))
-        return "inserted"
-
-    def replace_bars(self, ticker: str, period: str, bars: List[dict]):
-        """整筆覆蓋 bars 陣列（數據品質修正 pass 專用，不走去重合併）。"""
-        self.stock_db[dc.BARS].update_one(
-            dc.bars_filter(ticker.upper(), period),
-            dc.bars_set_update(bars),
-        )
-
-    # ── verdict ──
-    def get_verdict(self, ticker: str, period: str, target_date: str) -> Optional[str]:
-        doc = self.stock_db["Verify_Verdicts"].find_one(
-            {"ticker": ticker, "period": period, "target_date": target_date})
-        return doc.get("verdict") if doc else None
-
-    def set_verdict(self, ticker: str, period: str, target_date: str,
-                    verdict: str, note: str = ""):
-        # 精確 filter + upsert，不用 $or（M0 upsert 競態前科）
-        self.stock_db["Verify_Verdicts"].update_one(
-            {"ticker": ticker, "period": period, "target_date": target_date},
-            {"$set": {"verdict": verdict, "note": note,
-                      "checked_at": _now_est()}},
-            upsert=True,
-        )
-
-    def count_verdicts(self, target_date: str) -> dict:
-        out = {"filled": 0, "confirmed_empty": 0, "blocked": 0}
-        for row in self.stock_db["Verify_Verdicts"].aggregate([
-            {"$match": {"target_date": target_date}},
-            {"$group": {"_id": "$verdict", "n": {"$sum": 1}}},
-        ]):
-            out[row["_id"]] = row["n"]
-        return out
-
-    # ── Ticker_Identity（v1.1 新增：ticker 重複使用防禦）──
-    def get_ticker_identity(self, ticker: str) -> Optional[dict]:
-        return self.stock_db["Ticker_Identity"].find_one({"ticker": ticker.upper()})
-
-    def set_ticker_identity(self, ticker: str, list_date, cik, company_name):
-        self.stock_db["Ticker_Identity"].update_one(
-            {"ticker": ticker.upper()},
-            {"$set": {
-                "list_date":    list_date,
-                "cik":          cik,
-                "company_name": company_name,
-                "checked_at":   _now_est(),
-            }},
-            upsert=True,
-        )
-
-    def update_ticker_identity(self, ticker: str, fields: dict):
-        """（2026-10-01 E）每週身份刷新寫入：只 $set 給定欄位（schema 見 MongoDB_Standard Ticker_Identity）。"""
-        self.stock_db["Ticker_Identity"].update_one(
-            {"ticker": ticker.upper()}, {"$set": fields}, upsert=True)
-
-    def get_oldest_bar_date(self, ticker: str, period: str) -> Optional[str]:
-        bars = self.get_bars(ticker, period)
-        if not bars:
-            return None
-        return min(b["t"][:10] for b in bars)
-
-    # ── Task_Log（標準欄位）──
-    def write_task_log(self, status: str, progress: int, total: int,
-                       last_error: str, started_at: datetime):
-        self.stock_db["Task_Log"].insert_one({
-            "task":        TASK_NAME,
-            "status":      status,
-            "progress":    progress,
-            "total":       total,
-            "last_error":  last_error,
-            "started_at":  started_at,
-            "finished_at": _now_est(),
-            "timestamp":   _now_est(),
-        })
+# VerifyDB 已逐字搬到 courier/verify_db（2026-10-16「唯一的門」）；建立時傳入 BARS_LIMIT／TASK_NAME／_now_est。
 
 
 # ─────────────────────────────────────────────
@@ -331,7 +200,6 @@ LOCK_ID = "bc_verify_lock"
 
 
 def _acquire_lock(db: VerifyDB) -> bool:
-    col   = db.stock_db["System_State"]
     now   = _now_est()
     stale = now - timedelta(seconds=LOCK_STALE_SECONDS)
     token = uuid.uuid4().hex
@@ -347,159 +215,40 @@ def _acquire_lock(db: VerifyDB) -> bool:
                            "lock_acquired_at": now,
                            "lock_token": token}}
     try:
-        col.find_one_and_update(filter_query, update_doc, upsert=True)
+        M.find_one_and_update("StockData", "System_State", filter_query, update_doc, upsert=True)
     except DuplicateKeyError:
         _log("⚠️ 搶鎖 upsert 撞 DuplicateKeyError（併發場景），upsert=False 重試")
-        col.find_one_and_update(filter_query, update_doc, upsert=False)
-    doc = col.find_one({"id": LOCK_ID})
+        M.find_one_and_update("StockData", "System_State", filter_query, update_doc, upsert=False)
+    doc = M.find_one("StockData", "System_State", {"id": LOCK_ID})
     return bool(doc) and doc.get("lock_token") == token
 
 
 def _release_lock(db: VerifyDB):
-    db.stock_db["System_State"].update_one(
-        {"id": LOCK_ID}, {"$set": {"is_running": False}})
+    M.update_one("StockData", "System_State",
+                 {"id": LOCK_ID}, {"$set": {"is_running": False}})
 
 
 # ─────────────────────────────────────────────
 # Polygon（語義克隆自 DC _fetch_polygon v12.32：[]=確認空 / None=狀態未知）
 # ─────────────────────────────────────────────
 
+# Polygon 五個函數已逐字搬到 courier/polygon（2026-10-16「唯一的門」，金鑰在門內讀）；這裡只轉接、帶入本檔的 _log。
+
 def _fetch_polygon(ticker: str, period_label: str,
                    start_date: str, end_date: str):
-    period_map = {"D": (1, "day"), "W": (1, "week")}
-    mult, p_api = period_map[period_label]
-    url = (
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{mult}/{p_api}/"
-        f"{start_date}/{end_date}"
-        f"?adjusted=true&extended_hours=false&sort=desc&limit=50000&apiKey={POLYGON_KEY}"
-    )
-    for attempt in range(POLYGON_MAX_RETRY):
-        try:
-            resp = requests.get(url, timeout=15)
-            if resp.status_code in (429, 403):
-                _log(f"  ⚠️ [{ticker}/{period_label}] 限速/封鎖 "
-                     f"({resp.status_code})，等待 {POLYGON_WAIT}s 重試")
-                time.sleep(POLYGON_WAIT)
-                continue
-            if resp.status_code != 200:
-                _log(f"  ❌ Polygon HTTP {resp.status_code} "
-                     f"({ticker}/{period_label})，狀態未知")
-                return None
-            results = resp.json().get("results", [])
-            if not results:
-                return []
-            processed = []
-            for r in results:
-                dt_obj = datetime.fromtimestamp(r["t"] / 1000, EST_TZ)
-                # W period：Polygon 返回週日戳，統一修正為當週週一（W-MON 錨定）
-                # v12.35 修復：週日 weekday()==6，減6天會退到上一週的週一，不是這週。
-                # 正確做法：週日 +1 天 = 這週的週一。
-                if period_label == "W":
-                    dt_obj = dt_obj + timedelta(days=1)
-                processed.append({
-                    "t": dt_obj.strftime("%Y-%m-%d %H:%M:%S"),
-                    "o": r["o"], "h": r["h"],
-                    "l": r["l"], "c": r["c"], "v": r["v"],
-                })
-            return processed
-        except Exception as e:
-            # ⚠️ scrub：requests 連線例外的 str(e) 會帶出含 apiKey 的 Polygon URL（見 bc_secutil / DANGER_ZONES §5）
-            _log(f"  ❌ Polygon 連線異常 ({ticker}/{period_label}): {scrub(e)}")
-            if attempt == POLYGON_MAX_RETRY - 1:
-                return None
-            time.sleep(POLYGON_WAIT)
-    return None
+    return PG.verify_fetch_polygon(ticker, period_label, start_date, end_date, _log)
 
 
 def _fetch_polygon_reference(ticker: str) -> Optional[dict]:
-    """
-    查詢 Polygon Reference API 取得 ticker 上市日期等身份資訊（v1.1 新增）。
-
-    只在 Ticker_Identity 裡沒有這支 ticker 記錄時才會被呼叫一次，
-    之後永久快取，不重複查詢（list_date 不會變）。
-
-    回傳 None → 狀態未知（限速/連線異常），下次再試
-    回傳 {}   → Polygon 確認查無此 ticker 的身份資料
-    回傳 dict → 正常取得 {list_date, cik, company_name}
-    """
-    url = f"https://api.polygon.io/v3/reference/tickers/{ticker}?apiKey={POLYGON_KEY}"
-    try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code in (429, 403):
-            _log(f"  ⚠️ [{ticker}] Reference API 限速/封鎖 ({resp.status_code})")
-            return None
-        if resp.status_code != 200:
-            _log(f"  ❌ [{ticker}] Reference API HTTP {resp.status_code}")
-            return None
-        data = resp.json().get("results")
-        if not data:
-            return {}
-        return {
-            "list_date":    data.get("list_date"),
-            "cik":          data.get("cik"),
-            "company_name": data.get("name"),
-        }
-    except Exception as e:
-        _log(f"  ❌ [{ticker}] Reference API 連線異常: {scrub(e)}")
-        return None
-
-
-def _polygon_ref_get(url: str, params: dict) -> Optional[dict]:
-    """Polygon Reference GET，429 退避重試。失敗回 None。（2026-10-01 E）"""
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 429:
-                _log(f"  ⚠️ Reference API 限速 429，等 {POLYGON_WAIT}s 重試")
-                time.sleep(POLYGON_WAIT)
-                continue
-            if resp.status_code != 200:
-                _log(f"  ❌ Reference API HTTP {resp.status_code}")
-                return None
-            return resp.json()
-        except Exception as e:
-            _log(f"  ❌ Reference API 連線異常: {scrub(e)}")
-            time.sleep(POLYGON_DELAY)
-    return None
+    return PG.verify_fetch_reference(ticker, _log)
 
 
 def _fetch_polygon_active_map() -> Optional[dict]:
-    """
-    （2026-10-01 E）分頁拉 Polygon 全部「現役」股票/ETF 代號 → {TICKER: {name, cik}}。
-    ~12 頁（每頁 1000），一週一次。失敗回 None＝本週不做身份刷新（不誤判下市）。
-    """
-    url = "https://api.polygon.io/v3/reference/tickers"
-    params = {"market": "stocks", "active": "true", "limit": 1000, "apiKey": POLYGON_KEY}
-    out, pages = {}, 0
-    while url and pages < 40:
-        data = _polygon_ref_get(url, params)
-        if data is None:
-            return None
-        for r in data.get("results") or []:
-            tk = (r.get("ticker") or "").upper()
-            if tk:
-                out[tk] = {"name": r.get("name"), "cik": r.get("cik")}
-        url = data.get("next_url")
-        params = {"apiKey": POLYGON_KEY}   # next_url 已帶其餘查詢參數
-        pages += 1
-        time.sleep(POLYGON_DELAY)
-    return out
+    return PG.verify_fetch_active_map(_log)
 
 
 def _fetch_polygon_inactive(ticker: str) -> Optional[dict]:
-    """
-    （2026-10-01 E）查某代號的「已停止交易」紀錄。回 None＝狀態未知；{}＝查無；
-    dict＝最近一筆 {name, cik, delisted_utc}（同代號可能多次下市，取 delisted_utc 最新）。
-    """
-    data = _polygon_ref_get("https://api.polygon.io/v3/reference/tickers",
-                            {"ticker": ticker, "active": "false", "limit": 10, "apiKey": POLYGON_KEY})
-    if data is None:
-        return None
-    rows = [r for r in (data.get("results") or []) if r.get("delisted_utc")]
-    if not rows:
-        return {}
-    r = max(rows, key=lambda x: x.get("delisted_utc") or "")
-    return {"name": r.get("name"), "cik": r.get("cik"), "delisted_utc": r.get("delisted_utc")}
+    return PG.verify_fetch_inactive(ticker, _log)
 
 
 def _same_cik(a, b) -> bool:
@@ -688,18 +437,18 @@ def main() -> int:
     start_mono = time.monotonic()
 
     try:
-        db = VerifyDB()
+        db = VerifyDB(BARS_LIMIT, TASK_NAME, _now_est)
     except Exception as e:
         _log(f"❌ 初始化 VerifyDB 失敗: {e}")
         return 1
 
-    load_market_calendar(db.stock_db)
+    load_market_calendar(None)   # 2026-10-16：查詢經 courier.mongo，不再傳資料庫物件
 
     # ── 輸入回聲塊 ──
     all_tickers = db.get_all_tickers()
     _log("=== 輸入回聲 ===")
     _log(f"  ticker 數: {len(all_tickers)} | periods: {VERIFY_PERIODS}")
-    _log(f"  Mongo ping: {db.client.admin.command('ping')}")
+    _log(f"  Mongo ping: {M.ping()}")
     _log(f"  POLYGON_DELAY={POLYGON_DELAY}s | 熔斷: 樣本≥{BLOCK_MIN_SAMPLE} "
          f"且 blocked≥{BLOCK_RATIO:.0%} → 冷卻 {BLOCK_COOLDOWN}s")
     _log(f"  假日表來源: {'Mongo' if _HOLIDAY_CACHE['holidays'] else '內建兜底'} | "

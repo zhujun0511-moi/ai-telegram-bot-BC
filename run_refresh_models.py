@@ -42,15 +42,15 @@ import sys
 from datetime import datetime
 
 import pytz
-import requests
 
-from tasks.outbound import notify as _notify_shared
-from tasks.outbound import dispatch_workflow as _dispatch_workflow_shared
+# 2026-10-16「唯一的門」：呼叫 AC、通知、dispatch 一律經 courier（密鑰不離開門）。
+from courier.outbound import notify as _notify_shared
+from courier.outbound import dispatch_workflow as _dispatch_workflow_shared
+from courier.outbound import ac_refresh_free_models
 
 EST_TZ = pytz.timezone("US/Eastern")
 
-ANALYSIS_HUB_URL  = os.getenv("ANALYSIS_HUB_URL", "").strip()
-WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "").strip()
+# ANALYSIS_HUB_URL／WEBHOOK_SECRET 已搬到 courier/outbound.ac_refresh_free_models（2026-10-16）
 
 
 def _now_est() -> datetime:
@@ -72,17 +72,11 @@ def refresh_free_models() -> bool:
     刷新失敗不影響後續 dispatch——模型清單刷新跟排程鏈是兩件獨立的事，
     模型清單一時抓不到新的，不該連帶讓當天的 backtest/verify 都不跑。
     """
-    if not ANALYSIS_HUB_URL or not WEBHOOK_SECRET:
-        _log("❌ ANALYSIS_HUB_URL/WEBHOOK_SECRET 未設定，無法刷新模型")
-        return False
     try:
-        resp = requests.get(
-            f"{ANALYSIS_HUB_URL.rstrip('/')}/admin/refresh-free-models",
-            headers={"x-webhook-secret": WEBHOOK_SECRET},
-            # 2026-09-21：新 refresh 要逐個「金融題實測」~13 模型（併發4、每個上限20s）→ 總耗時可達 ~90s，
-            # 30s 會假逾時（AC 其實照樣跑完存+自發告警，不影響功能，但 BC 日誌難看、拿不到結果）。放寬到 180s。
-            timeout=180,
-        )
+        resp = ac_refresh_free_models()   # 請求逐字搬到 courier/outbound（timeout 180）
+        if resp is None:
+            _log("❌ ANALYSIS_HUB_URL/WEBHOOK_SECRET 未設定，無法刷新模型")
+            return False
         if resp.status_code == 200:
             body = resp.json()
             _log(

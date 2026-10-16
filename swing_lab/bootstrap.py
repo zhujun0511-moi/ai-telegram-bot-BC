@@ -23,16 +23,12 @@ DEST = os.path.join(HERE, "_code")
 
 
 def main():
-    from huggingface_hub import hf_hub_download
-    tok = os.environ.get("HF_TOKEN", "").strip()
-    if not tok:
-        raise SystemExit("缺 HF_TOKEN")
+    # 2026-10-16「唯一的門」：下載經 BC 的門（courier/dataset.download_code_bundle，HF_TOKEN 在門內讀）。
+    # 本檔在 swing_lab/ 底下執行（working-directory: swing_lab），門在上一層。
+    sys.path.insert(0, os.path.dirname(HERE))
+    from courier.dataset import download_code_bundle
     want = os.environ.get("SWING_CODE_BUNDLE", "").strip()
-    if not want:
-        p = hf_hub_download(REPO, CODE_DIR + "/latest.json", repo_type="dataset", token=tok, force_download=True)
-        with open(p, encoding="utf-8") as f:
-            want = json.load(f)["sha256"]
-    zp = hf_hub_download(REPO, "%s/%s.zip" % (CODE_DIR, want), repo_type="dataset", token=tok)
+    zp, want = download_code_bundle(REPO, CODE_DIR, want)
     h = hashlib.sha256()
     with open(zp, "rb") as f:
         for blk in iter(lambda: f.read(1 << 20), b""):

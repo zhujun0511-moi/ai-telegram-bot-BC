@@ -37,12 +37,13 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import pytz
-from pymongo.errors import DuplicateKeyError
-
+# 2026-10-16「唯一的門」：Mongo、通知、dispatch 一律經 courier；門外不再碰 db.stock_db／db.client。
+from courier import mongo as M
+from courier.mongo import DuplicateKeyError
 from tasks.cfet_backtest import BacktestDB, run_backtest_batch
 from tasks.backtest_stats import StatsDB, run_stats_analysis
-from tasks.outbound import notify as _notify_shared
-from tasks.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
+from courier.outbound import notify as _notify_shared
+from courier.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
 
 EST_TZ = pytz.timezone("US/Eastern")
 
@@ -98,7 +99,7 @@ def load_market_calendar(stock_db):
     失敗回落 FALLBACK_HOLIDAYS。main() 於 DB 初始化後、任何日期計算前呼叫。
     """
     try:
-        doc = stock_db["Configs"].find_one({"type": "market_calendar"})
+        doc = M.find_one("StockData", "Configs", {"type": "market_calendar"})
         if doc and doc.get("holidays"):
             _HOLIDAY_CACHE["holidays"] = set(doc["holidays"])
             _log(f"market_calendar 載入 {len(_HOLIDAY_CACHE['holidays'])} 個假日")
@@ -144,12 +145,13 @@ def _is_last_shift(now_est: datetime) -> bool:
 # ─────────────────────────────────────────────
 
 def _get_global_state(db: BacktestDB) -> dict:
-    doc = db.stock_db["System_State"].find_one({"id": "global"})
+    doc = M.find_one("StockData", "System_State", {"id": "global"})
     return doc or {}
 
 
 def _set_global_key(db: BacktestDB, key: str, value):
-    db.stock_db["System_State"].update_one(
+    M.update_one(
+        "StockData", "System_State",
         {"id": "global"},
         {"$set": {key: value, "updated_at": _now_est()}},
         upsert=True,
@@ -178,7 +180,6 @@ def _find_owed_date(state: dict) -> Optional[str]:
 # ─────────────────────────────────────────────
 
 def _acquire_lock(db: BacktestDB) -> bool:
-    col   = db.stock_db["System_State"]
     now   = _now_est()
     stale = now - timedelta(seconds=LOCK_STALE_SECONDS)
     token = uuid.uuid4().hex
@@ -194,17 +195,17 @@ def _acquire_lock(db: BacktestDB) -> bool:
                            "lock_acquired_at": now,
                            "lock_token": token}}
     try:
-        col.find_one_and_update(filter_query, update_doc, upsert=True)
+        M.find_one_and_update("StockData", "System_State", filter_query, update_doc, upsert=True)
     except DuplicateKeyError:
         _log("⚠️ 搶鎖 upsert 撞 DuplicateKeyError（併發場景），upsert=False 重試")
-        col.find_one_and_update(filter_query, update_doc, upsert=False)
-    doc = col.find_one({"id": LOCK_ID})
+        M.find_one_and_update("StockData", "System_State", filter_query, update_doc, upsert=False)
+    doc = M.find_one("StockData", "System_State", {"id": LOCK_ID})
     return bool(doc) and doc.get("lock_token") == token
 
 
 def _release_lock(db: BacktestDB):
-    db.stock_db["System_State"].update_one(
-        {"id": LOCK_ID}, {"$set": {"is_running": False}})
+    M.update_one("StockData", "System_State",
+                 {"id": LOCK_ID}, {"$set": {"is_running": False}})
 
 
 # ─────────────────────────────────────────────
@@ -217,7 +218,8 @@ def _reset_backtest_progress(db: BacktestDB, snapshot_date: str):
     直接操作 Backtest_Progress collection，不改動模組本體
     （tasks/cfet_backtest.py 原樣遷移原則）。
     """
-    db.stock_db["Backtest_Progress"].update_one(
+    M.update_one(
+        "StockData", "Backtest_Progress",
         {"task_id": "cfet_backtest"},
         {"$set": {"task_id": "cfet_backtest",
                   "completed": False,
@@ -249,7 +251,7 @@ def _run_backtest_for_date(db: BacktestDB, target_date: str,
 
 def _write_task_log(db: BacktestDB, status: str, progress: int, total: int,
                     last_error: str, started_at: datetime):
-    db.stock_db["Task_Log"].insert_one({
+    M.insert_one("StockData", "Task_Log", {
         "task":        TASK_NAME,
         "status":      status,
         "progress":    progress,
@@ -275,7 +277,7 @@ def main() -> int:
         _log(f"❌ 初始化 BacktestDB 失敗: {e}")
         return 1
 
-    load_market_calendar(db.stock_db)
+    load_market_calendar(None)   # 2026-10-16：查詢經 courier.mongo，不再傳資料庫物件
 
     # ── 輸入回聲塊 ──
     state       = _get_global_state(db)
@@ -283,7 +285,7 @@ def main() -> int:
     done_keys   = sorted(k for k in state if DONE_KEY_RE.match(k))
     _log("=== 輸入回聲 ===")
     _log(f"  回測標的數: {len(all_tickers)}")
-    _log(f"  Mongo ping: {db.client.admin.command('ping')}")
+    _log(f"  Mongo ping: {M.ping()}")
     _log(f"  System_State 內 after_hours_done 鍵（近況）: {done_keys[-5:]}")
     _log(f"  補課視窗: 最近 {BACKFILL_MAX_DAYS} 天 | 末班判定: "
          f"{_is_last_shift(started_at)}")

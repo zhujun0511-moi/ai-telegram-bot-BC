@@ -26,42 +26,20 @@ import sys
 import math
 import datetime as dt
 
-import requests
+# 2026-10-16「唯一的門」：GitHub API、Mongo、外部探測、通知一律經 courier（權杖不離開門）。
+from courier import github as GH
+from courier import mongo as M
+from courier import keys
+from courier.outbound import probe_comm_hub
 
 try:                       # Windows GBK 主控台印 emoji 會崩；GitHub runner 本就 UTF-8
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-GH_API = "https://api.github.com"
 
 
-def _token() -> str:
-    return os.getenv("GH_TOKEN", "").strip()
-
-
-def _headers() -> dict:
-    return {
-        "Authorization": f"Bearer {_token()}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def try_billing_api(owner: str):
-    """帳號 Actions billing。回 (used, included, paid) 或 None（無權限/失敗→降級）。"""
-    try:
-        r = requests.get(f"{GH_API}/users/{owner}/settings/billing/actions",
-                         headers=_headers(), timeout=15)
-        if r.status_code != 200:
-            print(f"[billing] HTTP {r.status_code}（多半是 token 無 user scope）→ 降級估算")
-            return None
-        j = r.json()
-        return (j.get("total_minutes_used"), j.get("included_minutes"),
-                j.get("total_paid_minutes_used"))
-    except Exception as e:
-        print(f"[billing] 例外 {e} → 降級估算")
-        return None
+# _token／_headers／try_billing_api 已逐字搬到 courier/github（2026-10-16）
 
 
 def cycle_start(reset_day: int) -> dt.date:
@@ -76,30 +54,8 @@ def cycle_start(reset_day: int) -> dt.date:
 
 
 def _iter_runs(repo: str, since_date: dt.date):
-    """yield repo 在 since_date(含)之後建立的 workflow run（分頁）。"""
-    page = 1
-    since_iso = since_date.isoformat()
-    while page <= 20:   # 安全上限
-        try:
-            r = requests.get(f"{GH_API}/repos/{repo}/actions/runs",
-                             headers=_headers(),
-                             params={"per_page": 100, "page": page,
-                                     "created": f">={since_iso}"},
-                             timeout=20)
-        except Exception as e:
-            print(f"[runs] {repo} 例外 {e}")
-            return
-        if r.status_code != 200:
-            print(f"[runs] {repo} HTTP {r.status_code}")
-            return
-        runs = r.json().get("workflow_runs", [])
-        if not runs:
-            return
-        for run in runs:
-            yield run
-        if len(runs) < 100:
-            return
-        page += 1
+    """yield repo 在 since_date(含)之後建立的 workflow run（逐字搬到 courier/github.iter_runs）。"""
+    return GH.iter_runs(repo, since_date)
 
 
 def sum_run_minutes(repo: str, since_date: dt.date):
@@ -147,7 +103,7 @@ def detect_block(repo: str):
 
 
 GCP_STALE_HOURS   = 26          # VM 回報超過此時數未更新＝視為未回報
-GCP_PROBE_URL     = "https://comm-hub.zhujun.date/"
+# GCP_PROBE_URL（comm-hub 根網址）已搬到 courier/outbound.probe_comm_hub（2026-10-16）
 MONGO_LIMIT_MB    = 512         # Atlas M0 儲存上限，滿了會拒絕寫入
 MONGO_WARN_PCT    = 0.75
 MONGO_DBS         = ("StockData", "CommData", "FractalRadar")
@@ -157,7 +113,7 @@ def gcp_section(mongo_client):
     """（2026-10-02）讀 VM 每日回報 StockData.System_State{id:gcp_vm_usage}。回 (lines, alarm)。
     VM 掛了＝這筆不會更新 → 報「未回報」＋外部探測 comm-hub（報告由 GitHub 發，VM 死了也收得到）。"""
     lines, alarm = [], False
-    doc = mongo_client["StockData"]["System_State"].find_one({"id": "gcp_vm_usage"})
+    doc = M.find_one("StockData", "System_State", {"id": "gcp_vm_usage"})
     now = dt.datetime.now(dt.timezone.utc)
     rep = (doc or {}).get("reported_at")
     if isinstance(rep, dt.datetime) and rep.tzinfo is None:
@@ -165,10 +121,7 @@ def gcp_section(mongo_client):
     age_h = max(0.0, (now - rep).total_seconds() / 3600) if isinstance(rep, dt.datetime) else None
     if age_h is None or age_h > GCP_STALE_HOURS:
         alarm = True
-        try:
-            code = requests.get(GCP_PROBE_URL, timeout=15).status_code
-        except Exception as e:
-            code = type(e).__name__
+        code = probe_comm_hub()   # 原 requests.get(GCP_PROBE_URL, timeout=15)，逐字搬進門
         lines.append(f"🔴 VM 未回報（上次 {rep.strftime('%m-%d %H:%M UTC') if rep else '從無'}）"
                      f"｜外部探測 comm-hub：{code}")
         if not doc:
@@ -207,7 +160,7 @@ def mongo_section(mongo_client):
     total, parts = 0.0, []
     for name in MONGO_DBS:
         try:
-            st = mongo_client[name].command("dbStats")
+            st = M.db_stats(name)
             mb = (st.get("dataSize", 0) + st.get("indexSize", 0)) / 1024 / 1024
             total += mb
             parts.append(f"{name} {mb:.0f}")
@@ -243,13 +196,13 @@ def freshness_section(mongo_client):
     Key Level 自 09-23 凍結、盤中 CFET 摘要轉播過期資料。回 (lines, alarm)。
     """
     import stale_bars_watch as S
-    sd = mongo_client["StockData"]
+    sd = None   # 2026-10-16：資料庫物件不再外發
     ref_dates = S.ref_trading_dates(sd)
     if not ref_dates:
         return ["🔴 基準 SPY 無日線，無法判斷新鮮度"], True
     ref = ref_dates[0]
     full = S.full_set(sd)
-    delisted = {d["ticker"].upper() for d in sd["Ticker_Identity"].find({"delisted": True}, {"ticker": 1})}
+    delisted = {d["ticker"].upper() for d in M.find("StockData", "Ticker_Identity", {"delisted": True}, {"ticker": 1})}
     live = [t for t in full if t not in delisted]
     lines, alarm = [f"基準交易日 {ref}（SPY 最新日線）｜清單 {len(full)} 支"], False
 
@@ -259,7 +212,7 @@ def freshness_section(mongo_client):
     alarm = alarm or sa
 
     # ② 指標（扁平 Indicators 每票最新日）
-    ind = {r["_id"]: r["d"] for r in sd["Indicators"].aggregate([
+    ind = {r["_id"]: r["d"] for r in M.aggregate("StockData", "Indicators", [
         {"$match": {"ticker": {"$in": live}}},
         {"$group": {"_id": "$ticker", "d": {"$max": "$date"}}}])}
     behind = sorted(t for t in live if _lag(ref_dates, ind.get(t)) >= 1)
@@ -271,8 +224,8 @@ def freshness_section(mongo_client):
         lines.append(f"✅ 指標：全部更新到 {ref}")
 
     # ③ Key Level（2026-10-02 起由 DC after_hours 計算）
-    kl = {d["ticker"]: d.get("trading_date") for d in sd["Bars"].find(
-        {"period": "KEY_LEVELS", "ticker": {"$in": live}}, {"ticker": 1, "trading_date": 1})}
+    kl = {d["ticker"]: d.get("trading_date") for d in M.find(
+        "StockData", "Bars", {"period": "KEY_LEVELS", "ticker": {"$in": live}}, {"ticker": 1, "trading_date": 1})}
     kl_behind = sorted(t for t in live if _lag(ref_dates, kl.get(t)) >= 1)
     kl_newest = max((v for v in kl.values() if v), default=None)
     # 無擺動點資料的年輕股本來就不會有 KL → 只在「整體落後」或「多數落後」時亮燈
@@ -286,7 +239,7 @@ def freshness_section(mongo_client):
         lines.append(f"✅ 關鍵位：更新到 {ref}（未更新 {len(kl_behind)} 支，多為無擺動點的新股）")
 
     # ④ 新版 CFET 觀察名單（BC.p setup_scan → FractalRadar.Watchlist）
-    wl = mongo_client["FractalRadar"]["Watchlist"].find_one({"_id": "current"}, {"date": 1, "watchlist": 1})
+    wl = M.find_one("FractalRadar", "Watchlist", {"_id": "current"}, {"date": 1, "watchlist": 1})
     wl_date = (wl or {}).get("date")
     if _lag(ref_dates, wl_date) >= 1:
         alarm = True
@@ -295,7 +248,7 @@ def freshness_section(mongo_client):
         lines.append(f"✅ CFET 觀察名單：{wl_date}（{len((wl or {}).get('watchlist') or [])} 支）")
 
     # ⑤ dataset 列表內實際價（BC raw_writer，2026-10-02）：每日執行狀態＋首次補史進度
-    rw = sd["System_State"].find_one({"id": "raw_writer_status"})
+    rw = M.find_one("StockData", "System_State", {"id": "raw_writer_status"})
     if not rw:
         alarm = True
         lines.append("⚠️ 列表內實際價（raw_writer）：尚無執行紀錄")
@@ -320,7 +273,7 @@ def freshness_section(mongo_client):
                          f"｜補缺日 {rw.get('gap_filled', 0)}{tail}" + (f"｜錯誤 {len(errs)} 筆" if errs else ""))
 
     # ⑥ TD 定稿閘門（BC td_ready_gate，2026-10-02）：昨晚 TD 何時定稿、何時觸發 DC、DC 何時跑完
-    g = sd["System_State"].find_one({"id": "td_ready_gate"})
+    g = M.find_one("StockData", "System_State", {"id": "td_ready_gate"})
     if not g or (g.get("date") or "") < ref:
         alarm = True
         lines.append(f"🔴 定稿閘門：{ref} 沒有執行紀錄（最後一次 {(g or {}).get('date') or '無'}；DC 只能靠 23:00 保底觸發）")
@@ -338,7 +291,7 @@ def freshness_section(mongo_client):
 
     # ⑥b 夜間收尾鏈（BC nightly_chain，2026-10-05）：DC 盤後完成 → BC.p snapshot/indicators/commdata → BC raw_writer
     #    → BC.p bars（2026-10-06 改順序；某步失敗不再整條停 → 列出全部失敗的步驟）
-    ch = sd["System_State"].find_one({"id": "nightly_chain"})
+    ch = M.find_one("StockData", "System_State", {"id": "nightly_chain"})
     if not ch or (ch.get("date") or "") < ref:
         alarm = True
         lines.append(f"⚠️ 夜間鏈：{ref} 沒有執行紀錄（最後一次 {(ch or {}).get('date') or '無'}；各歸檔靠原排程保底）")
@@ -363,8 +316,8 @@ def freshness_section(mongo_client):
 
     # ⑦ DC 日線閘門（基準交易日的自動剪齊／被擋；原 DC after_hours 單獨通知併入此處）
     last = {}
-    for d in sd["Validation_Log"].find({"context": "dc_daily_d_gate", "trading_date": ref},
-                                       {"problems": 1}).sort("run_at", 1):
+    for d in M.find("StockData", "Validation_Log", {"context": "dc_daily_d_gate", "trading_date": ref},
+                    {"problems": 1}, sort=("run_at", 1)):
         for p in d.get("problems") or []:
             if p.get("ticker"):
                 last[p["ticker"]] = p
@@ -387,7 +340,7 @@ def freshness_section(mongo_client):
 
 
 def main() -> int:
-    if not _token():
+    if not GH.has_token():
         print("❌ GH_TOKEN 未設定，無法查詢")
         return 1
 
@@ -402,7 +355,7 @@ def main() -> int:
     lines = []
 
     # ── 已用分鐘（billing API 優先、否則加總 run）──
-    bill = try_billing_api(owner)
+    bill = GH.try_billing_api(owner)
     if bill and bill[0] is not None:
         used, included, paid = bill
         if included:
@@ -439,12 +392,11 @@ def main() -> int:
         lines.append(f"本週期速度推估週期末 ~{projected} 分（已過 {_elapsed}/{_cycle_len} 天）")
 
     # ── BC.p setup_scan 上次自計時（從 FractalRadar.System_State 讀，供「job 跑多久」時間報告）──
-    _uri = os.getenv("MONGO_URI", "").strip()
+    _uri = keys.has("MONGO_URI")   # 原 os.getenv("MONGO_URI","").strip()，只用來判斷有沒有設
     if _uri:
+        M.configure(serverSelectionTimeoutMS=8000)   # 原兩處 MongoClient 都帶 8000
         try:
-            import pymongo
-            _st = pymongo.MongoClient(_uri, serverSelectionTimeoutMS=8000)[
-                "FractalRadar"]["System_State"].find_one({"_id": "state"})
+            _st = M.find_one("FractalRadar", "System_State", {"_id": "state"})
             if _st and _st.get("setup_scan_at"):
                 lines.append(f"CFET setup 上次跑：{_st.get('setup_scan_runtime_sec')}s、"
                              f"watch {_st.get('setup_scan_watch_count')} 支（{_st.get('setup_scan_at')}）")
@@ -479,8 +431,7 @@ def main() -> int:
     other_alarm = False
     if _uri:
         try:
-            import pymongo
-            _mc = pymongo.MongoClient(_uri, serverSelectionTimeoutMS=8000)
+            _mc = None   # 2026-10-16：連線在門內（courier.mongo），這裡不再持有用戶端
             for title, fn in (("資料新鮮度", freshness_section), ("GCP VM", gcp_section),
                               ("Mongo Atlas", mongo_section)):
                 try:
@@ -502,7 +453,7 @@ def main() -> int:
 
     if over or other_alarm or always:
         try:
-            from tasks.outbound import notify
+            from courier.outbound import notify
             ok = notify(msg, report_type="bc_backtest")
             print("[notify] 已推送" if ok else "[notify] 未推送（COMM_HUB_URL 未設或推送失敗）")
         except Exception as e:

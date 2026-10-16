@@ -21,14 +21,14 @@ Python 3.9 相容。
 import os
 import sys
 
-from tasks.outbound import dispatch_workflow
+# 2026-10-16「唯一的門」：權杖在門內讀（courier/github.chain_token("BCP")＝GH_TOKEN）。
+from courier import github as GH
 
 
 def main() -> int:
-    token = os.getenv("GH_TOKEN", "").strip()
     cfet_repo = os.getenv("CFET_REPO", "").strip()
 
-    if not token or not cfet_repo:
+    if not GH.chain_has_token("BCP") or not cfet_repo:
         print("❌ GH_TOKEN 或 CFET_REPO 未設定，無法 fan-out 到 CFET judge repo")
         return 1
 
@@ -36,8 +36,7 @@ def main() -> int:
     # Key Level phase 知道這次是 after_hours fan-out 觸發，可以更新 touch_state
     # （見 keylevel_driver.py AFTER_TRIGGER_SOURCES；cfet_judge.yml 已宣告對應
     # workflow_dispatch.inputs.trigger_source）。
-    ok = dispatch_workflow("cfet_judge.yml", token=token, repo=cfet_repo,
-                           inputs={"trigger_source": "after_hours"})
+    ok = GH.dispatch_chain_step("cfet_judge.yml", "BCP", cfet_repo, {"trigger_source": "after_hours"}, ref=None)
     return 0 if ok else 1
 
 

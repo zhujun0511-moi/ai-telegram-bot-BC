@@ -23,9 +23,12 @@ import os
 import sys
 import time
 
-import pymongo
 import pytz
-import requests
+
+# 2026-10-16「唯一的門」：TwelveData、觸發 DC、Mongo 一律經 courier（金鑰／密鑰不離開門）。
+from courier import mongo as M
+from courier import twelvedata as TDC
+from courier.outbound import dc_v3_update
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -42,9 +45,8 @@ FORCE_AT_ET = (22, 30)
 LATE_START_ET = (19, 0)      # 2026-10-05：晚於此時間才啟動（排程延遲／手動補跑），第一次查詢抽樣全有當日線即觸發，不再等 15 分比對
 END_AT_ET   = (23, 0)
 JOB_BUDGET_S = 5 * 3600 + 45 * 60   # GitHub job 上限 6h，留餘裕
-DC_URL      = os.getenv("DC_URL", "").strip().rstrip("/") or "https://zhujun0511-ai-ai-telegram-bot-dc.hf.space"
+# DC_URL 已搬到 courier/outbound.dc_v3_update（2026-10-16）
 DRY_RUN     = os.getenv("GATE_DRY_RUN", "0").strip() == "1"
-UA          = {"User-Agent": "python-requests/2.32.3"}
 
 
 def _log(m):
@@ -87,46 +89,14 @@ def is_stable(prev, cur, samples, today):
 
 # ══ IO ══
 
-def td_snapshot(key, samples):
-    """一次批量查抽樣最新日線 → {sym: {date, close, volume}}；失敗回 None。"""
-    try:
-        r = requests.get("https://api.twelvedata.com/time_series",
-                         params={"symbol": ",".join(samples), "interval": "1day", "outputsize": "1"},
-                         headers={**UA, "Authorization": "apikey " + key}, timeout=40)
-        j = r.json()
-    except Exception as e:
-        _log(f"⚠️ TD 連線異常 {type(e).__name__}")
-        return None
-    if j.get("code") == 429 or j.get("status") == "error":
-        _log(f"⚠️ TD {j.get('code')} {str(j.get('message', ''))[:80]}")
-        return None
-    out = {}
-    for s in samples:
-        v = ((j.get(s) or {}).get("values") or [None])[0]
-        if v:
-            try:
-                out[s] = {"date": v["datetime"][:10], "close": v["close"], "volume": float(v.get("volume") or 0)}
-            except (KeyError, ValueError, TypeError):
-                pass
-    return out
+def td_snapshot(samples):
+    """一次批量查抽樣最新日線（逐字搬到 courier/twelvedata.gate_snapshot）。"""
+    return TDC.gate_snapshot(samples, _log)
 
 
-def trigger_dc(secret):
-    """觸發 DC /v3-update（HF 剛好重啟可能失敗 → 重試 3 次）。"""
-    if DRY_RUN:
-        _log("（試跑）略過觸發 DC")
-        return True
-    for i in range(3):
-        try:
-            r = requests.get(f"{DC_URL}/v3-update", params={"mode": "incremental"},
-                             headers={**UA, "x-webhook-secret": secret}, timeout=60)
-            _log(f"→ DC /v3-update：HTTP {r.status_code} {r.text[:80]}")
-            if r.status_code == 200:
-                return True
-        except Exception as e:
-            _log(f"⚠️ 觸發 DC 異常 {type(e).__name__}")
-        time.sleep(30)
-    return False
+def trigger_dc():
+    """觸發 DC /v3-update（逐字搬到 courier/outbound.dc_v3_update；重試 3 次、試跑略過）。"""
+    return dc_v3_update(_log, DRY_RUN)
 
 
 def keep_existing(prev, today_iso):
@@ -139,9 +109,8 @@ def main():
     t0 = time.time()
     now = dt.datetime.now(ET)
     today = now.date()
-    sd = pymongo.MongoClient(os.environ["MONGO_URI"])["StockData"]
-    st_col = sd["System_State"]
-    cal = sd["Configs"].find_one({"type": "market_calendar"}) or {}
+    M.configure(strict=True)   # 原寫法 os.environ["MONGO_URI"]（缺就 KeyError）
+    cal = M.find_one("StockData", "Configs", {"type": "market_calendar"}) or {}
     holidays = set(cal.get("holidays") or [])
     rec = {"id": "td_ready_gate", "date": today.isoformat(), "started_at": dt.datetime.now(dt.timezone.utc),
            "samples": SAMPLES, "first_seen": {}, "polls": 0, "ready_at": None, "ready_reason": None,
@@ -149,7 +118,7 @@ def main():
            "dry_run": DRY_RUN}
 
     def save():
-        st_col.update_one({"id": "td_ready_gate"}, {"$set": rec}, upsert=True)
+        M.update_one("StockData", "System_State", {"id": "td_ready_gate"}, {"$set": rec}, upsert=True)
 
     if not is_trading_day(today, holidays):
         rec["finished"] = "holiday"
@@ -164,20 +133,20 @@ def main():
         _log(f"等到 {START_AT_ET[0]}:{START_AT_ET[1]:02d} ET 開始")
         time.sleep((start - now).total_seconds())
 
-    key, secret = os.environ.get("TWELVE_KEY", ""), os.environ.get("WEBHOOK_SECRET", "")
+    # TWELVE_KEY／WEBHOOK_SECRET 改在門內讀（2026-10-16）
     prev = None
     # ── 階段一：等 TD 定稿 ──
     while True:
         now = dt.datetime.now(ET)
-        if (st_col.find_one({"id": "global"}) or {}).get(done_key):
-            if keep_existing(st_col.find_one({"id": "td_ready_gate"}), today.isoformat()):
+        if (M.find_one("StockData", "System_State", {"id": "global"}) or {}).get(done_key):
+            if keep_existing(M.find_one("StockData", "System_State", {"id": "td_ready_gate"}), today.isoformat()):
                 _log("DC 今日盤後已完成，且今天已有閘門觸發紀錄（例：17:03 那輪）→ 保留原紀錄、不覆蓋，收工")
                 return 0
             _log("DC 今日盤後已完成（可能被手動/保底觸發），閘門收工")
             rec["finished"] = "already_done"
             save()
             return 0
-        cur = td_snapshot(key, SAMPLES)
+        cur = td_snapshot(SAMPLES)
         rec["polls"] += 1
         rec["td_credits"] += len(SAMPLES)
         if cur:
@@ -203,13 +172,13 @@ def main():
         time.sleep(POLL_MIN * 60)
 
     # ── 階段二：觸發 DC，之後盯到完成（未完成就續打＝斷了接著跑）──
-    trigger_dc(secret)
+    trigger_dc()
     rec["triggered_at"] = _hm()
     save()
     while True:
         time.sleep(WATCH_MIN * 60)
         now = dt.datetime.now(ET)
-        if (st_col.find_one({"id": "global"}) or {}).get(done_key):
+        if (M.find_one("StockData", "System_State", {"id": "global"}) or {}).get(done_key):
             rec["done_at"], rec["finished"] = _hm(now), "done"
             save()
             _log(f"✅ DC 今日盤後完成（{rec['done_at']}）")
@@ -220,7 +189,7 @@ def main():
             _log("到收工時間 DC 仍未完成 → 交給 cron-job.org 23:00 起的保底")
             return 0
         _log("DC 尚未完成 → 續打 /v3-update（斷了接著跑）")
-        trigger_dc(secret)
+        trigger_dc()
         rec["retriggers"] += 1
         save()
 

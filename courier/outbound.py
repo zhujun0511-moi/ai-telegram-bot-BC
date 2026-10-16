@@ -27,7 +27,8 @@ import time
 
 import requests
 
-from bc_secutil import scrub
+# 2026-10-16「唯一的門」：本檔由 tasks/outbound.py 搬進 courier/outbound.py。
+from courier.keys import scrub
 
 
 def notify(msg: str, report_type: str = "bc_backtest", retries: int = 1, delay: int = 2) -> bool:
@@ -43,6 +44,10 @@ def notify(msg: str, report_type: str = "bc_backtest", retries: int = 1, delay: 
     # 2026-08-06 全域密鑰遮蔽（防禦縱深）：msg 可能帶呼叫端傳進的例外訊息，例外的
     # str(e) 可能含密鑰 URL；在唯一對外 Telegram 出口統一遮蔽，保護所有 notify 呼叫端。
     msg = scrub(msg)
+
+    # 2026-10-16 Jun 拍板「發 Telegram 的人自己備份」：送出前先寫 CommData.Telegram_Outbound
+    # （欄位比照 AC courier/sender._save_outbound）；備份失敗或沒有 MONGO_URI 只印出、不擋發送。
+    _save_outbound(msg, report_type)
 
     base           = os.getenv("COMM_HUB_URL", "").strip().rstrip("/")
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -147,3 +152,91 @@ def trigger_ac_webhook(path: str, payload: dict) -> bool:
     except Exception as e:
         print(f"[trigger_ac_webhook] {path} 失敗: {scrub(e)}")
         return False
+
+
+def _save_outbound(content: str, report_type: str, source: str = "BC"):
+    """發送前備份到 CommData.Telegram_Outbound（2026-10-16 新增；失敗不阻塞發送）。"""
+    try:
+        from datetime import datetime
+        import pytz
+        from courier import mongo
+        if not os.getenv("MONGO_URI", ""):
+            print("[notify] 無 MONGO_URI，略過 Telegram_Outbound 備份")
+            return
+        mongo.insert_one("CommData", "Telegram_Outbound", {
+            "type":       report_type,
+            "content":    content,
+            "source":     source,
+            "created_at": datetime.now(pytz.timezone("US/Eastern")),
+        })
+    except Exception as e:
+        print(f"[notify] Telegram_Outbound 備份失敗（不影響發送）: {scrub(e)}")
+
+
+# ─────────────────────────────────────────────
+# 以下 2026-10-16 由各腳本原樣搬進門（呼叫端只呼叫函數，鑰匙與網址不離開門）
+# ─────────────────────────────────────────────
+
+_UA = {"User-Agent": "python-requests/2.32.3"}
+
+
+def dc_v3_update(log, dry_run: bool) -> bool:
+    """原 td_ready_gate.trigger_dc：觸發 DC /v3-update（HF 剛好重啟可能失敗 → 重試 3 次）。"""
+    dc_url = os.getenv("DC_URL", "").strip().rstrip("/") or "https://zhujun0511-ai-ai-telegram-bot-dc.hf.space"
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    if dry_run:
+        log("（試跑）略過觸發 DC")
+        return True
+    for i in range(3):
+        try:
+            r = requests.get(f"{dc_url}/v3-update", params={"mode": "incremental"},
+                             headers={**_UA, "x-webhook-secret": secret}, timeout=60)
+            log(f"→ DC /v3-update：HTTP {r.status_code} {r.text[:80]}")
+            if r.status_code == 200:
+                return True
+        except Exception as e:
+            log(f"⚠️ 觸發 DC 異常 {type(e).__name__}")
+        time.sleep(30)
+    return False
+
+
+def send_signal_snapshot_backtest(ticker: str):
+    """原 tasks/cfet_backtest._send_signal_snapshot（逐字）：回測用途的中樞神經 Signal Snapshot 落地呼叫，
+    deliver_to_telegram 不傳（通訊中心 bc_backtest 預設 False），失敗只印、不影響回測主流程。"""
+    base           = os.getenv("COMM_HUB_URL", "").strip().rstrip("/")
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if not base or not webhook_secret:
+        return
+    try:
+        requests.post(
+            f"{base}/signal/snapshot",
+            json={"ticker": ticker, "triggered_by": "bc_backtest"},
+            headers={"WEBHOOK_SECRET": webhook_secret, "Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"⚠️ signal_snapshot 呼叫失敗（不影響回測主流程）: {e}")
+
+
+def probe_comm_hub():
+    """原 actions_minutes_watch.gcp_section 的外部探測：GET comm-hub 根網址，回狀態碼或例外名稱。"""
+    try:
+        return requests.get("https://comm-hub.zhujun.date/", timeout=15).status_code
+    except Exception as e:
+        return type(e).__name__
+
+
+def ac_refresh_free_models():
+    """原 run_refresh_models.refresh_free_models 的請求部分（逐字：timeout 180）。
+    回 None＝ANALYSIS_HUB_URL／WEBHOOK_SECRET 未設定；否則回 requests 回應（例外原樣往上拋）。"""
+    base   = os.getenv("ANALYSIS_HUB_URL", "").strip()
+    secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if not base or not secret:
+        return None
+    return requests.get(
+        f"{base.rstrip('/')}/admin/refresh-free-models",
+        headers={"x-webhook-secret": secret},
+        # 2026-09-21：新 refresh 要逐個「金融題實測」~13 模型（併發4、每個上限20s）→ 總耗時可達 ~90s，
+        # 30s 會假逾時（AC 其實照樣跑完存+自發告警，不影響功能，但 BC 日誌難看、拿不到結果）。放寬到 180s。
+        timeout=180,
+    )

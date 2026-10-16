@@ -29,14 +29,13 @@ import re
 import sys
 import time
 
-import pymongo
 import pytz
-import requests
 
-from tasks.outbound import dispatch_workflow
+# 2026-10-16「唯一的門」：Mongo、GitHub API、dispatch 一律經 courier（權杖不離開門）。
+from courier import mongo as M
+from courier import github as GH
 
 ET = pytz.timezone("US/Eastern")
-API = "https://api.github.com"
 POLL_S = 30
 FIND_RUN_S = 180                      # dispatch 後最多等幾秒找到對應的 run
 # (名稱, 倉庫別名, workflow 檔, 正式參數, 試跑參數, 單步上限分鐘)
@@ -58,57 +57,25 @@ def _log(m):
 
 
 def _repos():
-    return {"BCP": os.getenv("CFET_REPO", "").strip(), "BC": os.getenv("GITHUB_REPOSITORY", "").strip()}
+    return GH.chain_repos()
 
 
-def _token(alias):
-    # 跨倉庫（BC.p）用 PAT；同倉庫用內建 GITHUB_TOKEN
-    return os.getenv("GH_TOKEN", "").strip() if alias == "BCP" else os.getenv("GITHUB_TOKEN", "").strip()
-
-
-def _hdr(token):
-    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"}
-
-
-def latest_done_date(st_col):
+def latest_done_date():
     """DC 盤後最近一次完成的交易日（System_State{id:global} 的 after_hours_done_{date}=True 中最大者）。"""
-    g = st_col.find_one({"id": "global"}) or {}
+    g = M.find_one("StockData", "System_State", {"id": "global"}) or {}
     dates = [k[len("after_hours_done_"):] for k, v in g.items()
              if k.startswith("after_hours_done_") and v and re.fullmatch(r"\d{4}-\d{2}-\d{2}", k[len("after_hours_done_"):])]
     return max(dates) if dates else None
 
 
-def find_run(repo, wf, token, since_utc):
-    """找 dispatch 之後建立的那個 run（同 workflow、event=workflow_dispatch、created_at ≥ since）。"""
-    deadline = time.time() + FIND_RUN_S
-    while time.time() < deadline:
-        try:
-            r = requests.get(f"{API}/repos/{repo}/actions/workflows/{wf}/runs",
-                             params={"event": "workflow_dispatch", "per_page": 5}, headers=_hdr(token), timeout=20)
-            for run in r.json().get("workflow_runs", []):
-                created = dt.datetime.strptime(run["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-                if created >= since_utc:
-                    return run["id"]
-        except Exception as e:
-            _log(f"查 run 失敗（重試）：{type(e).__name__}")
-        time.sleep(10)
-    return None
+def find_run(repo, wf, alias, since_utc):
+    """找 dispatch 之後建立的那個 run（逐字搬到 courier/github.find_run）。"""
+    return GH.find_run(repo, wf, alias, since_utc, FIND_RUN_S, _log)
 
 
-def wait_run(repo, run_id, token, limit_min):
-    """等 run 結束，回 conclusion（success/failure/cancelled/timed_out…；逾時回 chain_timeout）。"""
-    end = time.time() + limit_min * 60
-    while time.time() < end:
-        try:
-            r = requests.get(f"{API}/repos/{repo}/actions/runs/{run_id}", headers=_hdr(token), timeout=20)
-            j = r.json()
-            if j.get("status") == "completed":
-                return j.get("conclusion") or "unknown"
-        except Exception as e:
-            _log(f"查狀態失敗（重試）：{type(e).__name__}")
-        time.sleep(POLL_S)
-    return "chain_timeout"
+def wait_run(repo, run_id, alias, limit_min):
+    """等 run 結束（逐字搬到 courier/github.wait_run）。"""
+    return GH.wait_run(repo, run_id, alias, limit_min, POLL_S, _log)
 
 
 def main():
@@ -118,9 +85,9 @@ def main():
     ap.add_argument("--if-needed", action="store_true")    # 保底排程用：DC 未完成或本鏈已跑完就結束
     a = ap.parse_args()
 
-    st_col = pymongo.MongoClient(os.environ["MONGO_URI"])["StockData"]["System_State"]
-    date = latest_done_date(st_col)
-    prev = st_col.find_one({"id": "nightly_chain"}) or {}
+    M.configure(strict=True)   # 原寫法 os.environ["MONGO_URI"]（缺就 KeyError）
+    date = latest_done_date()
+    prev = M.find_one("StockData", "System_State", {"id": "nightly_chain"}) or {}
     if a.if_needed:
         if not date:
             _log("DC 盤後沒有任何完成紀錄 → 結束")
@@ -133,7 +100,7 @@ def main():
             return 0
 
     repos = _repos()
-    if not repos["BCP"] or not _token("BCP") or not _token("BC"):
+    if not repos["BCP"] or not GH.chain_has_token("BCP") or not GH.chain_has_token("BC"):
         _log("❌ 缺 CFET_REPO／GH_TOKEN／GITHUB_TOKEN，無法執行")
         return 1
 
@@ -143,24 +110,24 @@ def main():
                       "end": None, "conclusion": "not_started"} for n, al, *_ in STEPS]}
 
     def save():
-        st_col.update_one({"id": "nightly_chain"}, {"$set": rec}, upsert=True)
+        M.update_one("StockData", "System_State", {"id": "nightly_chain"}, {"$set": rec}, upsert=True)
 
     save()
     _log(f"夜間鏈開始：交易日 {date}｜觸發 {a.trigger}｜{'試跑' if a.dry_run else '正式'}")
     failed = []
     for i, (name, alias, wf, inp_real, inp_dry, limit) in enumerate(STEPS):
         step = rec["steps"][i]
-        repo, token = repos[alias], _token(alias)
+        repo = repos[alias]
         since = dt.datetime.now(dt.timezone.utc).replace(microsecond=0) - dt.timedelta(seconds=5)
         step["start"] = _hm()
-        ok = dispatch_workflow(wf, token=token, repo=repo, ref="main", inputs=inp_dry if a.dry_run else inp_real)
+        ok = GH.dispatch_chain_step(wf, alias, repo, inp_dry if a.dry_run else inp_real)
         if not ok:
             step["conclusion"] = "dispatch_failed"
         else:
-            run_id = find_run(repo, wf, token, since)
+            run_id = find_run(repo, wf, alias, since)
             step["run_id"] = run_id
             save()
-            step["conclusion"] = wait_run(repo, run_id, token, limit) if run_id else "run_not_found"
+            step["conclusion"] = wait_run(repo, run_id, alias, limit) if run_id else "run_not_found"
         step["end"] = _hm()
         save()
         _log(f"{name}：{step['conclusion']}（{step['start']}→{step['end']}）")

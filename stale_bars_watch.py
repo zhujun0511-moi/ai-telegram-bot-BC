@@ -17,11 +17,11 @@ stale_bars_watch.py — 每日「日線停更」看門狗（2026-10-01 新增，
 import os
 import sys
 
-import pymongo
+# 2026-10-16「唯一的門」：Mongo 與通知一律經 courier；原本傳來傳去的 sd（資料庫物件）參數保留位置但不再使用。
+from courier import mongo as M
+from courier import keys
+from courier.outbound import notify
 
-from tasks.outbound import notify
-
-MONGO_URI      = os.getenv("MONGO_URI", "")
 STALE_MIN_DAYS = int(os.getenv("STALE_MIN_DAYS", "2"))
 ALWAYS_NOTIFY  = os.getenv("ALWAYS_NOTIFY", "0").strip() == "1"
 REF_TICKER     = "SPY"
@@ -32,8 +32,8 @@ REPORT_TYPE    = "data_stale_watch"
 def _newest_d(sd, tickers):
     """{TICKER: (newest_date_str|None, synthetic)}，一次查完。"""
     out = {}
-    for d in sd["Bars"].find({"period": "D", "ticker": {"$in": tickers}},
-                             {"ticker": 1, "synthetic": 1, "bars": {"$slice": 1}}):
+    for d in M.find("StockData", "Bars", {"period": "D", "ticker": {"$in": tickers}},
+                    {"ticker": 1, "synthetic": 1, "bars": {"$slice": 1}}):
         b = d.get("bars") or []
         out[d["ticker"].upper()] = ((str(b[0].get("t"))[:10] if b else None), bool(d.get("synthetic")))
     return out
@@ -41,18 +41,18 @@ def _newest_d(sd, tickers):
 
 def ref_trading_dates(sd):
     """基準 SPY 最近 REF_WINDOW 個交易日（新在前）；空＝無法判斷。"""
-    ref = sd["Bars"].find_one({"ticker": REF_TICKER, "period": "D"}, {"bars": {"$slice": REF_WINDOW}})
+    ref = M.find_one("StockData", "Bars", {"ticker": REF_TICKER, "period": "D"}, {"bars": {"$slice": REF_WINDOW}})
     return [str(b.get("t"))[:10] for b in (ref or {}).get("bars") or []]
 
 
 def full_set(sd):
-    cfg = sd["Configs"].find_one({"type": "ticker_lists"}) or {}
+    cfg = M.find_one("StockData", "Configs", {"type": "ticker_lists"}) or {}
     return sorted({t.upper() for t in cfg.get("full_set", []) if isinstance(t, str)})
 
 
 def stale_section(sd, ref_dates, full):
     """（2026-10-02 併入每日健康報告）日線停更檢查。回 (lines, alarm)。"""
-    delisted = {d["ticker"].upper() for d in sd["Ticker_Identity"].find({"delisted": True}, {"ticker": 1})}
+    delisted = {d["ticker"].upper() for d in M.find("StockData", "Ticker_Identity", {"delisted": True}, {"ticker": 1})}
     newest = _newest_d(sd, full)
     stale, no_data, delisted_in_list = [], [], []
     for tk in full:
@@ -88,10 +88,10 @@ def stale_section(sd, ref_dates, full):
 
 def main() -> int:
     """單獨手動執行用（2026-10-02 起排程已併入 actions_minutes_watch 每日健康報告）。"""
-    if not MONGO_URI:
+    if not keys.has_raw("MONGO_URI"):
         print("❌ MONGO_URI 未設定")
         return 1
-    sd = pymongo.MongoClient(MONGO_URI)["StockData"]
+    sd = None   # 2026-10-16：資料庫物件不再外發，查詢都經 courier.mongo
 
     full = full_set(sd)
     if not full:

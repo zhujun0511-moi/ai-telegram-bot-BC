@@ -33,8 +33,12 @@ import os
 import sys
 import time
 
-import pymongo
-import requests
+# 2026-10-16「唯一的門」：TwelveData／Polygon／HF dataset／Mongo 一律經 courier（金鑰不離開門）。
+from courier import mongo as M
+from courier import keys
+from courier.twelvedata import RawTD
+from courier.polygon import RawPolygon
+from courier.dataset import RawHF, update_data_map
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -43,18 +47,14 @@ except Exception:
 
 WRITTEN_BY   = "raw_writer.py"
 ROOT         = "mp_data/ticker"
-REPO         = os.getenv("HF_REPO_ID", "").strip() or "zhujun0511-AI/ai-telegram-bot-dataset"
+REPO         = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"
 SEED_CAP     = int(os.getenv("RAW_SEED_CAP", "120"))
 COMMIT_CHUNK = 100
-TD_URL       = "https://api.twelvedata.com/time_series"
-PG_BASE      = "https://api.polygon.io"
-TD_PAUSE     = 8.5      # TD 免費 8 credits/分鐘
-PG_PAUSE     = 13.0     # Polygon 免費 5 次/分鐘
+# TD_URL／PG_BASE／TD_PAUSE(8.5)／PG_PAUSE(13.0) 隨 TD／Polygon 類別搬到 courier（2026-10-16）
 PG_GAP_DAYS  = 720      # Polygon 免費方案可查約 2 年內的日線（補 TD 缺日用）
 EVENT_WINDOW_DAYS = 14  # 每日查全市場事件的回看窗口（最長拉到 120 天，見 run）
 BAR_HEADER   = ["date", "open", "high", "low", "close", "volume"]
 ACT_HEADER   = ["date", "dividend", "split"]
-UA           = {"User-Agent": "python-requests/2.32.3"}
 
 
 def _log(msg):
@@ -211,136 +211,21 @@ def actions_rows(splits, dividends):
 
 # ══ 外部 IO ══════════════════════════════════════════════════════════
 
-class TD:
-    def __init__(self, key):
-        self.key, self.last, self.day_exhausted = key, 0.0, False
+# TD／Polygon／HF 三個對外類別已逐字搬進門（2026-10-16）：courier/twelvedata.RawTD、
+# courier/polygon.RawPolygon、courier/dataset.RawHF。Polygon.daily_raw 的「原始回應→列」轉換留在本檔（用 bar_row）。
 
-    def daily_none(self, ticker, start_date=None, outputsize=5000):
-        """TD 1day adjust=none。回 values 或 None（失敗/額度用盡）。"""
-        if self.day_exhausted or not self.key:
-            return None
-        params = {"symbol": ticker, "interval": "1day", "adjust": "none", "outputsize": str(outputsize)}
-        if start_date:
-            params["start_date"] = start_date
-        for attempt in range(5):
-            wait = TD_PAUSE - (time.time() - self.last)
-            if wait > 0:
-                time.sleep(wait)
-            self.last = time.time()
-            try:
-                r = requests.get(TD_URL, params=params, headers={**UA, "Authorization": "apikey " + self.key}, timeout=40)
-                j = r.json()
-            except Exception as e:
-                _log(f"  ⚠️ [TD] {ticker} 連線異常 {type(e).__name__}")
-                time.sleep(10)
-                continue
-            if j.get("status") == "ok":
-                return j.get("values") or []
-            msg = str(j.get("message", ""))[:120]
-            if j.get("code") == 429 and "day" in msg.lower():
-                self.day_exhausted = True
-                _log("  ⛔ [TD] 今日額度用盡，停止本輪補史")
-                return None
-            if j.get("code") == 429:
-                _log(f"  ⏳ [TD] {ticker} 每分鐘額度撞車（{msg[:60]}），65 秒後重試")
-                time.sleep(65)
-                continue
-            _log(f"  ⚠️ [TD] {ticker} {j.get('code')} {msg}")
-            return None
-        return None
-
-
-class Polygon:
-    def __init__(self, key):
-        self.key, self.last = key, 0.0
-
-    def _get(self, url, params=None):
-        for attempt in range(4):
-            wait = PG_PAUSE - (time.time() - self.last)
-            if wait > 0:
-                time.sleep(wait)
-            self.last = time.time()
-            try:
-                r = requests.get(url, params=params, headers={**UA, "Authorization": "Bearer " + self.key}, timeout=40)
-            except Exception as e:
-                _log(f"  ⚠️ [Polygon] 連線異常 {type(e).__name__}")
-                time.sleep(15)
-                continue
-            if r.status_code == 429:
-                time.sleep(65)
-                continue
-            if r.status_code != 200:
-                _log(f"  ⚠️ [Polygon] HTTP {r.status_code}")
-                return None
-            return r.json()
-        return None
-
-    def daily_raw(self, ticker, frm, to):
-        """Polygon 未調整日線（實際價）→ {date: row}。免費方案只能查約 2 年內。"""
-        j = self._get(f"{PG_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{frm}/{to}",
-                      {"adjusted": "false", "sort": "asc", "limit": 5000})
-        out = {}
-        for r in (j or {}).get("results") or []:
-            # Polygon 日線 t＝美東午夜＝UTC 04:00（夏令）/05:00（冬令）→ UTC 日期即美東日期（勿固定減 5 小時，夏令會跑到前一天）
-            d = dt.datetime.fromtimestamp(r["t"] / 1000, dt.timezone.utc).date().isoformat()
-            try:
-                out[d] = bar_row(d, r["o"], r["h"], r["l"], r["c"], r.get("v"))
-            except (KeyError, ValueError, TypeError):
-                continue
-        return out
-
-    def all_pages(self, path, params):
-        out, url, p = [], PG_BASE + path, dict(params)
-        while url:
-            j = self._get(url, p)
-            if j is None:
-                return None
-            out += j.get("results") or []
-            url, p = j.get("next_url"), None
-        return out
-
-
-class HF:
-    def __init__(self, token, write):
-        from huggingface_hub import HfApi
-        self.token, self.write = token, write
-        self.api = HfApi(token=token)
-        self.pending = []
-
-    def list_files(self):
-        return set(self.api.list_repo_files(repo_id=REPO, repo_type="dataset"))
-
-    def read(self, path):
-        from huggingface_hub import hf_hub_download
+def _pg_daily_raw(pg, ticker, frm, to):
+    """Polygon 未調整日線（實際價）→ {date: row}。免費方案只能查約 2 年內。（原 Polygon.daily_raw，請求經門）"""
+    j = pg.daily_raw_json(ticker, frm, to)
+    out = {}
+    for r in (j or {}).get("results") or []:
+        # Polygon 日線 t＝美東午夜＝UTC 04:00（夏令）/05:00（冬令）→ UTC 日期即美東日期（勿固定減 5 小時，夏令會跑到前一天）
+        d = dt.datetime.fromtimestamp(r["t"] / 1000, dt.timezone.utc).date().isoformat()
         try:
-            p = hf_hub_download(repo_id=REPO, filename=path, repo_type="dataset", token=self.token)
-        except Exception as e:
-            if type(e).__name__ in ("EntryNotFoundError",) or "404" in str(e):
-                return None
-            raise
-        with open(p, "r", encoding="utf-8") as f:
-            return f.read()
-
-    def add(self, path, text):
-        self.pending.append((path, text))
-
-    def flush(self, out_dir, note):
-        if not self.pending:
-            return 0
-        n = len(self.pending)
-        if self.write:
-            from huggingface_hub import CommitOperationAdd
-            ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=t.encode("utf-8")) for p, t in self.pending]
-            self.api.create_commit(repo_id=REPO, repo_type="dataset", operations=ops,
-                                   commit_message=f"{WRITTEN_BY}: {note}")
-        else:
-            for p, t in self.pending:
-                fp = os.path.join(out_dir, p)
-                os.makedirs(os.path.dirname(fp), exist_ok=True)
-                with open(fp, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(t)
-        self.pending = []
-        return n
+            out[d] = bar_row(d, r["o"], r["h"], r["l"], r["c"], r.get("v"))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return out
 
 
 # ══ 地圖 descriptor（只宣告本寫入方相關格＋寫入方分工；merge 逐 period 取代，故欄位帶齊）══
@@ -379,15 +264,14 @@ MAP_DESCRIPTOR = {
 # ══ 主流程 ═══════════════════════════════════════════════════════════
 
 def run(args):
-    mongo = pymongo.MongoClient(os.environ["MONGO_URI"])
-    sd = mongo["StockData"]
-    ref_doc = sd["Bars"].find_one({"ticker": "SPY", "period": "D"}, {"bars": {"$slice": 1}})
+    M.configure(strict=True)   # 原寫法 os.environ["MONGO_URI"]（缺就 KeyError）
+    ref_doc = M.find_one("StockData", "Bars", {"ticker": "SPY", "period": "D"}, {"bars": {"$slice": 1}})
     ref = str(((ref_doc or {}).get("bars") or [{}])[0].get("t", ""))[:10]
     if not ref:
         _log("❌ 基準 SPY 無日線，中止")
         return 1
-    cfg = sd["Configs"].find_one({"type": "ticker_lists"}) or {}
-    delisted = {d["ticker"].upper() for d in sd["Ticker_Identity"].find({"delisted": True}, {"ticker": 1})}
+    cfg = M.find_one("StockData", "Configs", {"type": "ticker_lists"}) or {}
+    delisted = {d["ticker"].upper() for d in M.find("StockData", "Ticker_Identity", {"delisted": True}, {"ticker": 1})}
     universe = sorted({str(t).upper() for t in cfg.get("full_set", [])} - delisted)
     if args.tickers:
         asked = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
@@ -401,19 +285,19 @@ def run(args):
     _log(f"=== raw_writer | 基準交易日 {ref} | 列表內 {len(universe)} 支 | {'正式寫入' if args.write else '試跑（不上傳）'} ===")
 
     # 基準交易日曆（SPY 日線日期，供缺日偵測）＋ 上市日（剪掉上市前資料）
-    spy = sd["Bars"].find_one({"ticker": "SPY", "period": "D"}, {"bars.t": 1}) or {}
+    spy = M.find_one("StockData", "Bars", {"ticker": "SPY", "period": "D"}, {"bars.t": 1}) or {}
     cal = {str(b.get("t", ""))[:10] for b in spy.get("bars") or [] if str(b.get("t", ""))[:10] <= ref}
-    list_dates = {d["ticker"].upper(): d.get("list_date") for d in sd["Ticker_Identity"].find(
-        {"list_date": {"$exists": True}}, {"ticker": 1, "list_date": 1})}
+    list_dates = {d["ticker"].upper(): d.get("list_date") for d in M.find(
+        "StockData", "Ticker_Identity", {"list_date": {"$exists": True}}, {"ticker": 1, "list_date": 1})}
     pg_lo = (dt.date.today() - dt.timedelta(days=PG_GAP_DAYS)).isoformat()
     # 只寫到「基準日的前一個交易日」：DC 盤後抓的最新一根尚未定稿（實測 NVDA 2026-10-01 Mongo 量 2,573,606
     # vs 定稿 98,369,800），隔天 DC 全量重刷才定稿 → 最新一天留到下一輪再寫（d_raw 固定晚一天，換取寫入即定稿）。
     cal_sorted = sorted(cal)
     upto = cal_sorted[-2] if len(cal_sorted) >= 2 else ref
 
-    hf = HF(os.environ.get("HF_TOKEN", ""), args.write)
-    td = TD(os.environ.get("TWELVE_KEY", ""))
-    pg = Polygon(os.environ.get("POLYGON_KEY", ""))
+    hf = RawHF(args.write, REPO, WRITTEN_BY)   # HF_TOKEN／TWELVE_KEY／POLYGON_KEY 改在門內讀（2026-10-16）
+    td = RawTD(_log)
+    pg = RawPolygon(_log)
     files = hf.list_files()
     has = lambda t, f: f"{ROOT}/{t}/{f}" in files
 
@@ -450,7 +334,7 @@ def run(args):
             return
         fillable = [d for d in miss if d >= pg_lo]
         if fillable:
-            got = pg.daily_raw(t, fillable[0], fillable[-1])
+            got = _pg_daily_raw(pg, t, fillable[0], fillable[-1])
             for d in fillable:
                 if d in got:
                     new[d] = got[d]
@@ -509,7 +393,7 @@ def run(args):
                         new = td_rows(vals, upto)
                         st["split_refetch"] += 1
                     else:
-                        doc = sd["Bars"].find_one({"ticker": t, "period": "D"}, {"bars": {"$slice": 40}})
+                        doc = M.find_one("StockData", "Bars", {"ticker": t, "period": "D"}, {"bars": {"$slice": 40}})
                         mbars = (doc or {}).get("bars") or []
                         oldest = str(mbars[-1].get("t", ""))[:10] if mbars else ""
                         if not mbars or oldest > last:
@@ -564,12 +448,11 @@ def run(args):
     _log("=== 摘要 === " + str(summary))
 
     if args.write:
-        import data_map as dm
-        dm.update_data_map(REPO, os.environ.get("HF_TOKEN", ""), "ticker_bars", MAP_DESCRIPTOR, WRITTEN_BY,
-                           note=f"列表內實際價：補史 {st['seeded']}、追加 {st['appended']}（累計 {seeded_total}/{len(universe)}）")
-        sd["System_State"].update_one({"id": "raw_writer_status"},
-                                      {"$set": {**summary, "id": "raw_writer_status",
-                                                "run_at": dt.datetime.now(dt.timezone.utc)}}, upsert=True)
+        update_data_map(REPO, "ticker_bars", MAP_DESCRIPTOR, WRITTEN_BY,
+                        note=f"列表內實際價：補史 {st['seeded']}、追加 {st['appended']}（累計 {seeded_total}/{len(universe)}）")
+        M.update_one("StockData", "System_State", {"id": "raw_writer_status"},
+                     {"$set": {**summary, "id": "raw_writer_status",
+                               "run_at": dt.datetime.now(dt.timezone.utc)}}, upsert=True)
     return 0
 
 

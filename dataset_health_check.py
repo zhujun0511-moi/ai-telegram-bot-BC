@@ -22,54 +22,22 @@ import sys
 import json
 import random
 
+# 2026-10-16「唯一的門」：HF dataset、Mongo、鑰匙（含本機備援鑰匙檔）一律經 courier。
+from courier import mongo as M
+from courier import keys
+from courier.dataset import HealthDataset
+
 HF_REPO_DEFAULT = "zhujun0511-AI/ai-telegram-bot-dataset"
 SAMPLE_TICKER = "AAPL"   # audit 抽樣解路徑用（full_set 幾乎必有）
 
 
-def _load_env(path=r"C:\Users\zhuju\pass.env.txt"):
-    out = {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    out[k.strip()] = v.strip()
-    except Exception:
-        pass
-    return out
+# _load_env／_dl_json／_last_csv_row 已逐字搬進門（2026-10-16）：courier/keys.load_local_env、
+# courier/dataset.HealthDataset.dl_json／last_csv_row（token 留在門內）。
 
 
-def _dl_json(repo, path, token):
-    from huggingface_hub import hf_hub_download
-    try:
-        local = hf_hub_download(repo_id=repo, filename=path, repo_type="dataset", token=token)
-    except Exception as e:
-        if type(e).__name__ in ("EntryNotFoundError", "RepositoryNotFoundError") or "404" in str(e):
-            return None
-        raise
-    with open(local, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _last_csv_row(repo, path, token):
-    from huggingface_hub import hf_hub_download
-    try:
-        local = hf_hub_download(repo_id=repo, filename=path, repo_type="dataset", token=token)
-    except Exception:
-        return None
-    last = None
-    with open(local, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                last = line
-    return last
-
-
-def run_audit(repo, token, have_paths):
+def run_audit(ds, have_paths):
     warns = []
-    root_idx = _dl_json(repo, "DATA_MAP.json", token)
+    root_idx = ds.dl_json("DATA_MAP.json")
     if not root_idx:
         return ["[audit] ❌ DATA_MAP.json 不存在"]
     products = root_idx.get("products", {})
@@ -81,7 +49,7 @@ def run_audit(repo, token, have_paths):
             warns.append("[audit] ⚠️ _retired 前綴仍有檔存在: %s" % pref)
     # 逐 product
     for name, mpath in products.items():
-        doc = _dl_json(repo, mpath, token)
+        doc = ds.dl_json(mpath)
         if not doc:
             warns.append("[audit] ⚠️ product 小檔缺: %s" % mpath); continue
         tmpl = doc.get("path_template")
@@ -109,17 +77,16 @@ def run_audit(repo, token, have_paths):
     return warns
 
 
-def run_crosscheck(sd, repo, token, full, sample_n, tol):
+def run_crosscheck(ds, full, sample_n, tol):
     warns = []
-    cfg = sd["Configs"].find_one({"type": "ticker_lists"}) or {}
+    cfg = M.find_one("StockData", "Configs", {"type": "ticker_lists"}) or {}
     full_set = sorted({str(t).upper() for t in
                        (cfg.get("full_set") or (cfg.get("lists", {}) or {}).get("full_set") or [])})
     tickers = full_set if full else random.sample(full_set, min(sample_n, len(full_set)))
     print("[crosscheck] Yahoo(mp_data d.csv) vs TD(Mongo D)｜%d 支（tol=%.3f%%）" % (len(tickers), tol * 100))
-    bars = sd["Bars"]
     checked = flagged = skipped = 0
     for t in sorted(tickers):
-        row = _last_csv_row(repo, "mp_data/ticker/%s/d.csv" % t, token)
+        row = ds.last_csv_row("mp_data/ticker/%s/d.csv" % t)
         if not row:
             skipped += 1; continue
         parts = row.split(",")
@@ -130,7 +97,7 @@ def run_crosscheck(sd, repo, token, full, sample_n, tol):
             yclose = float(parts[4])
         except Exception:
             skipped += 1; continue
-        doc = bars.find_one({"ticker": t, "period": "D"}, {"bars": 1})
+        doc = M.find_one("StockData", "Bars", {"ticker": t, "period": "D"}, {"bars": 1})
         if not doc or not doc.get("bars"):
             skipped += 1; continue
         mclose = None
@@ -161,26 +128,21 @@ def main():
         tol = float(sys.argv[sys.argv.index("--tol") + 1])
     if "--sample" in sys.argv:
         sample_n = int(sys.argv[sys.argv.index("--sample") + 1])
-    env = _load_env()
-    uri = os.getenv("MONGO_URI") or env.get("MONGO_URI", "")
-    token = os.getenv("HF_TOKEN") or env.get("HF_TOKEN", "")
-    repo = os.getenv("HF_REPO_ID", "").strip() or env.get("HF_REPO_ID", "") or HF_REPO_DEFAULT
-    if not token or not uri:
+    # 原 _load_env()：本機備援鑰匙檔（GitHub 上不存在＝空）——2026-10-16 起只在門內讀，這裡只問「有沒有」
+    uri_ok = bool(keys.has_raw("MONGO_URI") or keys.local_env_has("MONGO_URI"))
+    repo = keys.env_strip("HF_REPO_ID") or keys.local_env_repo_id() or HF_REPO_DEFAULT
+    ds = HealthDataset(repo)
+    if not ds.ready() or not uri_ok:
         print("缺 HF_TOKEN 或 MONGO_URI"); sys.exit(2)
 
-    from huggingface_hub import HfApi
-    import pymongo
-    api = HfApi(token=token)
-    info = api.repo_info(repo_id=repo, repo_type="dataset", files_metadata=True)
-    have_paths = set(s.rfilename for s in (info.siblings or []))
-    cli = pymongo.MongoClient(uri, serverSelectionTimeoutMS=20000)
-    cli.admin.command("ping")
-    sd = cli["StockData"]
+    have_paths = ds.list_paths()
+    M.configure(local_fallback=True, serverSelectionTimeoutMS=20000)   # 原 MongoClient(uri, 20000)；uri＝環境變數或本機備援檔
+    M.ping()
 
     warns = []
-    warns += run_audit(repo, token, have_paths)
-    warns += run_crosscheck(sd, repo, token, full, sample_n, tol)
-    cli.close()
+    warns += run_audit(ds, have_paths)
+    warns += run_crosscheck(ds, full, sample_n, tol)
+    M.close_all()
 
     print("\n" + "=" * 60)
     if warns:

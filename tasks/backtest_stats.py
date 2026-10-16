@@ -16,12 +16,11 @@ backtest_stats.py — 統計分析 + 閾值優化（學習中心）
 """
 
 import os
-import pymongo
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import pytz
 
-MONGO_URI = os.getenv("MONGO_URI", "")
+# MONGO_URI 隨 StatsDB 搬到 courier/backtest_db（2026-10-16）
 EST_TZ    = pytz.timezone("US/Eastern")
 
 # 最少樣本數（低於此值不輸出結論）
@@ -31,51 +30,8 @@ MIN_SAMPLE = 20
 CHAIN_PREMIUM_THRESHOLD = 0.10   # 10%
 
 
-class StatsDB:
-    def __init__(self):
-        if not MONGO_URI:
-            raise RuntimeError("MONGO_URI 未設定")
-        self.client   = pymongo.MongoClient(MONGO_URI)
-        self.stock_db = self.client["StockData"]
-
-    def get_all_events(self) -> List[dict]:
-        """讀取所有有結果的回測事件（排除 open）"""
-        col  = self.stock_db["Backtest_Events"]
-        docs = list(col.find(
-            {"outcome.result": {"$in": ["win", "loss"]}},
-            {"_id": 0}
-        ))
-        return docs
-
-    def upsert_stat(self, condition_key: str, stat: dict):
-        """寫入統計結果"""
-        col = self.stock_db["Backtest_Stats"]
-        col.update_one(
-            {"condition_key": condition_key},
-            {"$set": {**stat, "condition_key": condition_key,
-                      "updated_at": datetime.now(EST_TZ)}},
-            upsert=True
-        )
-
-    def upsert_thresholds(self, thresholds: dict):
-        """寫入最優閾值"""
-        col = self.stock_db["Backtest_Thresholds"]
-        col.update_one(
-            {"_id": "latest"},
-            {"$set": {**thresholds, "updated_at": datetime.now(EST_TZ)}},
-            upsert=True
-        )
-
-    def get_stats_summary(self) -> List[dict]:
-        """取前20個樣本數最多的條件組合（供 prompt 注入）"""
-        col  = self.stock_db["Backtest_Stats"]
-        docs = list(
-            col.find(
-                {"sample_count": {"$gte": MIN_SAMPLE}},
-                {"_id": 0}
-            ).sort("win_rate", -1).limit(20)
-        )
-        return docs
+# StatsDB 已逐字搬到 courier/backtest_db（2026-10-16「唯一的門」）
+from courier.backtest_db import StatsDB  # noqa: E402
 
 
 # ─────────────────────────────────────────────
