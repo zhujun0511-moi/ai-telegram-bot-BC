@@ -158,7 +158,7 @@ def _save_outbound(content: str, report_type: str, source: str = "BC"):
     """發送前備份到 CommData.Telegram_Outbound（2026-10-16 新增；失敗不阻塞發送）。"""
     try:
         from datetime import datetime
-        import pytz
+        from zoneinfo import ZoneInfo   # 內建（Python 3.9+）；不用 pytz——部分工作流程沒裝 pytz（10-16 健康報告實測）
         from courier import mongo
         if not os.getenv("MONGO_URI", ""):
             print("[notify] 無 MONGO_URI，略過 Telegram_Outbound 備份")
@@ -167,7 +167,7 @@ def _save_outbound(content: str, report_type: str, source: str = "BC"):
             "type":       report_type,
             "content":    content,
             "source":     source,
-            "created_at": datetime.now(pytz.timezone("US/Eastern")),
+            "created_at": datetime.now(ZoneInfo("America/New_York")),
         })
     except Exception as e:
         print(f"[notify] Telegram_Outbound 備份失敗（不影響發送）: {scrub(e)}")
