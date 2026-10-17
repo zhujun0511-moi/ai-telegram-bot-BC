@@ -307,6 +307,9 @@ def run(args):
         if has(t, "d_raw.csv"):
             existing_d[t] = parse_csv(hf.read(f"{ROOT}/{t}/d_raw.csv"))
     lasts = [max(v) for v in existing_d.values() if v]
+    # 2026-10-17：每支 d_raw 目前最新日期（本輪補史／追加後跟著更新），摘要的 d_raw_newest_min 用這份。
+    # 原本用「開始時讀到的 existing_d」算，晚上那輪追加到 T-1 仍報 T-2 → 健康報告誤亮黃燈。
+    newest_by = {t: max(v) for t, v in existing_d.items() if v}
     win_start = min(lasts + [(dt.date.fromisoformat(ref) - dt.timedelta(days=EVENT_WINDOW_DAYS)).isoformat()])
     win_start = max(win_start, (dt.date.fromisoformat(ref) - dt.timedelta(days=120)).isoformat())
     today = dt.date.today().isoformat()
@@ -374,6 +377,8 @@ def run(args):
                     old = parse_csv(hf.read(f"{ROOT}/{t}/{fname}")) if has(t, fname) else {}
                     m2, _ = merge_keep_existing(old, rows)
                     hf.add(f"{ROOT}/{t}/{fname}", render_csv(BAR_HEADER, m2))
+                    if fname == "d_raw.csv" and m2:
+                        newest_by[t] = max(m2)
                 ex_act = parse_csv(hf.read(f"{ROOT}/{t}/actions.csv")) if has(t, "actions.csv") else {}
                 act, _ = merge_keep_existing(ex_act, past_only(actions_rows(sp, dv)))
                 hf.add(f"{ROOT}/{t}/actions.csv", render_csv(ACT_HEADER, act))
@@ -416,6 +421,7 @@ def run(args):
                     continue
                 if added:
                     hf.add(f"{ROOT}/{t}/d_raw.csv", render_csv(BAR_HEADER, merged))
+                    newest_by[t] = max(merged)
                     for kind, fname in (("w", "w_raw.csv"), ("m", "m_raw.csv")):
                         agg = aggregate(merged, kind, upto)
                         old = parse_csv(hf.read(f"{ROOT}/{t}/{fname}")) if has(t, fname) else {}
@@ -438,7 +444,7 @@ def run(args):
         _log(f"  ↳ 提交 {n} 檔")
 
     seeded_total = len(existing_d) + st["seeded"]
-    newest = [max(v) for v in existing_d.values() if v]
+    newest = list(newest_by.values())
     summary = {"ref_date": ref, "write_upto": upto, "universe": len(universe), "seeded_total": seeded_total,
                "pending_seed": st["pending_seed"], "seeded_this_run": st["seeded"],
                "appended": st["appended"], "split_refetch": st["split_refetch"],

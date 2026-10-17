@@ -40,7 +40,7 @@ POLL_S = 30
 FIND_RUN_S = 180                      # dispatch 後最多等幾秒找到對應的 run
 # (名稱, 倉庫別名, workflow 檔, 正式參數, 試跑參數, 單步上限分鐘)
 STEPS = [
-    ("snapshot_daily",   "BCP", "snapshot_daily.yml",   {"mode": "full"}, {"mode": "dry_run"}, 75),
+    # 2026-10-17：snapshot_daily 已移出夜間鏈（signal_snapshots 已廢，Jun 10-16 確認；BC.p 排程也已停）
     ("indicators_daily", "BCP", "indicators_daily.yml", {"mode": "full"}, {"mode": "dry_run"}, 45),
     ("commdata_daily",   "BCP", "commdata_daily.yml",   {"mode": "full"}, {"mode": "dry_run"}, 30),
     ("raw_writer_daily", "BC",  "raw_writer_daily.yml", {"write": "1"},   {"write": "0"},      165),
