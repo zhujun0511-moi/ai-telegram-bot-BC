@@ -1,0 +1,49 @@
+name: Probe Polygon Splits (拆股記錄覆蓋率實測)
+
+# 2026-10-17：Jun 準備買 MarketParquet（只有拆股調整價）→ 先確認 Polygon 拆股記錄能否還原真實價格
+# （早年 2000～2010、已下市股票的覆蓋）。只能手動觸發；日誌只印公開的拆股日期／比例與統計。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "要查的代號（逗號分隔）"
+        required: false
+        default: "NVDA,AAPL,TSLA,YHOO,SUNW,LEH,WM"
+      market:
+        description: "1=另外拉全市場 2000 年至今的拆股並按年統計"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install requests pytz huggingface_hub
+
+      - name: Run probe
+        env:
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          IN_TICKERS:       ${{ github.event.inputs.tickers }}
+          IN_MARKET:        ${{ github.event.inputs.market }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if ! [[ "$IN_TICKERS" =~ ^[A-Za-z0-9.,-]*$ ]]; then echo "代號含不允許的字元"; exit 1; fi
+          ARGS=(--tickers "$IN_TICKERS")
+          if [ "$IN_MARKET" != "1" ]; then ARGS+=(--no-market); fi
+          python tools/probe_splits.py "${ARGS[@]}"
