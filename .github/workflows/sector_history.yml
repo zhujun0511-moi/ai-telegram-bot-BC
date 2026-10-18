@@ -21,7 +21,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: sector-history
+  # 2026-10-18 Jun：GitHub 三條線（日常／考試／臨時）；所有臨時任務共用 temp-line，同時最多一個在跑
+  group: temp-line
   cancel-in-progress: false
 
 jobs:
