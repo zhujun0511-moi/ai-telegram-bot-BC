@@ -13,5 +13,6 @@ courier/ — BC 唯一的門（快遞員）。2026-10-16 Jun 拍板「唯一的�
   github.py      GitHub API 讀取（健康報告、夜間鏈）
   twelvedata.py  TwelveData（定稿閘門、raw_writer）
   polygon.py     Polygon（raw_writer、週末核查）
+  public_data.py 公開資料唯讀（維基百科 S&P 500 歷史版本、GitHub 成分股 CSV、SEC EDGAR；歷史板塊歸屬用，2026-10-18）
   outbound.py    通知（發送前自己備份 Telegram_Outbound，Jun 10-16 拍板）、dispatch、觸發 DC／AC、外部探測
 """

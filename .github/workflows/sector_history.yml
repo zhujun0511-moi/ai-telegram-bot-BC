@@ -1,0 +1,57 @@
+name: Sector History (歷史板塊歸屬)
+
+# 2026-10-18 新增（Jun 同意：按時間取得集合總成、自己拆分、有問題回去詳查；放 GitHub 跑）。
+# 登記：MongoDB_Standard_v3 §六-D swing_ai/sector_history/{日期}/；secret SEC_USER_AGENT（SEC 要求的聯絡人標頭）。
+# 只讀公開資料（維基百科 S&P 500 歷史版本、GitHub hanshof/sp500_constituents、SEC EDGAR），經門 courier/public_data；
+# 結果只寫私有 dataset；日誌只印筆數。獨立併發組，與考試佇列等其他排程同時跑互不影響。只能手動觸發。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1＝只試跑不寫 dataset"
+        required: false
+        default: "0"
+      months:
+        description: "只做這些月份（逗號分隔，留空＝2000-01 至今）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sector-history
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install requests huggingface_hub
+
+      - name: Build sector history
+        env:
+          HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+          SEC_USER_AGENT:    ${{ secrets.SEC_USER_AGENT }}
+          PYTHONUNBUFFERED:  "1"
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+          IN_DRY:     ${{ github.event.inputs.dry_run }}
+          IN_MONTHS:  ${{ github.event.inputs.months }}
+        run: |
+          # 輸入一律經環境變數、只允許安全字元（防指令注入）
+          if ! [[ "$IN_MONTHS" =~ ^[0-9,-]*$ ]]; then echo "months 含不允許的字元"; exit 1; fi
+          ARGS=()
+          if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
+          if [ -n "$IN_MONTHS" ]; then ARGS+=(--months "$IN_MONTHS"); fi
+          python sector_history.py "${ARGS[@]}"
