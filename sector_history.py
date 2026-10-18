@@ -134,11 +134,14 @@ def main():
     ap.add_argument("--months", default="", help="只做這些月份（逗號分隔，試跑用）")
     ap.add_argument("--limit-tickers", type=int, default=0, help="只查前 N 支（試跑用）")
     ap.add_argument("--out", default="_sector_out")
-    ap.add_argument("--step", default="build", choices=("build", "polygon", "llm", "apply"),
-                    help="build＝建歸屬表；polygon／llm／apply＝問題股詳查三步（2026-10-18）")
+    ap.add_argument("--step", default="build", choices=("build", "polygon", "llm", "apply", "publish"),
+                    help="build＝建歸屬表；polygon／llm／apply＝問題股詳查三步；publish＝發布 _catalog 規則表（2026-10-18）")
     ap.add_argument("--date", default="", help="詳查哪一版歸屬表（swing_ai/sector_history/{日期}；留空＝最新）")
     ap.add_argument("--max-batches", type=int, default=0, help="llm 步驟最多呼叫幾次（試跑用）")
     a = ap.parse_args()
+    if a.step == "publish":                  # 2026-10-18 Jun：身份表、板塊表發布成 _catalog 正本
+        from catalog_publish import main_publish
+        return main_publish(a, RawHF(write=not a.dry_run, repo=REPO, written_by="catalog_publish"))
     if a.step != "build":
         return review_main(a)
     if not PD.has_sec_contact():

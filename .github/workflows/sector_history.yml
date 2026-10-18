@@ -17,11 +17,11 @@ on:
         required: false
         default: ""
       step:
-        description: "identity＝身份時間表｜build＝建歸屬表｜polygon＝詳查第 1 步｜llm＝第 2 步（模型）｜apply＝第 3 步"
+        description: "identity＝身份時間表｜build＝建歸屬表｜polygon＝詳查第 1 步｜llm＝第 2 步（模型）｜apply＝第 3 步｜publish＝發布 _catalog 規則表"
         required: false
         default: "build"
         type: choice
-        options: [identity, build, polygon, llm, apply]
+        options: [identity, build, polygon, llm, apply, publish]
 
 permissions:
   contents: read
@@ -61,7 +61,7 @@ jobs:
         run: |
           # 輸入一律經環境變數、只允許安全字元（防指令注入）
           if ! [[ "$IN_MONTHS" =~ ^[0-9,-]*$ ]]; then echo "months 含不允許的字元"; exit 1; fi
-          case "$IN_STEP" in identity|build|polygon|llm|apply|"") ;; *) echo "step 不合法"; exit 1;; esac
+          case "$IN_STEP" in identity|build|polygon|llm|apply|publish|"") ;; *) echo "step 不合法"; exit 1;; esac
           if [ "$IN_STEP" = "identity" ]; then
             if [ "$IN_DRY" = "1" ]; then python ticker_identity.py --dry-run; else python ticker_identity.py; fi
             exit $?
