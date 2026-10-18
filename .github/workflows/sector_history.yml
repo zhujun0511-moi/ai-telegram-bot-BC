@@ -45,7 +45,7 @@ jobs:
           python-version: "3.9"
 
       - name: Install dependencies
-        run: pip install requests huggingface_hub
+        run: pip install requests huggingface_hub pytz   # courier/polygon.py 需要 pytz
 
       - name: Build sector history
         env:
