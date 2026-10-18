@@ -2,7 +2,9 @@
 """
 ticker_identity.py — 身份時間表（2026-10-18 Jun：預先處理「公司改名」與「代號易主」，例 FB→META、SPCX 前後不同公司）
 
-以「公司」為主鍵，不以代號：entity＝CIK:{10 碼}（優先）→ FIGI:{share_class_figi／composite_figi} → NAME:{名稱}。
+以「股份」為主鍵，不以代號（10-18 第 2 版）：entity＝FIGI:{share_class_figi}（優先；同一股份跨改名不變、
+  不同股份類別不同，例 GOOG／GOOGL 分開）→ 沒有 FIGI 但該 CIK 只有一種股份＝借用那個 FIGI → CIK:{10 碼} → NAME:{名稱}。
+  權證、權利、單位、優先股（WARRANT／RIGHT／UNIT／PFD）不進時間表（第 1 版把 SPAC 的 ABC／ABCU／ABCW 算成改名）。
   - 同一 entity 用過多個代號＝改名（FB 已下市紀錄的 CIK＝META 現役的 CIK）
   - 同一代號屬於多個 entity＝易主（舊公司在 delisted_utc 那天結束，之後才是新公司）
 登記：MongoDB_Standard_v3 §六-D `swing_ai/identity/{日期}/`。來源：Polygon 現役＋已下市總表、SEC 代號→CIK（經門 courier/）。
@@ -24,13 +26,25 @@ def norm(t):
     return (t or "").strip().upper().replace(".", "-")
 
 
-def entity_of(r):
-    cik = str(r.get("cik") or "").strip().lstrip("0")
-    if cik.isdigit():
-        return "CIK:%010d" % int(cik)
-    figi = r.get("share_class_figi") or r.get("composite_figi")
+SKIP_TYPES = ("WARRANT", "RIGHT", "UNIT", "PFD")
+
+
+def _cik(r):
+    c = str(r.get("cik") or "").strip().lstrip("0")
+    return int(c) if c.isdigit() else None
+
+
+def entity_of(r, cik2figi=None):
+    figi = r.get("share_class_figi")
     if figi:
         return "FIGI:" + figi
+    c = _cik(r)
+    if c is not None and cik2figi and len(cik2figi.get(c, ())) == 1:
+        return "FIGI:" + next(iter(cik2figi[c]))       # 該公司只有一種股份 → 借用它的 FIGI（接得上改名）
+    if c is not None:
+        return "CIK:%010d" % c
+    if r.get("composite_figi"):
+        return "FIGI:" + r["composite_figi"]
     nm = (r.get("name") or "").strip().upper()
     return ("NAME:" + nm) if nm else None
 
@@ -40,12 +54,16 @@ def build(active_rows, inactive_rows, sec_t2c=None):
     每筆 Polygon 列＝「某代號在某段時間屬於某公司」：已下市列的 end＝delisted_utc；現役列 end＝空（至今）。
     同一代號的多筆按 end 排序，前一筆的 end＝後一筆的 start（易主邊界）。"""
     recs, problems = [], []
+    cik2figi = defaultdict(set)
+    for r in list(active_rows) + list(inactive_rows):
+        if r.get("type") not in SKIP_TYPES and r.get("share_class_figi") and _cik(r) is not None:
+            cik2figi[_cik(r)].add(r["share_class_figi"])
     for active, rows in ((True, active_rows), (False, inactive_rows)):
         for r in rows:
             t = norm(r.get("ticker"))
-            if not t:
+            if not t or r.get("type") in SKIP_TYPES:
                 continue
-            ent = entity_of(r)
+            ent = entity_of(r, cik2figi)
             if ent is None:
                 problems.append({"ticker": t, "reason": "無 CIK、無 FIGI、無名稱"})
                 continue
@@ -54,10 +72,10 @@ def build(active_rows, inactive_rows, sec_t2c=None):
                 problems.append({"ticker": t, "reason": "已下市紀錄沒有 delisted_utc"})
                 end = "0000-00-00"
             recs.append({"entity": ent, "ticker": t, "end": end, "name": r.get("name"), "active": active,
-                         "type": r.get("type"), "source": "polygon"})
-            if active and sec_t2c and t in sec_t2c and ent.startswith("CIK:") and \
-                    "CIK:%010d" % int(sec_t2c[t]) != ent:
-                problems.append({"ticker": t, "reason": "Polygon CIK %s 與 SEC CIK %010d 不一致" % (ent, int(sec_t2c[t]))})
+                         "type": r.get("type"), "cik": _cik(r), "source": "polygon"})
+            if active and sec_t2c and t in sec_t2c and _cik(r) is not None and _cik(r) != int(sec_t2c[t]):
+                problems.append({"ticker": t, "reason": "Polygon CIK %010d 與 SEC CIK %010d 不一致" % (
+                    _cik(r), int(sec_t2c[t]))})
     by_t = defaultdict(list)
     for x in recs:
         by_t[x["ticker"]].append(x)
@@ -88,7 +106,7 @@ def build(active_rows, inactive_rows, sec_t2c=None):
     for e, xs in by_e.items():
         tick = sorted(xs, key=lambda x: x["end"] or FAR)
         for a, b in zip(tick, tick[1:]):
-            if a["ticker"] != b["ticker"]:
+            if a["ticker"] != b["ticker"] and a.get("end"):   # 舊代號已結束、之後換新代號＝改名（同時現役不算）
                 renames.append({"entity": e, "old_ticker": a["ticker"], "new_ticker": b["ticker"], "date": a["end"],
                                 "old_name": a["name"], "new_name": b["name"]})
     return ident, renames, reuse, problems
@@ -113,6 +131,10 @@ class Resolver:
             if (x.get("end") or FAR) > d:
                 return x["entity"]
         return None
+
+    def is_current(self, ticker, entity):
+        """這個代號現在仍是這家公司（股份）在用的現役代號嗎。"""
+        return any(x["entity"] == entity and not x.get("end") for x in self.by_t.get(norm(ticker), []))
 
     def current_ticker(self, entity):
         """這家公司「現在」的代號；已下市（最後一筆有 end）＝None——不能回它最後用過的代號，
@@ -150,6 +172,11 @@ def main():
     today = dt.date.today().isoformat()
     base = "%s/%s" % (OUT_PREFIX, today)
     hf = RawHF(write=not a.dry_run, repo=REPO, written_by="ticker_identity")
+    files = hf.list_files()
+    k = 2
+    while any(p.startswith(base + "/") for p in files):      # 同日重建不覆蓋舊版
+        base = "%s/%s_v%d" % (OUT_PREFIX, today, k)
+        k += 1
     hf.add(base + "/identity.csv", to_csv(ident, ["entity", "ticker", "start", "end", "name", "active", "type", "source"]))
     hf.add(base + "/renames.csv", to_csv(ren, ["entity", "old_ticker", "new_ticker", "date", "old_name", "new_name"]))
     hf.add(base + "/reuse.csv", to_csv(reu, ["ticker", "boundary", "entity_before", "name_before", "entity_after",
@@ -158,7 +185,8 @@ def main():
     man = {"created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "active_rows": len(act),
            "inactive_rows": len(ina), "identity_rows": len(ident), "entities": len({x["entity"] for x in ident}),
            "renames": len(ren), "reuse": len(reu), "problems": len(prob),
-           "entity_kinds": dict(Counter(x["entity"].split(":")[0] for x in ident))}
+           "entity_kinds": dict(Counter(x["entity"].split(":")[0] for x in ident)), "version": base.split("/")[-1],
+           "build": "v2：股份 FIGI 主鍵、排除 WARRANT／RIGHT／UNIT／PFD、同時現役不算改名"}
     hf.add(base + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1))
     n = hf.flush(a.out, "ticker identity %s" % today)
     print("身份時間表：現役 %d、已下市 %d 筆 → %d 段、%d 家公司｜改名 %d｜易主 %d｜問題 %d｜寫出 %d 個檔（%s）" % (

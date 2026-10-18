@@ -61,5 +61,35 @@ check("Polygon 與 SEC 的 CIK 不一致 → 列為問題", any("MISMATCH" == p[
       prob)
 check("一致的不列問題（META）", not any(p["ticker"] == "META" for p in prob))
 
+# ── 第 2 版：股份 FIGI 主鍵、排除權證單位 ──
+act2 = [
+    {"ticker": "GOOGL", "name": "Alphabet Inc. Class A", "type": "CS", "cik": "0001652044", "share_class_figi": "BBG009S39JX6"},
+    {"ticker": "GOOG", "name": "Alphabet Inc. Class C", "type": "CS", "cik": "0001652044", "share_class_figi": "BBG009S3NB30"},
+    {"ticker": "META", "name": "Meta Platforms", "type": "CS", "cik": "0001326801", "share_class_figi": "BBG000MM2P62"},
+    {"ticker": "XYZ", "name": "XYZ Merged Co", "type": "CS", "cik": "0009999999", "share_class_figi": "BBG00XYZ0001"},
+    {"ticker": "ABCD", "name": "Abcd Acq Corp", "type": "CS", "cik": "0008888888"},
+    {"ticker": "ABCDU", "name": "Abcd Acq Corp Units", "type": "UNIT", "cik": "0008888888"},
+    {"ticker": "ABCDW", "name": "Abcd Acq Corp Warrants", "type": "WARRANT", "cik": "0008888888"},
+]
+ina2 = [
+    {"ticker": "FB", "name": "Facebook", "type": "CS", "cik": "0001326801", "delisted_utc": "2022-06-09T00:00:00Z"},
+    {"ticker": "SPAC1", "name": "Spac One Acq", "type": "CS", "cik": "0009999999", "delisted_utc": "2021-07-01T00:00:00Z"},
+    {"ticker": "SPAC1W", "name": "Spac One Warrants", "type": "WARRANT", "cik": "0009999999",
+     "delisted_utc": "2021-07-01T00:00:00Z"},
+]
+i2, r2, u2, p2 = TI.build(act2, ina2)
+R2 = TI.Resolver(i2)
+pairs = {(r["old_ticker"], r["new_ticker"]) for r in r2}
+check("第 2 版：GOOG／GOOGL 兩種股份各自一家，不算改名", not any("GOOG" in x for pr in pairs for x in pr), pairs)
+check("第 2 版：GOOGL 在 2018 年對到它自己（Class A）、現在仍是 GOOGL",
+      R2.current_ticker(R2.entity("GOOGL", "2018-05")) == "GOOGL" and R2.is_current("GOOGL", R2.entity("GOOGL", "2018-05")))
+check("第 2 版：GOOG 與 GOOGL 是不同的股份", R2.entity("GOOG", "2018-05") != R2.entity("GOOGL", "2018-05"))
+check("第 2 版：FB（沒有 FIGI）借用 Meta 唯一的股份 FIGI → 仍認得 FB→META 改名", ("FB", "META") in pairs, pairs)
+check("第 2 版：SPAC 合併後改名 SPAC1 → XYZ", ("SPAC1", "XYZ") in pairs, pairs)
+check("第 2 版：單位、權證不進時間表（ABCDU、ABCDW、SPAC1W 都沒有紀錄）",
+      not any(x["ticker"] in ("ABCDU", "ABCDW", "SPAC1W") for x in i2))
+check("第 2 版：SPAC 的 ABCD／ABCDU／ABCDW 不算改名", not any("ABCD" in x for pr in pairs for x in pr), pairs)
+check("第 2 版：改名總數＝2（FB→META、SPAC1→XYZ）", len(r2) == 2, r2)
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

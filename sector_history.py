@@ -172,6 +172,8 @@ def main():
         e = RES.entity(t, mth)
         if e is None:
             return t, None
+        if RES.is_current(t, e):                         # 代號本身仍是這家現役代號（例 GOOGL）→ 不換
+            return t, e
         cur = RES.current_ticker(e)
         if cur is None:                                  # 已下市的公司：不接到任何現役代號（防易主誤接）
             return "%s~%s" % (t, e), e
