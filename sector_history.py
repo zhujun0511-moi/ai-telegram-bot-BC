@@ -155,6 +155,28 @@ def main():
         uni = uni[:a.limit_tickers]
     print("股票清單 %d 支｜月份 %d 個（%s～%s）" % (len(uni), len(months), months[0], months[-1]), flush=True)
 
+    # 身份時間表（2026-10-18 Jun：板塊歸屬按「公司」接——FB 年代的 GICS 接到 META；易主代號的舊公司板塊不套到新公司）
+    import ticker_identity as TI
+    idv = sorted({p.split("/")[2] for p in files if p.startswith(TI.OUT_PREFIX + "/") and p.endswith("/identity.csv")})
+    RES = None
+    if idv:
+        RES = TI.Resolver(list(csv.DictReader(io.StringIO(hf.read("%s/%s/identity.csv" % (TI.OUT_PREFIX, idv[-1]))))))
+        print("身份時間表：用 %s 版（按公司接）" % idv[-1], flush=True)
+    else:
+        print("⚠️ 沒有身份時間表 → 照舊按代號接（改名、易主不處理）", flush=True)
+
+    def map_hist(t, mth):
+        """維基當時的代號 → (我們現在的代號, entity)。查無身份＝照舊用原代號。"""
+        if RES is None:
+            return t, None
+        e = RES.entity(t, mth)
+        if e is None:
+            return t, None
+        cur = RES.current_ticker(e)
+        if cur is None:                                  # 已下市的公司：不接到任何現役代號（防易主誤接）
+            return "%s~%s" % (t, e), e
+        return cur, e
+
     # ① 每月 S&P 成分＋GICS
     hist = list(csv.DictReader(io.StringIO(PD.hanshof_csv("sp_500_historical_components.csv"))))
     sp_rows, month_stat, last_gics = [], [], {}
@@ -171,10 +193,11 @@ def main():
             if r["date"] < mth + "-01":
                 h = r
         hs = set(norm(x) for x in h["tickers"].split(",")) if h else set()
-        for t, g in sorted(w.items()):
+        for t0, g in sorted(w.items()):
             xl = xl_for(g, mth)
-            sp_rows.append({"month": mth, "ticker": t, "gics_sector": g or "", "xl": xl or "",
-                            "in_hanshof": int(t in hs), "source": "wiki"})
+            t, ent = map_hist(t0, mth)
+            sp_rows.append({"month": mth, "ticker": t, "hist_ticker": t0, "entity": ent or "", "gics_sector": g or "",
+                            "xl": xl or "", "in_hanshof": int(t0 in hs), "source": "wiki"})
             if xl:
                 last_gics[t] = (mth, xl)
         month_stat.append({"month": mth, "wiki": len(w), "wiki_no_sector": sum(1 for g in w.values() if not g),
@@ -276,7 +299,12 @@ def main():
         return b.getvalue()
 
     base = "%s/%s" % (OUT_PREFIX, today.isoformat())
-    hf.add(base + "/sp500_monthly.csv", to_csv(sp_rows, ["month", "ticker", "gics_sector", "xl", "in_hanshof", "source"]))
+    k = 2
+    while any(p.startswith(base + "/") for p in files):      # 同日重建不覆蓋舊版（MongoDB_Standard §六-D）
+        base = "%s/%s_v%d" % (OUT_PREFIX, today.isoformat(), k)
+        k += 1
+    hf.add(base + "/sp500_monthly.csv", to_csv(sp_rows, ["month", "ticker", "hist_ticker", "entity", "gics_sector", "xl",
+                                                          "in_hanshof", "source"]))
     hf.add(base + "/sec_profiles.jsonl", "".join(json.dumps(dict(v, ticker=k, kind=kind.get(k)), ensure_ascii=False) + "\n"
                                                 for k, v in sorted(profiles.items())))
     hf.add(base + "/sic_map.json", json.dumps(sic_map, ensure_ascii=False, indent=1))
@@ -286,6 +314,8 @@ def main():
         ["ticker", "start", "end", "xl", "source", "confidence"]))
     hf.add(base + "/problems.csv", to_csv(problems, ["ticker", "reason"]))
     manifest = {"created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "months": [months[0], months[-1]],
+                "identity_version": idv[-1] if idv else None, "version": base.split("/")[-1],
+                "mapped_by_identity": sum(1 for r in sp_rows if r["ticker"] != r["hist_ticker"]),
                 "n_months": len(months), "tickers": len(uni), "sp500_rows": len(sp_rows), "month_stat": month_stat,
                 "sec_found": len(profiles), "sec_companies": len(cache), "sic_learn_pairs": n_pairs,
                 "sic_loo_accuracy": loo, "segments": len(seg_rows), "problems": len(problems),
