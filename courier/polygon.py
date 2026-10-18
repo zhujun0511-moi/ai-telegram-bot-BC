@@ -209,3 +209,27 @@ def verify_fetch_inactive(ticker: str, _log=print) -> Optional[dict]:
         return {}
     r = max(rows, key=lambda x: x.get("delisted_utc") or "")
     return {"name": r.get("name"), "cik": r.get("cik"), "delisted_utc": r.get("delisted_utc")}
+
+
+# ══ sector_history 用（2026-10-18：問題股詳查第 1 步）══════════════
+
+def sector_fetch_reference_all(_log=print, max_pages=60) -> Optional[list]:
+    """分頁拉 Polygon 全部「現役」股票類代號的完整欄位（ticker, name, type, cik, primary_exchange, currency）。
+    type 例：CS 普通股、ETF、ETN、ADRC 美國存託憑證、PFD 優先股、WARRANT、UNIT、RIGHT。失敗回 None。
+    放慢到每頁 13.5 秒（免費 5 次/分鐘；與正式系統共用鑰匙，只在非交易時段跑）。"""
+    url = f"{PG_BASE}/v3/reference/tickers"
+    params = {"market": "stocks", "active": "true", "limit": 1000, "apiKey": _key()}
+    out, pages = [], 0
+    while url and pages < max_pages:
+        data = _polygon_ref_get(url, params, _log)
+        if data is None:
+            return None
+        for r in data.get("results") or []:
+            if r.get("ticker"):
+                out.append({k: r.get(k) for k in ("ticker", "name", "type", "cik", "primary_exchange", "currency_name")})
+        url = data.get("next_url")
+        params = {"apiKey": _key()}
+        pages += 1
+        _log(f"  Polygon 代號總表第 {pages} 頁，累計 {len(out)} 筆")
+        time.sleep(POLYGON_DELAY)
+    return out

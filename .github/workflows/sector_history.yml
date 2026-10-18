@@ -16,6 +16,12 @@ on:
         description: "只做這些月份（逗號分隔，留空＝2000-01 至今）"
         required: false
         default: ""
+      step:
+        description: "build＝建歸屬表｜polygon＝詳查第 1 步（Polygon 分類）｜llm＝第 2 步（模型詳查）｜apply＝第 3 步（整理）"
+        required: false
+        default: "build"
+        type: choice
+        options: [build, polygon, llm, apply]
 
 permissions:
   contents: read
@@ -45,14 +51,18 @@ jobs:
         env:
           HF_TOKEN:          ${{ secrets.HF_TOKEN }}
           SEC_USER_AGENT:    ${{ secrets.SEC_USER_AGENT }}
+          POLYGON_KEY:       ${{ secrets.POLYGON_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PYTHONUNBUFFERED:  "1"
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
           IN_DRY:     ${{ github.event.inputs.dry_run }}
           IN_MONTHS:  ${{ github.event.inputs.months }}
+          IN_STEP:    ${{ github.event.inputs.step }}
         run: |
           # 輸入一律經環境變數、只允許安全字元（防指令注入）
           if ! [[ "$IN_MONTHS" =~ ^[0-9,-]*$ ]]; then echo "months 含不允許的字元"; exit 1; fi
-          ARGS=()
+          case "$IN_STEP" in build|polygon|llm|apply|"") ;; *) echo "step 不合法"; exit 1;; esac
+          ARGS=(--step "${IN_STEP:-build}")
           if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
           if [ -n "$IN_MONTHS" ]; then ARGS+=(--months "$IN_MONTHS"); fi
           python sector_history.py "${ARGS[@]}"

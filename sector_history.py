@@ -134,7 +134,13 @@ def main():
     ap.add_argument("--months", default="", help="只做這些月份（逗號分隔，試跑用）")
     ap.add_argument("--limit-tickers", type=int, default=0, help="只查前 N 支（試跑用）")
     ap.add_argument("--out", default="_sector_out")
+    ap.add_argument("--step", default="build", choices=("build", "polygon", "llm", "apply"),
+                    help="build＝建歸屬表；polygon／llm／apply＝問題股詳查三步（2026-10-18）")
+    ap.add_argument("--date", default="", help="詳查哪一版歸屬表（swing_ai/sector_history/{日期}；留空＝最新）")
+    ap.add_argument("--max-batches", type=int, default=0, help="llm 步驟最多呼叫幾次（試跑用）")
     a = ap.parse_args()
+    if a.step != "build":
+        return review_main(a)
     if not PD.has_sec_contact():
         raise SystemExit("⛔ 缺 SEC_USER_AGENT secret")
     today = dt.date.today()
@@ -290,6 +296,183 @@ def main():
     hf.add(base + "/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=1))
     n = hf.flush(a.out, "sector history %s" % today.isoformat())
     print("寫出 %d 個檔（%s）：%s" % (n, "本機試跑" if a.dry_run else "私有 dataset", a.out if a.dry_run else base), flush=True)
+
+
+# ══ 問題股詳查（2026-10-18 Jun：先用 Polygon 分類、剩下的兩個免費模型詳查、兩者一致才採用）══
+XLS = ("XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC")
+FUND_TYPES = ("ETF", "ETN", "ETV", "ETS", "FUND", "SP")
+DERIV_TYPES = ("PFD", "WARRANT", "RIGHT", "UNIT")
+COMPANY_TYPES = ("CS", "ADRC", "ADRP", "ADRS", "OS", "GDR", "NYRS")
+BATCH = 40
+
+
+def _latest_version(hf):
+    vs = sorted({p.split("/")[2] for p in hf.list_files() if p.startswith(OUT_PREFIX + "/") and p.count("/") >= 3
+                 and p.split("/")[2][:2] == "20"})
+    return vs[-1] if vs else None
+
+
+def _jsonl(text):
+    return [json.loads(x) for x in (text or "").splitlines() if x.strip()]
+
+
+def classify_problems(problems, profiles, poly):
+    """純函數：問題股 × SEC 資料 × Polygon 總表 → (kind_updates, review_queue)。
+    poly＝{正規化代號: Polygon 列}。ETF 類＝不歸板塊；優先股／權證類＝對回母公司；公司類＝送模型詳查。"""
+    upd, queue, seen = [], [], set()
+    for r in problems:
+        t = norm(r["ticker"])
+        if t in seen:
+            continue
+        seen.add(t)
+        pg = poly.get(t)
+        pr = profiles.get(t) or {}
+        typ = (pg or {}).get("type")
+        if typ in FUND_TYPES:
+            upd.append({"ticker": r["ticker"], "kind": "fund", "type": typ, "name": pg.get("name"), "xl": None,
+                        "note": "Polygon 類型 %s：基金／ETF 不歸板塊" % typ})
+        elif typ in DERIV_TYPES:
+            upd.append({"ticker": r["ticker"], "kind": "derivative", "type": typ, "name": pg.get("name"),
+                        "parent": t.split("-")[0], "note": "Polygon 類型 %s：對回母公司 %s" % (typ, t.split("-")[0])})
+        elif typ in COMPANY_TYPES or (typ is None and pr.get("name")):
+            queue.append({"ticker": r["ticker"], "name": (pg or {}).get("name") or pr.get("name"), "type": typ,
+                          "sic": pr.get("sic"), "sic_desc": pr.get("sic_desc"), "reason": r["reason"]})
+        else:
+            upd.append({"ticker": r["ticker"], "kind": "unknown", "type": typ, "name": (pg or {}).get("name"),
+                        "note": "Polygon 現役總表查無或類型不明（%s）：留人工" % typ})
+    return upd, queue
+
+
+def build_prompt(items):
+    lines = ["%d. %s | %s | SIC: %s" % (i + 1, it["ticker"], it.get("name") or "?", it.get("sic_desc") or "?")
+             for i, it in enumerate(items)]
+    head = ("You classify US-listed companies into the 11 Select Sector SPDR sectors (GICS-based): "
+            + ", ".join(XLS) + ".\n"
+            "For each company below give its CURRENT sector. If it moved sectors in the September 2018 GICS change "
+            "(creation of Communication Services), also give the sector before that change. If it is not an operating "
+            "company (fund, SPAC/blank check, shell) answer null. If you do not know the company, answer null with "
+            "confidence low. Do NOT guess.\n"
+            "Answer ONLY a JSON array, one object per company, in the same order, each like "
+            + json.dumps({"ticker": "ABC", "xl": "XLK", "before_2018": None, "confidence": "high"})
+            + " (xl and before_2018 may be null; confidence is high, medium or low).\n\n")
+    return head + "\n".join(lines)
+
+
+def parse_answer(text, items):
+    """解析模型回答 → {代號: {xl, before_2018, confidence}}；格式不對或代號對不上的丟掉（寧缺勿錯）。"""
+    if not text:
+        return {}
+    a, b = text.find("["), text.rfind("]")
+    if a < 0 or b <= a:
+        return {}
+    try:
+        arr = json.loads(text[a:b + 1])
+    except ValueError:
+        return {}
+    want = {it["ticker"].upper() for it in items}
+    out = {}
+    for x in arr if isinstance(arr, list) else []:
+        if not isinstance(x, dict):
+            continue
+        t = str(x.get("ticker", "")).upper()
+        xl, b18 = x.get("xl"), x.get("before_2018")
+        if t in want and (xl is None or xl in XLS) and (b18 is None or b18 in XLS):
+            out[t] = {"xl": xl, "before_2018": b18, "confidence": x.get("confidence")}
+    return out
+
+
+def agree(ans_by_model, models):
+    """兩個模型都答、xl 相同且非 null、信心都不是 low → 採用；其他＝人工。回 (採用, 人工)。"""
+    a, b = (ans_by_model.get(m, {}) for m in models)
+    take, manual = {}, []
+    for t in sorted(set(a) | set(b)):
+        x, y = a.get(t), b.get(t)
+        if x and y and x["xl"] and x["xl"] == y["xl"] and "low" not in (x.get("confidence"), y.get("confidence")):
+            take[t] = {"xl": x["xl"], "before_2018": x["before_2018"] if x["before_2018"] == y["before_2018"] else None}
+        else:
+            manual.append({"ticker": t, "a": x, "b": y})
+    return take, manual
+
+
+def _dump(rows):
+    return "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+
+
+def review_main(a):
+    hf = RawHF(write=not a.dry_run, repo=REPO, written_by="sector_history_review")
+    ver = a.date or _latest_version(hf)
+    if not ver:
+        raise SystemExit("⛔ 找不到歸屬表版本")
+    base = "%s/%s" % (OUT_PREFIX, ver)
+    rv = base + "/review"
+    if a.step == "polygon":
+        from courier import polygon as PG
+        problems = list(csv.DictReader(io.StringIO(hf.read(base + "/problems.csv") or "")))
+        profiles = {norm(p["ticker"]): p for p in _jsonl(hf.read(base + "/sec_profiles.jsonl"))}
+        ref = PG.sector_fetch_reference_all(_log=print)
+        if ref is None:
+            raise SystemExit("⛔ Polygon 代號總表讀取失敗")
+        poly = {norm(r["ticker"]): r for r in ref}
+        upd, queue = classify_problems(problems, profiles, poly)
+        hf.add(rv + "/polygon_ref.jsonl", _dump(ref))
+        hf.add(rv + "/kind_updates.jsonl", _dump(upd))
+        hf.add(rv + "/review_queue.jsonl", _dump(queue))
+        hf.add(rv + "/progress.json", json.dumps({"stage": "polygon_done", "queue": len(queue), "batches_done": {}},
+                                                 ensure_ascii=False, indent=1))
+        n = hf.flush(a.out, "sector review polygon %s" % ver)
+        c = Counter(u["kind"] for u in upd)
+        print("詳查第 1 步（Polygon）：代號總表 %d 筆｜問題股 %d 支 → 基金／ETF %d、衍生品對回母公司 %d、不明留人工 %d｜"
+              "送模型詳查 %d 支（約 %d 批×2 個模型）｜寫出 %d 個檔" % (
+                  len(ref), len({norm(r["ticker"]) for r in problems}), c.get("fund", 0), c.get("derivative", 0),
+                  c.get("unknown", 0), len(queue), -(-len(queue) // BATCH), n), flush=True)
+        return
+    if a.step == "llm":
+        from courier import openrouter as OR
+        if not OR.has_key():
+            raise SystemExit("⛔ 缺 OPENROUTER_API_KEY")
+        queue = _jsonl(hf.read(rv + "/review_queue.jsonl"))
+        prog = json.loads(hf.read(rv + "/progress.json") or "{}")
+        done = prog.setdefault("batches_done", {})
+        old = _jsonl(hf.read(rv + "/llm_review.jsonl"))
+        new_rows, stop, n_calls = [], False, 0
+        batches = [queue[i:i + BATCH] for i in range(0, len(queue), BATCH)]
+        for m in OR.ALLOWED_MODELS:
+            for k, items in enumerate(batches):
+                if stop or str(k) in done.get(m, []):
+                    continue
+                if a.max_batches and n_calls >= a.max_batches:
+                    stop = True
+                    break
+                text, status = OR.chat(m, build_prompt(items))
+                n_calls += 1
+                if status == "quota":
+                    print("OpenRouter 今日額度用完 → 存進度，下次接著跑", flush=True)
+                    stop = True
+                    break
+                ans = parse_answer(text, items)
+                new_rows.append({"model": m, "batch": k, "tickers": [it["ticker"] for it in items], "raw": text,
+                                 "parsed": ans, "status": status})
+                if status == "ok" and ans:
+                    done.setdefault(m, []).append(str(k))
+        prog["stage"] = "llm_partial" if stop else "llm_done"
+        hf.add(rv + "/llm_review.jsonl", _dump(old + new_rows))
+        hf.add(rv + "/progress.json", json.dumps(prog, ensure_ascii=False, indent=1))
+        hf.flush(a.out, "sector review llm %s" % ver)
+        print("詳查第 2 步（模型）：本次呼叫 %d 次｜已完成批數 %s" % (n_calls, {m: len(v) for m, v in done.items()}),
+              flush=True)
+        return
+    if a.step == "apply":
+        from courier.openrouter import ALLOWED_MODELS
+        rows = _jsonl(hf.read(rv + "/llm_review.jsonl"))
+        by_model = {}
+        for r in rows:
+            by_model.setdefault(r["model"], {}).update(r["parsed"])
+        take, manual = agree(by_model, ALLOWED_MODELS)
+        hf.add(rv + "/llm_agreed.json", json.dumps(take, ensure_ascii=False, indent=1))
+        hf.add(rv + "/manual_review.jsonl", _dump(manual))
+        hf.flush(a.out, "sector review apply %s" % ver)
+        print("詳查第 3 步（整理）：兩模型一致採用 %d 支｜留人工 %d 支（併入新版歸屬表另案）" % (len(take), len(manual)),
+              flush=True)
 
 
 if __name__ == "__main__":
