@@ -1,0 +1,51 @@
+name: Swing Exam Queue (擺動點考試佇列)
+
+# 2026-10-18 新增（Jun 同意）：擺動點考試的獨立佇列，只給本項目用。設計：handoff_subsystem_multilevel_fractal.md、
+# MongoDB_Standard_v3 §六-D（swing_ai/queue/exam_queue.jsonl）。
+# 一次只考一份卷：啟動器下載私有程式包 → 考官 queue 模式從私有 dataset 佇列領一份 → 考完交卷 →
+# 還有待考卷就自我觸發（新的一次拿到全新的 6 小時）。外部備援：cron-job.org 每 2 小時觸發一次。
+# 獨立併發組：與其他排程、與手動考試 swing_exam.yml 都分開；被擠掉的只會是另一個消化器（卷都在佇列裡，不會丟）。
+# 程式、配方、佇列、成績都在私有 dataset；日誌只印筆數、不印盈虧。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write          # 自我觸發（workflow_dispatch）
+
+concurrency:
+  group: swing-exam-queue
+  cancel-in-progress: false
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install huggingface_hub requests
+
+      - name: Take one exam from queue
+        timeout-minutes: 340       # 留時間給下一步自我觸發
+        env:
+          HF_TOKEN:                       ${{ secrets.HF_TOKEN }}
+          PYTHONUNBUFFERED:               "1"
+          HF_HUB_DISABLE_PROGRESS_BARS:   "1"
+        working-directory: swing_lab
+        run: python bootstrap.py queue --fetch-pack latest --procs 4   # 程式包從私有 dataset 下載、驗指紋才執行
+
+      - name: Re-dispatch if more exams pending
+        if: always()
+        env:
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+        working-directory: swing_lab
+        run: python requeue.py
