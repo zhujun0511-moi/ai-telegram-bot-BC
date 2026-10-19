@@ -1,0 +1,69 @@
+name: Catalog Rules (拆股表／交易日曆規則表發布)
+
+# 2026-10-19 新增（Jun 確認範圍；回應本地端 MPQ 工廠規則缺口 A8／A9／C1）。
+# 登記：MongoDB_Standard_v3 §六-D 10-19 條 _catalog/splits/v<N>/、_catalog/calendar/v<N>/。
+# splits＝Polygon 全市場拆股（經門 courier/polygon）按身份表對到公司；calendar＝catalog_src/ 下本地端 NYSE 日曆 CSV＋規則推算。
+# 結果只寫私有 dataset；日誌只印筆數。只能手動觸發。
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "splits＝拆股事件表｜calendar＝交易日曆"
+        required: true
+        default: "splits"
+        type: choice
+        options: [splits, calendar]
+      dry_run:
+        description: "1＝只試跑不寫 dataset"
+        required: false
+        default: "0"
+      rule_years:
+        description: "日曆用規則推算的年份（逗號分隔）"
+        required: false
+        default: "2027"
+
+permissions:
+  contents: read
+
+concurrency:
+  # 2026-10-18 Jun：GitHub 三條線（日常／考試／臨時）；所有臨時任務共用 temp-line，同時最多一個在跑
+  group: temp-line
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install requests huggingface_hub pytz   # courier/polygon.py 需要 pytz
+
+      - name: Offline tests
+        run: python tests/test_catalog_rules.py
+
+      - name: Publish
+        env:
+          HF_TOKEN:          ${{ secrets.HF_TOKEN }}
+          POLYGON_KEY:       ${{ secrets.POLYGON_KEY }}
+          PYTHONUNBUFFERED:  "1"
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+          IN_STEP:  ${{ github.event.inputs.step }}
+          IN_DRY:   ${{ github.event.inputs.dry_run }}
+          IN_YEARS: ${{ github.event.inputs.rule_years }}
+        run: |
+          # 輸入一律經環境變數、只允許安全字元（防指令注入）
+          case "$IN_STEP" in splits|calendar) ;; *) echo "step 不合法"; exit 1;; esac
+          if ! [[ "$IN_YEARS" =~ ^[0-9,]*$ ]]; then echo "rule_years 含不允許的字元"; exit 1; fi
+          ARGS=(--step "$IN_STEP")
+          if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
+          if [ -n "$IN_YEARS" ]; then ARGS+=(--rule-years "$IN_YEARS"); fi
+          python catalog_rules.py "${ARGS[@]}"
