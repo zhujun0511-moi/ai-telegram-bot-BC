@@ -119,6 +119,19 @@ class HealthDataset:
         return last
 
 
+def upload_local(repo, files, note, written_by):
+    """本機上傳（2026-10-25 身份表 v2 的輸入 _catalog/_src/mpq_symbols，tools/upload_mpq_symbols.py 用）：
+    token 同 resolve_health_token（環境變數或本機備援檔，門內讀）；files＝[(path, bytes)]，一次提交；回寫出檔數。"""
+    from huggingface_hub import CommitOperationAdd, HfApi
+    tok = resolve_health_token()
+    if not tok:
+        raise SystemExit("缺 HF_TOKEN")
+    ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=b) for p, b in files]
+    HfApi(token=tok).create_commit(repo_id=repo, repo_type="dataset", operations=ops,
+                                   commit_message="%s: %s" % (written_by, note))
+    return len(ops)
+
+
 # ══ swing_lab/bootstrap 用 ══════════════════════════════════════════
 
 def download_code_bundle(repo, code_dir, want):

@@ -3,17 +3,18 @@ name: Catalog Rules (拆股表／交易日曆規則表發布)
 # 2026-10-19 新增（Jun 確認範圍；回應本地端 MPQ 工廠規則缺口 A8／A9／C1）。
 # 登記：MongoDB_Standard_v3 §六-D 10-19 條 _catalog/splits/v<N>/、_catalog/calendar/v<N>/。
 # splits＝Polygon 全市場拆股（經門 courier/polygon）按身份表對到公司；calendar＝catalog_src/ 下本地端 NYSE 日曆 CSV＋規則推算。
+# 2026-10-25 加 identity_mpq（Jun 拍板 A1／A2／A3／A6／A7；登記 §六-D 10-25 條）：輸入 _catalog/_src/mpq_symbols，不連 Polygon。
 # 結果只寫私有 dataset；日誌只印筆數。只能手動觸發。
 
 on:
   workflow_dispatch:
     inputs:
       step:
-        description: "splits＝拆股事件表｜calendar＝交易日曆"
+        description: "splits＝拆股事件表｜calendar＝交易日曆｜identity_mpq＝身份表 v2（含 MPQ 代號）"
         required: true
         default: "splits"
         type: choice
-        options: [splits, calendar]
+        options: [splits, calendar, identity_mpq]
       dry_run:
         description: "1＝只試跑不寫 dataset"
         required: false
@@ -48,7 +49,9 @@ jobs:
         run: pip install requests huggingface_hub pytz   # courier/polygon.py 需要 pytz
 
       - name: Offline tests
-        run: python tests/test_catalog_rules.py
+        run: |
+          python tests/test_catalog_rules.py
+          python tests/test_identity_mpq.py
 
       - name: Publish
         env:
@@ -61,7 +64,7 @@ jobs:
           IN_YEARS: ${{ github.event.inputs.rule_years }}
         run: |
           # 輸入一律經環境變數、只允許安全字元（防指令注入）
-          case "$IN_STEP" in splits|calendar) ;; *) echo "step 不合法"; exit 1;; esac
+          case "$IN_STEP" in splits|calendar|identity_mpq) ;; *) echo "step 不合法"; exit 1;; esac
           if ! [[ "$IN_YEARS" =~ ^[0-9,]*$ ]]; then echo "rule_years 含不允許的字元"; exit 1; fi
           ARGS=(--step "$IN_STEP")
           if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
