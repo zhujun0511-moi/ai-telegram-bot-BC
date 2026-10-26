@@ -9,6 +9,7 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 - 比例不是常見拆法（例 1.272）＝疑似分拆，標 suspect_spinoff、低信心，預設不用於價格還原（A9）。
 - 日曆規則推算 2000～2026 與 CSV 交叉核對，差異只寫 crosscheck.csv，不改 CSV 內容。
 - 公開日誌只印數量。
+2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 用法：python catalog_rules.py --step splits|calendar|identity_mpq [--dry-run] [--out _catalog_out] [--rule-years 2027]
 Python 3.9 相容。
@@ -57,6 +58,14 @@ SPLIT_SCHEMA = {
     "限制": ["2000～2002 Polygon 記錄明顯不全（2000＝5、2001＝8、2002＝78 筆），缺的拆股本表沒有",
            "Polygon 不單獨標分拆；suspect_spinoff 只是按比例推測，預設不用於價格還原",
            "同一代號同一天同比例的重複記錄只留一筆"]}
+SPLIT_SCHEMA_V2 = json.loads(json.dumps(SPLIT_SCHEMA))
+SPLIT_SCHEMA_V2["schema"] = "catalog_splits_v2"
+SPLIT_SCHEMA_V2["splits.csv"]["entity_id"] = ("公司（股份）編號，與 manifest.identity_version 那版身份表一致；"
+                                              "先看該日 MPQ 數據屬哪家（X 或 X-DELISTED），MPQ 沒有才用 Polygon 段")
+SPLIT_SCHEMA_V2["splits.csv"]["mpq_symbols"] = "該日該公司有數據的 MPQ 代號（「|」分隔）；空＝MPQ 該日沒有這家的數據"
+SPLIT_SCHEMA_V2["splits.csv"]["confidence"] += "｜與 Polygon 段歸屬不同（照 MPQ）或 MPQ 同代號多家＝low"
+SPLIT_SCHEMA_V2["限制"] = SPLIT_SCHEMA["限制"] + [
+    "v2 起按身份表 v2 重掛；ratio 是否解釋得了 MPQ 調整價，由本地端照「倍數核對規格」核，核不過進 hold"]
 CAL_SCHEMA = {
     "schema": "catalog_calendar_v1",
     "calendar.csv": {
@@ -126,7 +135,8 @@ class IdIndex:
     def __init__(self, id_rows):
         self.by = defaultdict(list)
         for r in id_rows:
-            self.by[norm(r["symbol"])].append(r)
+            if (r.get("source") or "polygon") == "polygon":      # v2 起有 mpq 列，查法另見 MpqIndex
+                self.by[norm(r["symbol"])].append(r)
         for v in self.by.values():
             v.sort(key=lambda r: r.get("to") or FAR)
 
@@ -142,9 +152,77 @@ class IdIndex:
         return None, "晚於該代號在身份表的最後一段"
 
 
-def split_rows(raw, id_rows, version):
-    """raw＝Polygon splits 記錄。回 (rows, unmapped, stats)。純函數。"""
+MPQ_SUFFIX = "-DELISTED"
+
+
+def mpq_spans(src_rows):
+    """_src/mpq_symbols 列 → {(代號, asset): [(段首, 段末)]}（日線或 5 分任一有 bar）。"""
+    out = defaultdict(list)
+    for r in src_rows:
+        ds = [x for x in (r.get("d_first"), r.get("m5_first")) if x]
+        de = [x for x in (r.get("d_last"), r.get("m5_last")) if x]
+        if ds and de:
+            out[(r["mpq_symbol"], r["asset"])].append((min(ds), max(de)))
+    return out
+
+
+class MpqIndex:
+    """身份表 v2 的 mpq 列：（Polygon 代號, 日期）→ 該日 MPQ 有數據的公司。
+    同時看 X 與 X-DELISTED；列的有效期＝[from, to) 且不晚於該代號該類別最後一根 bar（to 空不代表之後還有數據）。"""
+
+    def __init__(self, id_rows, src_rows):
+        spans = mpq_spans(src_rows)
+        self.by = defaultdict(list)
+        for r in id_rows:
+            if r.get("source") != "mpq":
+                continue
+            sym = r["symbol"]
+            ends = [e for b, e in spans.get((sym, r.get("asset") or ""), [])
+                    if b < (r.get("to") or FAR) and e >= r["from"]]
+            if not ends:
+                continue
+            last = max(ends)
+            if r.get("to"):
+                last = min(last, (dt.date.fromisoformat(r["to"]) - dt.timedelta(days=1)).isoformat())
+            base = sym[:-len(MPQ_SUFFIX)] if sym.upper().endswith(MPQ_SUFFIX) else sym
+            self.by[norm(base)].append((r["from"], last, r["entity_id"], sym))
+
+    def entities(self, symbol, date):
+        """回 {entity: [MPQ 代號…]}。"""
+        out = defaultdict(set)
+        for f, last, e, sym in self.by.get(norm(symbol), []):
+            if f <= date <= last:
+                out[e].add(sym)
+        return {e: sorted(v) for e, v in out.items()}
+
+
+def _pick(idx, midx, sym, d, stats):
+    """回 (entity, why, mpq 代號, 額外 note, 是否降為低信心)。"""
+    eid, why = idx.entity(sym, d)
+    if midx is None:
+        return eid, why, "", "", False
+    m = midx.entities(sym, d)
+    if len(m) == 1:
+        me, ms = next(iter(m.items()))
+        if eid is None:
+            stats["rehung"] += 1
+            return me, "", "|".join(ms), "經 MPQ 代號對到公司（Polygon：%s）" % why, False
+        if eid != me:
+            stats["conflict"] += 1
+            return me, "", "|".join(ms), "Polygon 段歸 %s，MPQ 該日數據屬 %s；照 MPQ" % (eid, me), True
+        return eid, "", "|".join(ms), "", False
+    if len(m) > 1:
+        stats["mpq_ambiguous"] += 1
+        if eid is not None:
+            return eid, "", "|".join(m.get(eid, [])), "MPQ 該日有 %d 家用此代號，照 Polygon" % len(m), True
+        return None, "MPQ 該日有 %d 家用此代號、Polygon 對不上" % len(m), "", "", False
+    return eid, why, "", "", False
+
+
+def split_rows(raw, id_rows, version, src_rows=None):
+    """raw＝Polygon splits 記錄；src_rows＝_src/mpq_symbols（身份表含 mpq 列時給，v2 起）。回 (rows, unmapped, stats)。純函數。"""
     idx = IdIndex(id_rows)
+    midx = MpqIndex(id_rows, src_rows) if src_rows is not None else None
     rows, unm, seen = [], [], set()
     stats = defaultdict(int)
     for r in sorted(raw, key=lambda x: (x.get("execution_date") or "", norm(x.get("ticker")))):
@@ -158,16 +236,19 @@ def split_rows(raw, id_rows, version):
             stats["dup"] += 1
             continue
         seen.add(key)
-        eid, why = idx.entity(sym, d)
+        eid, why, msyms, mnote, low = _pick(idx, midx, sym, d, stats)
         if not eid:
             unm.append({"symbol": sym, "ex_date": d, "split_from": sf, "split_to": st, "reason": why})
             continue
         typ, ratio, conf, note = classify(sf, st, d)
+        if low:
+            conf = "low"
+        note = "；".join(x for x in (note, mnote) if x)
         stats[typ] += 1
         stats["conf_" + conf] += 1
         rows.append({"entity_id": eid, "symbol": sym, "ex_date": d, "type": typ, "ratio": ratio,
                      "split_from": sf, "split_to": st, "source": "polygon", "evidence": r.get("id") or "",
-                     "confidence": conf, "note": note, "table_version": version})
+                     "confidence": conf, "note": note, "table_version": version, "mpq_symbols": msyms})
     rows.sort(key=lambda x: (x["entity_id"], x["ex_date"]))
     stats["unmapped"] = len(unm)
     return rows, unm, dict(stats)
@@ -177,24 +258,43 @@ def latest_identity(files, read):
     ver, man = last_manifest(files, read, ID_DIR)
     if not ver:
         raise SystemExit("⛔ 找不到 _catalog/identity 已發布版本")
-    return ver, list(csv.DictReader(io.StringIO(read("%s/v%d/identity.csv" % (ID_DIR, ver)))))
+    return ver, list(csv.DictReader(io.StringIO(read("%s/v%d/identity.csv" % (ID_DIR, ver))))), man
+
+
+def mpq_src_rows(read, id_man):
+    """身份表 manifest 有 mpq_symbols（v2 起）→ 讀那份輸入並核 sha256；沒有＝None（照 v1 只用 Polygon）。"""
+    src = id_man.get("mpq_symbols") if id_man else None
+    if not src:
+        return None
+    txt = read(src + "/mpq_symbols.csv")
+    if txt is None or _sha(txt) != id_man.get("mpq_symbols_sha256"):
+        raise SystemExit("⛔ %s 讀不到或 sha256 與身份表 manifest 不一致" % src)
+    return list(csv.DictReader(io.StringIO(txt, newline="")))
 
 
 def plan_splits(files, read, raw):
-    id_ver, id_rows = latest_identity(files, read)
+    id_ver, id_rows, id_man = latest_identity(files, read)
+    src_rows = mpq_src_rows(read, id_man)
     last_v, last = last_manifest(files, read, SPLIT_DIR)
     ver = last_v + 1
-    rows, unm, stats = split_rows(raw, id_rows, ver)
-    csha = content_sha(rows, SPLIT_COLS)
+    rows, unm, stats = split_rows(raw, id_rows, ver, src_rows)
+    cols = SPLIT_COLS + (["mpq_symbols"] if src_rows is not None else [])
+    csha = content_sha(rows, cols)
     if last and last.get("content_sha256") == csha and last.get("identity_version") == id_ver:
         return [], "沿用 v%d（內容未變）" % last_v
-    f = {"splits.csv": to_csv(rows, SPLIT_COLS), "unmapped.csv": to_csv(unm, SPLIT_UNM_COLS),
-         "schema.json": json.dumps(SPLIT_SCHEMA, ensure_ascii=False, indent=1)}
-    man = manifest(ver, "polygon /v3/reference/splits execution_date>=2000-01-01", f,
-                   {"identity_version": id_ver, "content_sha256": csha, "polygon_rows": len(raw), "stats": stats})
+    schema = SPLIT_SCHEMA if src_rows is None else SPLIT_SCHEMA_V2
+    f = {"splits.csv": to_csv(rows, cols), "unmapped.csv": to_csv(unm, SPLIT_UNM_COLS),
+         "schema.json": json.dumps(schema, ensure_ascii=False, indent=1)}
+    extra = {"identity_version": id_ver, "content_sha256": csha, "polygon_rows": len(raw), "stats": stats}
+    if src_rows is not None:
+        extra["mpq_symbols"] = id_man["mpq_symbols"]
+    man = manifest(ver, "polygon /v3/reference/splits execution_date>=2000-01-01", f, extra)
     summ = "發布 v%d：%d 筆（拆股 %d、合股 %d、疑似分拆 %d；低信心 %d）｜對不上公司 %d｜重複略過 %d｜身份表 v%d" % (
         ver, len(rows), stats.get("split", 0), stats.get("reverse_split", 0), stats.get("suspect_spinoff", 0),
         stats.get("conf_low", 0), len(unm), stats.get("dup", 0), id_ver)
+    if src_rows is not None:
+        summ += "｜經 MPQ 補掛 %d、與 Polygon 歸屬不同照 MPQ %d、MPQ 同代號多家 %d" % (
+            stats.get("rehung", 0), stats.get("conflict", 0), stats.get("mpq_ambiguous", 0))
     return emit(SPLIT_DIR, ver, f, man), summ
 
 

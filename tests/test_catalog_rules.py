@@ -142,5 +142,67 @@ check("日曆內容沒變不發新版", adds2 == [], summ2)
 adds3, _ = CR.plan_calendar(set(cstore), cstore.get, CSV, [2027, 2028])
 check("加 2028 發 v2", adds3 and adds3[0][0].startswith("_catalog/calendar/v2/"))
 
+# ── 拆股表 v2：身份表 v2 有 mpq 列（2026-10-25 A8 重掛）──
+import hashlib  # noqa: E402
+
+ID2 = (IDENT.replace("table_version\n", "table_version,asset\n", 1).replace(",1\n", ",2,\n")
+       + "FIGI:SUNMICRO,mpq,SUNW-DELISTED,2000-01-03,2010-01-27,mpq_overlap,,2,stock\n"
+       + "FIGI:SUNWORKS,mpq,SUNW,2015-03-04,,mpq_overlap,,2,stock\n"
+       + "FIGI:BRKB,mpq,BRK.B,2000-01-03,,mpq_overlap,,2,stock\n"
+       + "MPQ:OLDCO-DELISTED,mpq,OLDCO-DELISTED,2000-01-03,,mpq_only,,2,stock\n"     # Polygon 沒有的舊公司
+       + "FIGI:NEWCO,mpq,FBX,2018-01-02,,mpq_overlap,,2,stock\n"                    # Polygon 段歸 FIGI:NEWCO
+       + "MPQ:FBX-DELISTED,mpq,FBX-DELISTED,2005-01-03,,mpq_only,,2,stock\n"         # MPQ 該日數據屬舊公司
+       + "FIGI:NEWCO,polygon,FBX,,,polygon,,2,\n"
+       + "MPQ:DUPA,mpq,DUP,2010-01-04,,mpq_only,,2,stock\n"
+       + "MPQ:DUPB-DELISTED,mpq,DUP-DELISTED,2010-01-04,,mpq_only,,2,stock\n")
+SRC2 = ("mpq_symbol,asset,seg,d_first,d_last,d_days,m5_first,m5_last,m5_days\n"
+        "SUNW-DELISTED,stock,1,2000-01-03,2010-01-26,2500,,,\n"
+        "SUNW,stock,1,2015-03-04,2024-02-14,2000,,,\n"
+        "BRK.B,stock,1,2000-01-03,2026-10-23,6700,,,\n"
+        "OLDCO-DELISTED,stock,1,2000-01-03,2008-06-30,2100,,,\n"
+        "FBX,stock,1,2018-01-02,2026-10-23,2200,,,\n"
+        "FBX-DELISTED,stock,1,2005-01-03,2015-12-31,2700,,,\n"
+        "DUP,stock,1,2010-01-04,2020-12-31,2700,,,\n"
+        "DUP-DELISTED,stock,1,2010-01-04,2020-12-31,2700,,,\n")
+RAW2 = RAW + [
+    {"id": "b1", "ticker": "OLDCO", "execution_date": "2005-05-02", "split_from": 1, "split_to": 2},   # v1 對不上 → MPQ 補掛
+    {"id": "b2", "ticker": "OLDCO", "execution_date": "2012-05-01", "split_from": 1, "split_to": 2},   # 末根後 → 仍對不上
+    {"id": "b3", "ticker": "FBX", "execution_date": "2012-06-01", "split_from": 1, "split_to": 3},     # Polygon 與 MPQ 不同家
+    {"id": "b4", "ticker": "DUP", "execution_date": "2014-06-02", "split_from": 1, "split_to": 2},     # MPQ 同代號兩家
+]
+store2 = {"_catalog/identity/v1/identity.csv": IDENT, "_catalog/identity/v1/manifest.json": json.dumps({"version": 1}),
+          "_catalog/identity/v2/identity.csv": ID2,
+          "_catalog/identity/v2/manifest.json": json.dumps({
+              "version": 2, "mpq_symbols": "_catalog/_src/mpq_symbols/v1",
+              "mpq_symbols_sha256": hashlib.sha256(SRC2.encode("utf-8")).hexdigest()}),
+          "_catalog/_src/mpq_symbols/v1/mpq_symbols.csv": SRC2}
+adds_v2, summ_v2 = CR.plan_splits(set(store2), store2.get, RAW2)
+o2 = dict(adds_v2)
+sp2 = rows(o2["_catalog/splits/v1/splits.csv"])
+un2 = rows(o2["_catalog/splits/v1/unmapped.csv"])
+b2 = {(x["symbol"], x["ex_date"]): x for x in sp2}
+m2 = json.loads(o2["_catalog/splits/v1/manifest.json"])
+check("v2：manifest 記身份表 v2 與 mpq 輸入", m2["identity_version"] == 2 and m2["mpq_symbols"] == "_catalog/_src/mpq_symbols/v1")
+check("v2：多 mpq_symbols 欄", "mpq_symbols" in sp2[0])
+check("v2：Polygon 與 MPQ 一致者照舊、帶 MPQ 代號",
+      b2[("SUNW", "2000-12-05")]["entity_id"] == "FIGI:SUNMICRO" and b2[("SUNW", "2000-12-05")]["mpq_symbols"] == "SUNW-DELISTED"
+      and b2[("BRK.B", "2010-01-21")]["mpq_symbols"] == "BRK.B")
+check("v2：Polygon 對不上、MPQ 有 → 補掛", b2[("OLDCO", "2005-05-02")]["entity_id"] == "MPQ:OLDCO-DELISTED"
+      and "經 MPQ" in b2[("OLDCO", "2005-05-02")]["note"], b2.get(("OLDCO", "2005-05-02")))
+check("v2：MPQ 末根之後不補掛", any(u["symbol"] == "OLDCO" and u["ex_date"] == "2012-05-01" for u in un2), un2)
+check("v2：Polygon 與 MPQ 不同家 → 照 MPQ、低信心",
+      b2[("FBX", "2012-06-01")]["entity_id"] == "MPQ:FBX-DELISTED" and b2[("FBX", "2012-06-01")]["confidence"] == "low")
+check("v2：MPQ 同代號兩家、Polygon 對不上 → unmapped", any(u["symbol"] == "DUP" for u in un2))
+check("v2：SUNW 空窗（2012，兩家都沒數據）仍 unmapped", any(u["symbol"] == "SUNW" and u["ex_date"] == "2012-05-01" for u in un2))
+check("v2：Sunworks 2019 合股帶 MPQ 代號 SUNW", b2[("SUNW", "2019-08-12")]["entity_id"] == "FIGI:SUNWORKS"
+      and b2[("SUNW", "2019-08-12")]["mpq_symbols"] == "SUNW")
+bad2 = dict(store2)
+bad2["_catalog/_src/mpq_symbols/v1/mpq_symbols.csv"] = SRC2 + "X,stock,1,2020-01-02,2020-01-03,2,,,\n"
+try:
+    CR.plan_splits(set(bad2), bad2.get, RAW2)
+    check("v2：mpq 輸入 sha256 不符要停", False)
+except SystemExit:
+    check("v2：mpq 輸入 sha256 不符要停", True)
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
