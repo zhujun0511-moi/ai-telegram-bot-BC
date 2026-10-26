@@ -204,5 +204,47 @@ try:
 except SystemExit:
     check("v2：mpq 輸入 sha256 不符要停", True)
 
+# ── 來源守衛（2026-10-26）：v1 對、v2 被 Polygon 改刪、v3 要保留 v1 值 ──
+G_IDENT = IDENT + "FIGI:BALL,polygon,BALL,,,polygon,,1\nFIGI:SLM,polygon,SLM,,,polygon,,1\nFIGI:NEWX,polygon,NEWX,,,polygon,,1\n"
+SPC = ",".join(CR.SPLIT_COLS) + "\n"
+g_store = {"_catalog/identity/v1/identity.csv": G_IDENT, "_catalog/identity/v1/manifest.json": json.dumps({"version": 1}),
+           "_catalog/splits/v1/splits.csv": SPC
+           + "FIGI:BALL,BALL,2004-08-24,split,2,1,2,polygon,E-old-ball,high,,1\n"
+           + "FIGI:SLM,SLM,2003-06-23,split,3,1,3,polygon,E-old-slm,high,,1\n"
+           + "FIGI:NVDA,NVDA,2024-06-10,split,10,1,10,polygon,a3,high,,1\n",
+           "_catalog/splits/v1/unmapped.csv": "symbol,ex_date,split_from,split_to,reason\nGONE,2010-01-04,1,4,身份表沒有這個代號\n",
+           "_catalog/splits/v1/manifest.json": json.dumps({"version": 1}),
+           "_catalog/splits/v2/splits.csv": SPC                                        # v2 未設守衛：BALL 消失、SLM 變 1:2
+           + "FIGI:SLM,SLM,2003-06-23,split,2,1,2,polygon,E-new-slm,high,,2\n"
+           + "FIGI:NVDA,NVDA,2024-06-10,split,10,1,10,polygon,a3,high,,2\n",
+           "_catalog/splits/v2/unmapped.csv": "symbol,ex_date,split_from,split_to,reason\n",
+           "_catalog/splits/v2/manifest.json": json.dumps({"version": 2})}
+G_RAW = [{"id": "E-new-slm", "ticker": "SLM", "execution_date": "2003-06-23", "split_from": 1, "split_to": 2},
+         {"id": "a3", "ticker": "NVDA", "execution_date": "2024-06-10", "split_from": 2, "split_to": 20},     # 同比例不同寫法
+         {"id": "n1", "ticker": "NEWX", "execution_date": "2026-01-05", "split_from": 1, "split_to": 2}]      # 新增
+g_adds, g_summ = CR.plan_splits(set(g_store), g_store.get, G_RAW)
+g = dict(g_adds)
+g_sp = {(r["symbol"], r["ex_date"]): r for r in rows(g["_catalog/splits/v3/splits.csv"])}
+g_ch = rows(g["_catalog/splits/v3/changes.csv"])
+g_man = json.loads(g["_catalog/splits/v3/manifest.json"])
+check("守衛：發布到 v3、有 changes.csv", "_catalog/splits/v3/changes.csv" in g and g_adds[-1][0].endswith("v3/manifest.json"))
+check("守衛：Polygon 刪掉的 BALL 保留 v1 值", ("BALL", "2004-08-24") in g_sp and g_sp[("BALL", "2004-08-24")]["ratio"] == "2"
+      and "保留 v1" in g_sp[("BALL", "2004-08-24")]["note"], g_sp.get(("BALL", "2004-08-24")))
+check("守衛：SLM 改比例 → 保留 v1 的 1:3（不是 v2 的 1:2）", g_sp[("SLM", "2003-06-23")]["ratio"] == "3"
+      and g_sp[("SLM", "2003-06-23")]["evidence"] == "E-old-slm")
+check("守衛：比例同、寫法不同（2:20＝1:10）不算改", g_sp[("NVDA", "2024-06-10")]["note"] == ""
+      and not any(c["symbol"] == "NVDA" for c in g_ch))
+check("守衛：新增照收", ("NEWX", "2026-01-05") in g_sp)
+check("守衛：unmapped 裡的舊記錄也保留", any(c["symbol"] == "GONE" and c["kind"] == "deleted" for c in g_ch)
+      and "GONE" in g["_catalog/splits/v3/unmapped.csv"])
+check("守衛：changes 記新舊值與版本", sorted((c["symbol"], c["kind"], c["kept_version"], c["new_to"]) for c in g_ch)
+      == [("BALL", "deleted", "1", ""), ("GONE", "deleted", "1", ""), ("SLM", "ratio_changed", "1", "2")], g_ch)
+check("守衛：manifest 記數", g_man["guard"] == {"baseline_versions": [1, 2], "deleted": 2, "ratio_changed": 1, "added": 1},
+      g_man.get("guard"))
+g2 = dict(g_store)
+g2.update(g)
+g_adds2, g_summ2 = CR.plan_splits(set(g2), g2.get, G_RAW)
+check("守衛：同樣輸入再跑 → 內容未變不發新版", g_adds2 == [] and "沿用 v3" in g_summ2, g_summ2)
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

@@ -9,6 +9,7 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 - 比例不是常見拆法（例 1.272）＝疑似分拆，標 suspect_spinoff、低信心，預設不用於價格還原（A9）。
 - 日曆規則推算 2000～2026 與 CSV 交叉核對，差異只寫 crosscheck.csv，不改 CSV 內容。
 - 公開日誌只印數量。
+2026-10-26 拆股表 v3 起來源守衛：和最早那版逐筆比，Polygon 刪除或改比例的保留舊值、列 changes.csv，新增照收。
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 用法：python catalog_rules.py --step splits|calendar|identity_mpq [--dry-run] [--out _catalog_out] [--rule-years 2027]
@@ -65,7 +66,12 @@ SPLIT_SCHEMA_V2["splits.csv"]["entity_id"] = ("公司（股份）編號，與 ma
 SPLIT_SCHEMA_V2["splits.csv"]["mpq_symbols"] = "該日該公司有數據的 MPQ 代號（「|」分隔）；空＝MPQ 該日沒有這家的數據"
 SPLIT_SCHEMA_V2["splits.csv"]["confidence"] += "｜與 Polygon 段歸屬不同（照 MPQ）或 MPQ 同代號多家＝low"
 SPLIT_SCHEMA_V2["限制"] = SPLIT_SCHEMA["限制"] + [
-    "v2 起按身份表 v2 重掛；ratio 是否解釋得了 MPQ 調整價，由本地端照「倍數核對規格」核，核不過進 hold"]
+    "v2 起按身份表 v2 重掛；ratio 是否解釋得了 MPQ 調整價，由本地端照「倍數核對規格」核，核不過進 hold",
+    "v3 起來源守衛：和各（代號, 日）最早出現那版比，Polygon 刪除或改比例的不自動接受（保留舊值、note 註明、列 changes.csv）"]
+SPLIT_SCHEMA_V2["changes.csv"] = {
+    "kind": "deleted＝Polygon 這次沒有｜ratio_changed＝同代號同日比例不同",
+    "kept_*": "保留下來的舊值與它最早出現的版本", "new_*": "Polygon 這次的值",
+    "status": "kept_previous＝已保留舊值，待實際價仲裁（仲裁後的覆寫方式另議）"}
 CAL_SCHEMA = {
     "schema": "catalog_calendar_v1",
     "calendar.csv": {
@@ -219,8 +225,9 @@ def _pick(idx, midx, sym, d, stats):
     return eid, why, "", "", False
 
 
-def split_rows(raw, id_rows, version, src_rows=None):
-    """raw＝Polygon splits 記錄；src_rows＝_src/mpq_symbols（身份表含 mpq 列時給，v2 起）。回 (rows, unmapped, stats)。純函數。"""
+def split_rows(raw, id_rows, version, src_rows=None, keep_notes=None):
+    """raw＝Polygon splits 記錄；src_rows＝_src/mpq_symbols（身份表含 mpq 列時給，v2 起）；
+    keep_notes＝{(代號, 日): 說明}，來源守衛保留舊值的鍵（v3 起）。回 (rows, unmapped, stats)。純函數。"""
     idx = IdIndex(id_rows)
     midx = MpqIndex(id_rows, src_rows) if src_rows is not None else None
     rows, unm, seen = [], [], set()
@@ -243,7 +250,8 @@ def split_rows(raw, id_rows, version, src_rows=None):
         typ, ratio, conf, note = classify(sf, st, d)
         if low:
             conf = "low"
-        note = "；".join(x for x in (note, mnote) if x)
+        knote = (keep_notes or {}).get((norm(sym), d), "")
+        note = "；".join(x for x in (note, mnote, knote) if x)
         stats[typ] += 1
         stats["conf_" + conf] += 1
         rows.append({"entity_id": eid, "symbol": sym, "ex_date": d, "type": typ, "ratio": ratio,
@@ -272,22 +280,103 @@ def mpq_src_rows(read, id_man):
     return list(csv.DictReader(io.StringIO(txt, newline="")))
 
 
+# ── 來源守衛（2026-10-26 Jun：Polygon 一週內改刪 8 筆，BALL 2004 消失、SLM 2003 比例變）──
+CHANGE_COLS = ["symbol", "ex_date", "kind", "kept_from", "kept_to", "kept_id", "kept_version", "new_from", "new_to",
+               "new_id", "status"]
+
+
+def _rkey(sf, st):
+    """比例的比較鍵：1:2 與 2:4 視為相同；解析不了就用原字串。"""
+    try:
+        return str(Fraction(str(st)) / Fraction(str(sf)))
+    except (ValueError, ZeroDivisionError):
+        return "%s:%s" % (sf, st)
+
+
+def baseline(files, read):
+    """各（代號, 除權日）最早出現那一版的 Polygon 原值（splits.csv＋unmapped.csv）。
+    回 {鍵: {"version": v, "recs": [{ticker, execution_date, split_from, split_to, id}]}}。"""
+    base = {}
+    for v in published(files, SPLIT_DIR):
+        seen = defaultdict(list)
+        for name, idcol in (("splits.csv", "evidence"), ("unmapped.csv", None)):
+            txt = read("%s/v%d/%s" % (SPLIT_DIR, v, name))
+            for r in csv.DictReader(io.StringIO(txt or "")):
+                seen[(norm(r["symbol"]), r["ex_date"])].append(
+                    {"ticker": r["symbol"], "execution_date": r["ex_date"], "split_from": r["split_from"],
+                     "split_to": r["split_to"], "id": r.get(idcol) or "" if idcol else ""})
+        for k, recs in seen.items():
+            if k not in base:
+                base[k] = {"version": v, "recs": recs}
+    return base
+
+
+def guard(raw, base):
+    """本次 Polygon 與基準比：比例相同照常；刪除或改比例＝保留基準值；新鍵照收。回 (守衛後 raw, keep_notes, changes, stats)。"""
+    cur = defaultdict(list)
+    for r in raw:
+        cur[(norm(r.get("ticker")), (r.get("execution_date") or "").strip())].append(r)
+    out, notes, changes = [], {}, []
+    st = defaultdict(int)
+    for k, rs in cur.items():
+        b = base.get(k)
+        if b is None:
+            st["added"] += 1
+            out += rs
+        elif {_rkey(r["split_from"], r["split_to"]) for r in rs} == {_rkey(r["split_from"], r["split_to"]) for r in b["recs"]}:
+            out += rs
+        else:
+            st["ratio_changed"] += 1
+            out += b["recs"]
+            notes[k] = "保留 v%d 值：Polygon 這次改成 %s" % (b["version"], "、".join(
+                "%s:%s" % (r["split_from"], r["split_to"]) for r in rs))
+            for o in b["recs"]:
+                for n in rs:
+                    changes.append({"symbol": o["ticker"], "ex_date": k[1], "kind": "ratio_changed",
+                                    "kept_from": o["split_from"], "kept_to": o["split_to"], "kept_id": o["id"],
+                                    "kept_version": b["version"], "new_from": n.get("split_from"),
+                                    "new_to": n.get("split_to"), "new_id": n.get("id") or "", "status": "kept_previous"})
+    for k, b in base.items():
+        if k in cur:
+            continue
+        st["deleted"] += 1
+        out += b["recs"]
+        notes[k] = "保留 v%d 值：Polygon 這次沒有這筆" % b["version"]
+        for o in b["recs"]:
+            changes.append({"symbol": o["ticker"], "ex_date": k[1], "kind": "deleted", "kept_from": o["split_from"],
+                            "kept_to": o["split_to"], "kept_id": o["id"], "kept_version": b["version"], "new_from": "",
+                            "new_to": "", "new_id": "", "status": "kept_previous"})
+    changes.sort(key=lambda c: (c["kind"], c["symbol"], c["ex_date"]))
+    return out, notes, changes, dict(st)
+
+
 def plan_splits(files, read, raw):
     id_ver, id_rows, id_man = latest_identity(files, read)
     src_rows = mpq_src_rows(read, id_man)
     last_v, last = last_manifest(files, read, SPLIT_DIR)
     ver = last_v + 1
-    rows, unm, stats = split_rows(raw, id_rows, ver, src_rows)
+    base = baseline(files, read)
+    gst = None
+    if base:
+        raw, notes, changes, gst = guard(raw, base)
+    else:
+        notes, changes = {}, []
+    rows, unm, stats = split_rows(raw, id_rows, ver, src_rows, notes)
     cols = SPLIT_COLS + (["mpq_symbols"] if src_rows is not None else [])
     csha = content_sha(rows, cols)
     if last and last.get("content_sha256") == csha and last.get("identity_version") == id_ver:
         return [], "沿用 v%d（內容未變）" % last_v
     schema = SPLIT_SCHEMA if src_rows is None else SPLIT_SCHEMA_V2
-    f = {"splits.csv": to_csv(rows, cols), "unmapped.csv": to_csv(unm, SPLIT_UNM_COLS),
-         "schema.json": json.dumps(schema, ensure_ascii=False, indent=1)}
+    f = {"splits.csv": to_csv(rows, cols), "unmapped.csv": to_csv(unm, SPLIT_UNM_COLS)}
+    if gst is not None:
+        f["changes.csv"] = to_csv(changes, CHANGE_COLS)
+    f["schema.json"] = json.dumps(schema, ensure_ascii=False, indent=1)
     extra = {"identity_version": id_ver, "content_sha256": csha, "polygon_rows": len(raw), "stats": stats}
     if src_rows is not None:
         extra["mpq_symbols"] = id_man["mpq_symbols"]
+    if gst is not None:
+        extra["guard"] = {"baseline_versions": published(files, SPLIT_DIR), "deleted": gst.get("deleted", 0),
+                          "ratio_changed": gst.get("ratio_changed", 0), "added": gst.get("added", 0)}
     man = manifest(ver, "polygon /v3/reference/splits execution_date>=2000-01-01", f, extra)
     summ = "發布 v%d：%d 筆（拆股 %d、合股 %d、疑似分拆 %d；低信心 %d）｜對不上公司 %d｜重複略過 %d｜身份表 v%d" % (
         ver, len(rows), stats.get("split", 0), stats.get("reverse_split", 0), stats.get("suspect_spinoff", 0),
@@ -295,6 +384,9 @@ def plan_splits(files, read, raw):
     if src_rows is not None:
         summ += "｜經 MPQ 補掛 %d、與 Polygon 歸屬不同照 MPQ %d、MPQ 同代號多家 %d" % (
             stats.get("rehung", 0), stats.get("conflict", 0), stats.get("mpq_ambiguous", 0))
+    if gst is not None:
+        summ += "｜來源守衛：Polygon 刪除 %d、改比例 %d 照舊保留，新增 %d" % (
+            gst.get("deleted", 0), gst.get("ratio_changed", 0), gst.get("added", 0))
     return emit(SPLIT_DIR, ver, f, man), summ
 
 
