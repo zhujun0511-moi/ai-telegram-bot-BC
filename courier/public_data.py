@@ -99,3 +99,23 @@ def sec_profile(cik):
             "former_names": [{"name": x.get("name"), "from": (x.get("from") or "")[:10], "to": (x.get("to") or "")[:10]}
                              for x in (j.get("formerNames") or [])],
             "tickers": j.get("tickers") or []}
+
+
+SEC_TICKET_FORMS = ("25", "25-NSE", "15-12B", "15-12G", "15-15D", "15F-12B", "8-K", "S-4", "425", "DEFM14A",
+                    "SC TO-T", "SC 14D9", "10-12B", "8-A12B", "8-A12G")
+
+
+def sec_recent_filings(cik, since):
+    """2026-10-28 工單預審：SEC 最近申報（since 以後、只留與下市／併購／分拆／轉板相關的表格）。
+    回 [{form, date, items}]（新到舊）；查無＝[]。items＝8-K 事項代碼（例 2.01 完成併購、3.01 下市通知）。"""
+    r = _get("sec", SEC_SUBMISSIONS % int(cik))
+    if r is None:
+        return []
+    rec = ((r.json().get("filings") or {}).get("recent")) or {}
+    forms, dates, items = rec.get("form") or [], rec.get("filingDate") or [], rec.get("items") or []
+    out = []
+    for k, f in enumerate(forms):
+        d = dates[k] if k < len(dates) else ""
+        if d >= since and f in SEC_TICKET_FORMS:
+            out.append({"form": f, "date": d, "items": items[k] if k < len(items) else ""})
+    return out

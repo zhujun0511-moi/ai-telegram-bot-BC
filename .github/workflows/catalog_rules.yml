@@ -5,17 +5,19 @@ name: Catalog Rules (拆股表／交易日曆規則表發布)
 # splits＝Polygon 全市場拆股（經門 courier/polygon）按身份表對到公司；calendar＝catalog_src/ 下本地端 NYSE 日曆 CSV＋規則推算。
 # 2026-10-25 加 identity_mpq（Jun 拍板 A1／A2／A3／A6／A7；登記 §六-D 10-25 條）：輸入 _catalog/_src/mpq_symbols，不連 Polygon。
 # 2026-10-26 加 series_candidates（Jun 同意 A4＋A5 範圍；登記 §六-D 10-26 條）：序列正本表候選，不連外部 API。
+# 2026-10-28 加 identity_refresh（工單通道；登記 handoff_master 10-28 節）：先跑 ticker_identity.py 重建 Polygon 段（約 50 分鐘），
+#   再併 MPQ 一次發一版，不產生不含 MPQ 的中間版。dry_run＝不重建、用現有最新 Polygon 來源試算（驗合併邏輯）。
 # 結果只寫私有 dataset；日誌只印筆數。只能手動觸發。
 
 on:
   workflow_dispatch:
     inputs:
       step:
-        description: "splits＝拆股事件表｜calendar＝交易日曆｜identity_mpq＝身份表 v2（含 MPQ 代號）｜series_candidates＝序列正本表候選"
+        description: "splits＝拆股事件表｜calendar＝交易日曆｜identity_mpq＝身份表 v2（含 MPQ 代號）｜series_candidates＝序列正本表候選｜identity_refresh＝身份表重建（Polygon 重建＋併 MPQ 一次發版）"
         required: true
         default: "splits"
         type: choice
-        options: [splits, calendar, identity_mpq, series_candidates]
+        options: [splits, calendar, identity_mpq, series_candidates, identity_refresh]
       dry_run:
         description: "1＝只試跑不寫 dataset"
         required: false
@@ -36,7 +38,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,11 +56,14 @@ jobs:
           python tests/test_catalog_rules.py
           python tests/test_identity_mpq.py
           python tests/test_series_mpq.py
+          python tests/test_catalog_publish.py
+          python tests/test_identity_refresh.py
 
       - name: Publish
         env:
           HF_TOKEN:          ${{ secrets.HF_TOKEN }}
           POLYGON_KEY:       ${{ secrets.POLYGON_KEY }}
+          SEC_USER_AGENT:    ${{ secrets.SEC_USER_AGENT }}
           PYTHONUNBUFFERED:  "1"
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
           IN_STEP:  ${{ github.event.inputs.step }}
@@ -66,8 +71,11 @@ jobs:
           IN_YEARS: ${{ github.event.inputs.rule_years }}
         run: |
           # 輸入一律經環境變數、只允許安全字元（防指令注入）
-          case "$IN_STEP" in splits|calendar|identity_mpq|series_candidates) ;; *) echo "step 不合法"; exit 1;; esac
+          case "$IN_STEP" in splits|calendar|identity_mpq|series_candidates|identity_refresh) ;; *) echo "step 不合法"; exit 1;; esac
           if ! [[ "$IN_YEARS" =~ ^[0-9,]*$ ]]; then echo "rule_years 含不允許的字元"; exit 1; fi
+          if [ "$IN_STEP" = "identity_refresh" ] && [ "$IN_DRY" != "1" ]; then
+            python ticker_identity.py || exit 1
+          fi
           ARGS=(--step "$IN_STEP")
           if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
           if [ -n "$IN_YEARS" ]; then ARGS+=(--rule-years "$IN_YEARS"); fi

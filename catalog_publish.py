@@ -189,7 +189,18 @@ def plan(files, read, today_month):
     id_pub = published(files, ID_DIR)
     last_id_man = json.loads(read("%s/v%d/manifest.json" % (ID_DIR, id_pub[-1]))) if id_pub else None
     ident = list(csv.DictReader(io.StringIO(read("%s/%s/identity.csv" % (TI.OUT_PREFIX, id_src)))))
-    if last_id_man and last_id_man.get("source") == "%s/%s" % (TI.OUT_PREFIX, id_src):
+    if last_id_man and last_id_man.get("mpq_symbols"):
+        # 2026-10-28：最新版已含 MPQ（v2 起）→ 這裡不再單獨發「只有 Polygon」的版（會冒出不含 MPQ 的中間版）。
+        # Polygon 來源有新版時改用 catalog_rules.yml step identity_refresh（Polygon＋MPQ 一次發版）。
+        poly_src = last_id_man.get("polygon_source")
+        if not poly_src and last_id_man.get("polygon_base_version"):
+            poly_src = json.loads(read("%s/v%d/manifest.json" % (ID_DIR, int(last_id_man["polygon_base_version"])))).get("source")
+        if poly_src != "%s/%s" % (TI.OUT_PREFIX, id_src):
+            raise SystemExit("⛔ 身份表 v%d 已含 MPQ，Polygon 來源 %s 是新的：請改跑 catalog_rules.yml step identity_refresh"
+                             "（一次發版），這裡不單獨發 Polygon 版" % (id_pub[-1], id_src))
+        id_ver = id_pub[-1]
+        summ["identity"] = "沿用 v%d（已含 MPQ、Polygon 來源未變）" % id_ver
+    elif last_id_man and last_id_man.get("source") == "%s/%s" % (TI.OUT_PREFIX, id_src):
         id_ver = id_pub[-1]
         summ["identity"] = "沿用 v%d（來源未變）" % id_ver
     else:

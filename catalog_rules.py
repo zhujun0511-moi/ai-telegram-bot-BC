@@ -13,7 +13,8 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-26 拆股表 v3 起來源守衛：和最早那版逐筆比，Polygon 刪除或改比例的保留舊值、列 changes.csv，新增照收。
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
-用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates [--dry-run] [--out _catalog_out] [--rule-years 2027]
+2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
+用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|identity_refresh [--dry-run] [--out _catalog_out] [--rule-years 2027]
 Python 3.9 相容。
 """
 import argparse
@@ -534,9 +535,10 @@ def fetch_polygon_splits():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates"),
+    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "identity_refresh"),
                     help="identity_mpq＝身份表 v2 含 MPQ 代號（2026-10-25，identity_mpq.py）｜"
-                         "series_candidates＝序列正本表候選（2026-10-26，series_mpq.py）")
+                         "series_candidates＝序列正本表候選（2026-10-26，series_mpq.py）｜"
+                         "identity_refresh＝身份表重建：最新 Polygon 來源＋併 MPQ 一次發版（2026-10-28 工單通道）")
     ap.add_argument("--dry-run", action="store_true", help="不寫 dataset，結果寫本機 --out")
     ap.add_argument("--out", default="_catalog_out")
     ap.add_argument("--rule-years", default="2027", help="規則推算的年份（逗號分隔）")
@@ -549,6 +551,9 @@ def main():
     elif a.step == "identity_mpq":
         import identity_mpq
         adds, summ = identity_mpq.plan(files, hf.read)
+    elif a.step == "identity_refresh":
+        import identity_mpq
+        adds, summ = identity_mpq.plan_refresh(files, hf.read)
     elif a.step == "series_candidates":
         import series_mpq
         adds, summ = series_mpq.plan(files, hf.read)
@@ -565,7 +570,7 @@ def main():
     for p, t in adds:
         hf.add(p, t)
     n = hf.flush(a.out, "catalog %s" % a.step)
-    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選"}[a.step], summ), flush=True)
+    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "identity_refresh": "身份表重建"}[a.step], summ), flush=True)
     print("寫出 %d 個檔（%s）" % (n, "本機試跑 " + a.out if a.dry_run else "私有 dataset"), flush=True)
     return 0
 

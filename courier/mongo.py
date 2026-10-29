@@ -88,6 +88,11 @@ def find_one_and_update(db, col, query, update, upsert=False):
     return _col(db, col).find_one_and_update(query, update, upsert=upsert)
 
 
+def delete_one(db, col, query):
+    """2026-10-28 工單通道：刪除條件由呼叫端寫死（run_tickets.delete_own 只刪 from=datacenter）。"""
+    return _col(db, col).delete_one(query)
+
+
 def create_index(db, col, keys_, **kw):
     return _col(db, col).create_index(keys_, **kw)
 

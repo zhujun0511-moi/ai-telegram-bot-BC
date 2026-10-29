@@ -21,6 +21,7 @@ import csv
 import datetime as dt
 import io
 import json
+import re
 from collections import Counter, defaultdict
 
 from catalog_publish import CAT, ENT_COLS, ID_SCHEMA, _sha, published, to_csv
@@ -278,14 +279,20 @@ def _latest(files, read, d):
     return pub[-1], json.loads(read("%s/v%d/manifest.json" % (d, pub[-1])))
 
 
-def plan(files, read):
-    """決定要發布什麼：回 (adds, 摘要)。純計算，不寫東西。"""
+def _mpq_input(files, read):
+    """MPQ 代號摘要最新版：回 (版本, manifest, 內容)，並核 sha256。"""
     src_v, src_man = _latest(files, read, SRC_DIR)
     if not src_v:
         raise SystemExit("⛔ 找不到 %s 輸入" % SRC_DIR)
     src_txt = read("%s/v%d/mpq_symbols.csv" % (SRC_DIR, src_v))
     if _sha(src_txt) != src_man["files"]["mpq_symbols.csv"]["sha256"]:
         raise SystemExit("⛔ mpq_symbols v%d sha256 與 manifest 不一致" % src_v)
+    return src_v, src_man, src_txt
+
+
+def plan(files, read):
+    """決定要發布什麼：回 (adds, 摘要)。純計算，不寫東西。"""
+    src_v, src_man, src_txt = _mpq_input(files, read)
     id_v, id_man = _latest(files, read, ID_DIR)
     if not id_v:
         raise SystemExit("⛔ 找不到 _catalog/identity 已發布版本")
@@ -304,7 +311,9 @@ def plan(files, read):
     for r in poly:
         r["table_version"] = ver
         r.setdefault("asset", "")
-    ents = list(csv.DictReader(io.StringIO(read(base + "/entities.csv"))))
+    # 基底若是 identity_refresh 發的版（本身已含 MPQ），只取 Polygon 的公司，MPQ:{代號} 由本次 build 重新產生
+    ents = [e for e in csv.DictReader(io.StringIO(read(base + "/entities.csv")))
+            if not (e.get("entity_id") or "").startswith("MPQ:")]
     f = {"identity.csv": to_csv(poly + mrows, ID_COLS_V2),
          "entities.csv": to_csv(ents + ments, ENT_COLS)}
     for name in ("renames.csv", "reuse.csv", "problems.csv"):
@@ -329,4 +338,78 @@ def plan(files, read):
         ver, stats["mpq_symbols"], stats["mpq_rows"], stats.get("overlap", 0), stats.get("residue", 0),
         stats["mpq_only_entities"], stats.get("no_polygon", 0), stats.get("polygon_ended", 0),
         stats.get("polygon_ambiguous", 0), stats.get("delisted_polygon_active", 0), stats.get("split_by_polygon", 0), stats.get("same_entity_overlap", 0), stats["merged_segments"], base_v)
+    return adds, summ
+
+
+# ── identity_refresh（2026-10-28 工單通道）：Polygon 重建＋併 MPQ 一次發一版 ──
+# 起因：工單回覆「改名／下市」必須附已發布的身份表版本，新發生的改名要先重建 Polygon 段（ticker_identity.py）。
+# 舊流程是 catalog_publish（只發 Polygon 版）→ identity_mpq（再併 MPQ），中間會冒出一版不含 MPQ 的身份表、
+# 本地端讀到會錯。這裡直接用最新的 swing_ai/identity 來源＋最新 MPQ 摘要，一次產出含兩者的新版。
+
+def poly_source_of(read, id_man):
+    """某已發布身份表版本的 Polygon 段來自哪份 swing_ai/identity 來源。"""
+    if not id_man:
+        return None
+    if id_man.get("polygon_source"):
+        return id_man["polygon_source"]
+    if id_man.get("polygon_base_version"):
+        base = json.loads(read("%s/v%d/manifest.json" % (ID_DIR, int(id_man["polygon_base_version"]))))
+        return base.get("source")
+    return id_man.get("source")
+
+
+def _poly_keys(rows):
+    return {(r.get("entity_id"), r.get("symbol"), r.get("from") or "", r.get("to") or "")
+            for r in rows if (r.get("source") or "polygon") == "polygon"}
+
+
+def plan_refresh(files, read):
+    """決定要發布什麼：回 (adds, 摘要)。純計算，不寫東西。"""
+    import ticker_identity as TI
+    from catalog_publish import entity_rows, identity_rows, latest_src
+    id_src = latest_src(files, TI.OUT_PREFIX, "identity.csv")
+    if not id_src:
+        raise SystemExit("⛔ 找不到 %s 來源（先跑 ticker_identity.py）" % TI.OUT_PREFIX)
+    poly_source = "%s/%s" % (TI.OUT_PREFIX, id_src)
+    src_v, src_man, src_txt = _mpq_input(files, read)
+    id_v, id_man = _latest(files, read, ID_DIR)
+    if id_man and poly_source_of(read, id_man) == poly_source and id_man.get("mpq_symbols") == "%s/v%d" % (SRC_DIR, src_v):
+        return [], "沿用 v%d（Polygon 來源 %s 與 MPQ 輸入都未變）" % (id_v, id_src)
+    ver = id_v + 1
+    ident = list(csv.DictReader(io.StringIO(read("%s/identity.csv" % poly_source))))
+    reuse = list(csv.DictReader(io.StringIO(read("%s/reuse.csv" % poly_source) or "")))
+    poly = identity_rows(ident, reuse, ver)
+    for r in poly:
+        r["asset"] = ""
+    mrows, ments, probs, stats = build(poly, list(csv.DictReader(io.StringIO(src_txt, newline=""))), ver,
+                                       (src_man.get("calendar") or [None, None])[1])
+    f = {"identity.csv": to_csv(poly + mrows, ID_COLS_V2),
+         "entities.csv": to_csv(entity_rows(ident) + ments, ENT_COLS)}
+    for name in ("renames.csv", "reuse.csv", "problems.csv"):
+        txt = read("%s/%s" % (poly_source, name))
+        if txt is not None:
+            f[name] = re.sub(r"^entity(,|$)", r"entity_id\1", txt, count=1)
+    f["mpq_problems.csv"] = to_csv(probs, PROB_COLS)
+    f["schema.json"] = json.dumps(SCHEMA_V2, ensure_ascii=False, indent=1)
+    diff = {}
+    if id_v:
+        prev = list(csv.DictReader(io.StringIO(read("%s/v%d/identity.csv" % (ID_DIR, id_v)))))
+        a, b = _poly_keys(prev), _poly_keys(poly)
+        diff = {"vs_version": id_v, "polygon_rows_added": len(b - a), "polygon_rows_removed": len(a - b),
+                "mpq_rows_prev": sum(1 for r in prev if r.get("source") == "mpq"), "mpq_rows_now": len(mrows)}
+    man = {"version": ver, "created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "source": "%s ＋ %s/v%d" % (poly_source, SRC_DIR, src_v),
+           "files": {k: ({"sha256": _sha(v), "rows": max(v.count("\n") - 1, 0)} if k.endswith(".csv")
+                         else {"sha256": _sha(v)}) for k, v in f.items()},
+           "polygon_source": poly_source, "polygon_base_version": ver,
+           "mpq_symbols": "%s/v%d" % (SRC_DIR, src_v),
+           "mpq_symbols_sha256": src_man["files"]["mpq_symbols.csv"]["sha256"],
+           "rules": {"tol_days": TOL, "merge_gap_days": MERGE_GAP}, "stats": stats, "diff_vs_prev": diff,
+           "note": "identity_refresh（2026-10-28）：Polygon 重建＋併 MPQ 一次發版，不產生不含 MPQ 的中間版；規則同 v2"}
+    d = "%s/v%d" % (ID_DIR, ver)
+    adds = [("%s/%s" % (d, k), v) for k, v in f.items()]
+    adds.append((d + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1)))   # manifest 最後
+    summ = "發布 v%d：Polygon 來源 %s（%d 段）＋MPQ v%d（%d 段）｜與 v%s 比 Polygon 段 +%s／-%s、MPQ 段 %s→%d" % (
+        ver, id_src, len(poly), src_v, len(mrows), diff.get("vs_version", "-"), diff.get("polygon_rows_added", "-"),
+        diff.get("polygon_rows_removed", "-"), diff.get("mpq_rows_prev", "-"), len(mrows))
     return adds, summ

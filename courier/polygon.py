@@ -236,3 +236,77 @@ def sector_fetch_reference_all(_log=print, max_pages=60, active=True) -> Optiona
         _log(f"  Polygon {'現役' if active else '已下市'}代號總表第 {pages} 頁，累計 {len(out)} 筆")
         time.sleep(POLYGON_DELAY)
     return out
+
+
+# ══ run_tickets 用（2026-10-28：工單通道預審，單一代號；免費 5 次/分鐘，每次呼叫間隔 13.5 秒）══
+
+_TK_LAST = {"t": 0.0}
+
+
+def _tk_get(path: str, params: dict = None, _log=print):
+    """工單預審共用 GET：節流＋429 等待。回 (HTTP 碼, JSON 或 None)；連線失敗回 (None, None)。"""
+    for attempt in range(3):
+        wait = POLYGON_DELAY - (time.time() - _TK_LAST["t"])
+        if wait > 0:
+            time.sleep(wait)
+        _TK_LAST["t"] = time.time()
+        try:
+            r = requests.get(PG_BASE + path, params=dict(params or {}, apiKey=_key()), headers=UA, timeout=30)
+        except Exception as e:
+            _log(f"  ⚠️ [Polygon 工單] 連線異常: {scrub(e)}")
+            continue
+        if r.status_code == 429:
+            time.sleep(POLYGON_WAIT)
+            continue
+        try:
+            return r.status_code, (r.json() if r.status_code == 200 else None)
+        except ValueError:
+            return r.status_code, None
+    return None, None
+
+
+def ticket_overview(ticker: str, _log=print) -> Optional[dict]:
+    """代號現況（/v3/reference/tickers/{代號}）。None＝狀態未知；{}＝查無；dict＝精簡欄位。"""
+    code, j = _tk_get(f"/v3/reference/tickers/{ticker}", None, _log)
+    if code == 404:
+        return {}
+    if code != 200 or j is None:
+        return None
+    r = j.get("results") or {}
+    keep = ("ticker", "name", "active", "market", "type", "primary_exchange", "cik", "composite_figi",
+            "share_class_figi", "list_date", "delisted_utc")
+    return {k: r.get(k) for k in keep}
+
+
+def ticket_inactive(ticker: str, _log=print) -> Optional[list]:
+    """該代號「已停止交易」的紀錄（新到舊）。None＝狀態未知。"""
+    code, j = _tk_get("/v3/reference/tickers", {"ticker": ticker, "active": "false", "limit": 10}, _log)
+    if code != 200 or j is None:
+        return None
+    rows = [{k: r.get(k) for k in ("ticker", "name", "cik", "composite_figi", "share_class_figi",
+                                   "primary_exchange", "delisted_utc")}
+            for r in (j.get("results") or [])]
+    return sorted(rows, key=lambda x: x.get("delisted_utc") or "", reverse=True)
+
+
+def ticket_change_events(ident: str, _log=print) -> Optional[list]:
+    """代號變更事件（/vX/reference/tickers/{代號或 FIGI}/events）→ [{date, ticker}]（舊到新）。None＝狀態未知；[]＝沒有。"""
+    code, j = _tk_get(f"/vX/reference/tickers/{ident}/events", {"types": "ticker_change"}, _log)
+    if code == 404:
+        return []
+    if code != 200 or j is None:
+        return None
+    ev = ((j.get("results") or {}).get("events")) or []
+    out = [{"date": e.get("date"), "ticker": (e.get("ticker_change") or {}).get("ticker")}
+           for e in ev if e.get("type") == "ticker_change"]
+    return sorted(out, key=lambda x: x.get("date") or "")
+
+
+def ticket_bar_dates(ticker: str, frm: str, to: str, _log=print) -> Optional[list]:
+    """frm～to 之間 Polygon 有日線的日期（美東 YYYY-MM-DD）。只回日期、不回價格（工單不放價格）。None＝狀態未知。"""
+    code, j = _tk_get(f"/v2/aggs/ticker/{ticker}/range/1/day/{frm}/{to}",
+                      {"adjusted": "false", "sort": "asc", "limit": 500}, _log)
+    if code != 200 or j is None:
+        return None
+    return sorted({datetime.fromtimestamp(r["t"] / 1000, EST_TZ).strftime("%Y-%m-%d")
+                   for r in (j.get("results") or []) if r.get("t") is not None})

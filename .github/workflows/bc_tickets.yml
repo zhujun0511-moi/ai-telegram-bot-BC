@@ -1,0 +1,54 @@
+name: BC Tickets (工單通道預審)
+
+# 2026-10-28 新增（Jun 拍板）：本地端↔數據中心 Mongo 工單通道的數據中心側。
+# 本地端發現個股斷流 3 個交易日 → 在 CommData.Tickets 開單；這裡按時檢查新單、預審（Polygon＋SEC）、
+# 能確定的 source_gap 自動回覆，其他寫 dc_review 後 Telegram 通知 Jun 待人工（數據中心窗口 tickets_cli.py）。
+# 雲端跑：電腦沒開機也照跑（Jun 10-28：溝通只走 Mongo、不走 Shared）。
+# 登記：MongoDB_Standard_v3「CommData.Tickets」節；handoff_master「2026-10-28 工單通道」節。
+# 公開 repo：日誌只印數量、不印代號（代號只進 Telegram）。
+
+on:
+  schedule:
+    - cron: "30 12 * * *"   # 美東約 07:30（冬令）／08:30（夏令）：補看前一晚較晚開的單
+    - cron: "30 23 * * *"   # 美東約 18:30（冬令）／19:30（夏令）：本地端盤後流程開的單
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1＝只連線計數，不搶單、不寫入、不通知"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bc-tickets
+  cancel-in-progress: false
+
+jobs:
+  tickets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz   # courier/polygon.py 需要 pytz
+
+      - name: Review tickets
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          SEC_USER_AGENT:   ${{ secrets.SEC_USER_AGENT }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          PYTHONUNBUFFERED: "1"
+          IN_DRY:           ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$IN_DRY" = "1" ]; then python run_tickets.py --dry-run; else python run_tickets.py; fi
