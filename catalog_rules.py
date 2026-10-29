@@ -28,6 +28,8 @@ import sys
 from collections import defaultdict
 from fractions import Fraction
 
+from courier import keys
+
 from catalog_publish import CAT, _sha, to_csv, published
 
 SPLIT_DIR = CAT + "/splits"
@@ -37,7 +39,7 @@ CAL_SRC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog
                             "nyse_holidays_and_special_schedules_2000_2026.csv")
 HIGH_FROM = "2003-01-01"          # Polygon 拆股 2003 起完整；2000～2002 明顯不全（10-17 實測）
 FAR = "9999-12-31"
-REPO = os.environ.get("HF_REPO_ID", "").strip() or "zhujun0511-AI/ai-telegram-bot-dataset"
+REPO = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"   # 10-28 門禁修正：環境變數經門讀（同 raw_writer）
 
 SPLIT_COLS = ["entity_id", "symbol", "ex_date", "type", "ratio", "split_from", "split_to", "source",
               "evidence", "confidence", "note", "table_version"]
