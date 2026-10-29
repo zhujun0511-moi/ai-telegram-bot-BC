@@ -246,5 +246,50 @@ g2.update(g)
 g_adds2, g_summ2 = CR.plan_splits(set(g2), g2.get, G_RAW)
 check("守衛：同樣輸入再跑 → 內容未變不發新版", g_adds2 == [] and "沿用 v3" in g_summ2, g_summ2)
 
+# ── 人工查證清單（2026-10-29 v4）：add／override／reject，fail-closed ──
+EVH = ",".join(CR.EVENT_COLS) + "\n"
+EV = (EVH
+      + "add,FIGI:NVDA,NVDA,2000-06-27,split,2,1,2,yahoo,Yahoo 2000-06-27 1:2；MPQ 跳變 2,Polygon 無此記錄\n"
+      + "add,FIGI:META,META,2024-01-02,spinoff,1.2,,,yahoo,Yahoo 1000:1197；MPQ 跳變 1.2,分拆\n"
+      + "override,FIGI:BALL,BALL,2004-08-24,stock_dividend,1.05,,,yahoo,Yahoo 100:105,改判股票股利\n"
+      + "reject,FIGI:SLM,SLM,2003-06-23,,,,,,Polygon 已刪；Yahoo 無,屬他公司\n")
+e_adds, e_summ = CR.plan_splits(set(g2), g2.get, G_RAW, EV)
+e = dict(e_adds)
+e_sp = {(r["symbol"], r["ex_date"]): r for r in rows(e["_catalog/splits/v4/splits.csv"])}
+e_man = json.loads(e["_catalog/splits/v4/manifest.json"])
+check("清單：發 v4、schema v3", e_adds[-1][0].endswith("v4/manifest.json")
+      and json.loads(e["_catalog/splits/v4/schema.json"])["schema"] == "catalog_splits_v3")
+check("清單：add 拆股 high、source=yahoo", e_sp[("NVDA", "2000-06-27")]["confidence"] == "high"
+      and e_sp[("NVDA", "2000-06-27")]["source"] == "yahoo" and e_sp[("NVDA", "2000-06-27")]["table_version"] == "4")
+check("清單：add 分拆 split_from 空", e_sp[("META", "2024-01-02")]["type"] == "spinoff" and e_sp[("META", "2024-01-02")]["split_from"] == "")
+b = e_sp[("BALL", "2004-08-24")]
+check("清單：override 改型、保留舊 evidence 並追加", b["type"] == "stock_dividend" and b["ratio"] == "1.05" and b["confidence"] == "high"
+      and b["evidence"].startswith("E-old-ball；") and b["source"] == "polygon+yahoo" and "保留 v1" in b["note"], b)
+sl = e_sp[("SLM", "2003-06-23")]
+check("清單：reject 不刪、標 rejected、note 寫原因", sl["confidence"] == "rejected" and "查證為錯：屬他公司" in sl["note"] and sl["ratio"] == "3", sl)
+check("清單：manifest 記 events", e_man["events_sha256"] == CR._sha(EV) and e_man["events_rows"] == 4
+      and e_man["events"] == {"add_split": 1, "add_spinoff": 1, "override_stock_dividend": 1, "reject": 1}, e_man.get("events"))
+check("清單：摘要有數", "新增 2、更正 1、駁回 1" in e_summ, e_summ)
+check("清單：不給清單＝照 v3 行為", CR.plan_splits(set(g2), g2.get, G_RAW)[0] == [])
+
+
+def fails(text, name):
+    try:
+        CR.plan_splits(set(g2), g2.get, G_RAW, text)
+        check(name, False)
+    except SystemExit:
+        check(name, True)
+
+
+fails(EVH + "override,FIGI:X,NOPE,2020-01-02,split,2,1,2,yahoo,ev,\n", "清單：override 對不到要停")
+fails(EVH + "add,FIGI:NVDA,NVDA,2024-06-10,split,10,1,10,yahoo,ev,\n", "清單：add 與既有同鍵要停")
+fails(EVH + "add,FIGI:NVDA,NVDA,2020-01-02,split,2,1,2,blog,ev,\n", "清單：來源不在白名單要停")
+fails(EVH + "add,FIGI:NVDA,NVDA,2020-01-02,split,2,1,2,yahoo,,\n", "清單：沒 evidence 要停")
+fails(EVH + "add,FIGI:NVDA,NVDA,2020-01-02,bogus,2,1,2,yahoo,ev,\n", "清單：type 不認得要停")
+fails(EVH + "add,FIGI:NVDA,NVDA,2020-01-02,split,0,1,2,yahoo,ev,\n", "清單：ratio 非正要停")
+fails(EVH + "reject,FIGI:SLM,SLM,2003-06-23,,,,,,ev,\n", "清單：reject 沒 note 要停")
+fails(EVH + "add,FIGI:NVDA,NVDA,2020-01-02,split,2,1,2,yahoo,ev,\n" * 2, "清單：同鍵重複要停")
+fails("action,entity_id\n", "清單：欄位不符要停")
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

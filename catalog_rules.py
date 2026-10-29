@@ -14,6 +14,8 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
+2026-10-29 拆股表 v4：合併人工查證清單 catalog_src/split_events.csv（add／override／reject，每列附公開來源；Jun 10-29 拍板三點，
+  回應本地端暫扣序列需求 ADR-055）；新類型 spinoff／special_dividend／stock_dividend、confidence 加 rejected。
 用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|identity_refresh [--dry-run] [--out _catalog_out] [--rule-years 2027]
 Python 3.9 相容。
 """
@@ -37,6 +39,7 @@ CAL_DIR = CAT + "/calendar"
 ID_DIR = CAT + "/identity"
 CAL_SRC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src",
                             "nyse_holidays_and_special_schedules_2000_2026.csv")
+SPLIT_EVENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "split_events.csv")
 HIGH_FROM = "2003-01-01"          # Polygon 拆股 2003 起完整；2000～2002 明顯不全（10-17 實測）
 FAR = "9999-12-31"
 REPO = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"   # 10-28 門禁修正：環境變數經門讀（同 raw_writer）
@@ -354,7 +357,8 @@ def guard(raw, base):
     return out, notes, changes, dict(st)
 
 
-def plan_splits(files, read, raw):
+def plan_splits(files, read, raw, events_text=None):
+    """events_text＝catalog_src/split_events.csv 內容（v4 起；None＝不合併，照 v3）。"""
     id_ver, id_rows, id_man = latest_identity(files, read)
     src_rows = mpq_src_rows(read, id_man)
     last_v, last = last_manifest(files, read, SPLIT_DIR)
@@ -366,11 +370,18 @@ def plan_splits(files, read, raw):
     else:
         notes, changes = {}, []
     rows, unm, stats = split_rows(raw, id_rows, ver, src_rows, notes)
+    est = None
+    if events_text is not None:
+        midx = MpqIndex(id_rows, src_rows) if src_rows is not None else None
+        ms = (lambda sym, d, e: "|".join(midx.entities(sym, d).get(e, []))) if midx is not None else None
+        rows, est = apply_events(rows, parse_events(events_text), ver, ms)
     cols = SPLIT_COLS + (["mpq_symbols"] if src_rows is not None else [])
     csha = content_sha(rows, cols)
     if last and last.get("content_sha256") == csha and last.get("identity_version") == id_ver:
         return [], "沿用 v%d（內容未變）" % last_v
     schema = SPLIT_SCHEMA if src_rows is None else SPLIT_SCHEMA_V2
+    if est is not None:
+        schema = SPLIT_SCHEMA_V3
     f = {"splits.csv": to_csv(rows, cols), "unmapped.csv": to_csv(unm, SPLIT_UNM_COLS)}
     if gst is not None:
         f["changes.csv"] = to_csv(changes, CHANGE_COLS)
@@ -381,7 +392,10 @@ def plan_splits(files, read, raw):
     if gst is not None:
         extra["guard"] = {"baseline_versions": published(files, SPLIT_DIR), "deleted": gst.get("deleted", 0),
                           "ratio_changed": gst.get("ratio_changed", 0), "added": gst.get("added", 0)}
-    man = manifest(ver, "polygon /v3/reference/splits execution_date>=2000-01-01", f, extra)
+    if est is not None:
+        extra.update(events_sha256=_sha(events_text), events_rows=sum(est.values()), events=est)
+    man = manifest(ver, "polygon /v3/reference/splits execution_date>=2000-01-01"
+                   + ("＋catalog_src/split_events.csv" if est is not None else ""), f, extra)
     summ = "發布 v%d：%d 筆（拆股 %d、合股 %d、疑似分拆 %d；低信心 %d）｜對不上公司 %d｜重複略過 %d｜身份表 v%d" % (
         ver, len(rows), stats.get("split", 0), stats.get("reverse_split", 0), stats.get("suspect_spinoff", 0),
         stats.get("conf_low", 0), len(unm), stats.get("dup", 0), id_ver)
@@ -391,7 +405,110 @@ def plan_splits(files, read, raw):
     if gst is not None:
         summ += "｜來源守衛：Polygon 刪除 %d、改比例 %d 照舊保留，新增 %d" % (
             gst.get("deleted", 0), gst.get("ratio_changed", 0), gst.get("added", 0))
+    if est is not None:
+        summ += "｜人工查證清單：新增 %d、更正 %d、駁回 %d" % (
+            sum(v for k, v in est.items() if k.startswith("add_")),
+            sum(v for k, v in est.items() if k.startswith("override_")), est.get("reject", 0))
     return emit(SPLIT_DIR, ver, f, man), summ
+
+
+# ── 人工查證清單（2026-10-29 Jun 拍板：①新類型沿用 splits.csv ②每筆要公開來源、跳變只當線索 ③錯的不刪標 rejected）──
+EVENT_COLS = ["action", "entity_id", "symbol", "ex_date", "type", "ratio", "split_from", "split_to", "source", "evidence", "note"]
+EVENT_ACTIONS = ("add", "override", "reject")
+EVENT_TYPES = ("split", "reverse_split", "spinoff", "special_dividend", "stock_dividend")
+EVENT_SOURCES = ("polygon", "polygon_dividend", "sec", "company", "exchange", "yahoo")
+SPLIT_SCHEMA_V3 = json.loads(json.dumps(SPLIT_SCHEMA_V2))
+SPLIT_SCHEMA_V3["schema"] = "catalog_splits_v3"
+SPLIT_SCHEMA_V3["splits.csv"]["type"] += ("｜spinoff＝分拆（含合併分拆的重組調整）｜special_dividend＝特別股息｜stock_dividend＝股票股利"
+                                          "（後三種只來自人工查證清單，ratio＝還原倍數，split_from／split_to 可空）")
+SPLIT_SCHEMA_V3["splits.csv"]["source"] = ("polygon｜人工查證清單的來源（yahoo／sec／company／exchange／polygon_dividend）；"
+                                           "更正過的 Polygon 列＝polygon+<來源>")
+SPLIT_SCHEMA_V3["splits.csv"]["evidence"] = "Polygon 記錄 id｜清單附的公開記錄與實測跳變（「；」分隔）"
+SPLIT_SCHEMA_V3["splits.csv"]["confidence"] += "｜人工查證清單新增或更正＝high｜rejected＝查證為錯，不用於價格還原（note 寫原因）"
+SPLIT_SCHEMA_V3["限制"] = SPLIT_SCHEMA_V2["限制"] + [
+    "v4 起合併 BC catalog_src/split_events.csv：add＝表裡沒有的事件；override＝更正既有列 type／ratio；reject＝既有列標 rejected（不刪）",
+    "分拆的 ratio＝本地端實測跳變（與公開值差 ≤5% 才收）；拆股／股票股利用公開比例"]
+
+
+def _ratio_ok(v):
+    try:
+        return float(v) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def parse_events(text):
+    """清單 CSV → 列表；任何一列不合格就整次停（fail-closed）。純函數。"""
+    rd = csv.DictReader(io.StringIO(text))
+    if rd.fieldnames != EVENT_COLS:
+        raise SystemExit("⛔ split_events.csv 欄位不符：%s" % rd.fieldnames)
+    out, seen = [], set()
+    for i, e in enumerate(rd, 2):
+        bad = []
+        if e["action"] not in EVENT_ACTIONS:
+            bad.append("action")
+        if not (e["entity_id"] and e["symbol"] and re.match(r"^\d{4}-\d{2}-\d{2}$", e["ex_date"] or "")):
+            bad.append("entity_id/symbol/ex_date")
+        if not (e["evidence"] or "").strip():
+            bad.append("evidence 必填")
+        if e["action"] in ("add", "override"):
+            if e["type"] not in EVENT_TYPES:
+                bad.append("type")
+            if not _ratio_ok(e["ratio"]):
+                bad.append("ratio")
+            if not all(x in EVENT_SOURCES for x in (e["source"] or "-").split("+")):
+                bad.append("source")
+        elif not (e["note"] or "").strip():
+            bad.append("reject 要寫 note")
+        k = (e["entity_id"], norm(e["symbol"]), e["ex_date"])
+        if k in seen:
+            bad.append("同鍵重複")
+        seen.add(k)
+        if bad:
+            raise SystemExit("⛔ split_events.csv 第 %d 列不合格：%s" % (i, "、".join(bad)))
+        out.append(e)
+    return out
+
+
+def apply_events(rows, events, version, msyms=None):
+    """把清單套到拆股表。override／reject 必須恰好對到一列既有列；add 不得與既有列同鍵；違反就整次停。
+    msyms(symbol, ex_date, entity_id)→該日 MPQ 代號字串（新增列用；None＝沒有 mpq_symbols 欄）。回 (rows, stats)。純函數。"""
+    st = defaultdict(int)
+    out = [dict(r) for r in rows]
+    idx = defaultdict(list)
+    for r in out:
+        idx[(r["entity_id"], norm(r["symbol"]), r["ex_date"])].append(r)
+    for e in events:
+        k = (e["entity_id"], norm(e["symbol"]), e["ex_date"])
+        hit = idx.get(k, [])
+        if e["action"] == "add":
+            if hit:
+                raise SystemExit("⛔ split_events add 與既有列同鍵：%s %s %s" % k)
+            new = {"entity_id": e["entity_id"], "symbol": e["symbol"], "ex_date": e["ex_date"], "type": e["type"],
+                   "ratio": e["ratio"], "split_from": e["split_from"], "split_to": e["split_to"], "source": e["source"],
+                   "evidence": e["evidence"], "confidence": "high", "note": e["note"], "table_version": version}
+            if msyms is not None:
+                new["mpq_symbols"] = msyms(e["symbol"], e["ex_date"], e["entity_id"]) or ""
+            out.append(new)
+            idx[k].append(new)
+            st["add_" + e["type"]] += 1
+            continue
+        if len(hit) != 1:
+            raise SystemExit("⛔ split_events %s 對到 %d 列（要恰好 1 列）：%s %s %s" % ((e["action"], len(hit)) + k))
+        r = hit[0]
+        ev_note = e["note"] if e["action"] == "override" else "查證為錯：" + e["note"]
+        r.update(evidence="；".join(x for x in (r["evidence"], e["evidence"]) if x),
+                 note="；".join(x for x in (r["note"], ev_note) if x))
+        if e["action"] == "override":
+            src = r["source"].split("+")
+            r.update(type=e["type"], ratio=e["ratio"], confidence="high",
+                     source="+".join(src + [x for x in e["source"].split("+") if x not in src]))
+            st["override_" + e["type"]] += 1
+        else:
+            r["confidence"] = "rejected"
+            st["reject"] += 1
+    out.sort(key=lambda x: (x["entity_id"], x["ex_date"]))
+    return out, dict(st)
 
 
 # ── 交易日曆 ──
@@ -549,7 +666,11 @@ def main():
     hf = RawHF(write=not a.dry_run, repo=REPO, written_by="catalog_rules")
     files = hf.list_files()
     if a.step == "splits":
-        adds, summ = plan_splits(files, hf.read, fetch_polygon_splits())
+        ev = None
+        if os.path.exists(SPLIT_EVENTS_FILE):
+            with open(SPLIT_EVENTS_FILE, encoding="utf-8") as fh:
+                ev = fh.read()
+        adds, summ = plan_splits(files, hf.read, fetch_polygon_splits(), ev)
     elif a.step == "identity_mpq":
         import identity_mpq
         adds, summ = identity_mpq.plan(files, hf.read)
