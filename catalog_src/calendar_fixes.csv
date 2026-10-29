@@ -1,0 +1,3 @@
+date,type,open,close,reason,source,evidence
+2002-07-05,early_close,09:30,13:00,Day after Independence Day,exchange,NYSE 2002 holiday schedule: 1:00 p.m. close on Friday July 5；本地 15m（SPY/MSFT）13:00 後無正常盤 bar
+2003-12-26,early_close,09:30,13:00,Day after Christmas,exchange,NYSE 2003 holiday schedule: 1:00 p.m. close on Friday December 26；本地 15m（SPY/MSFT）13:00 後無正常盤 bar

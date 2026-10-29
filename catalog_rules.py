@@ -16,6 +16,8 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
 2026-10-29 拆股表 v4：合併人工查證清單 catalog_src/split_events.csv（add／override／reject，每列附公開來源；Jun 10-29 拍板三點，
   回應本地端暫扣序列需求 ADR-055）；新類型 spinoff／special_dividend／stock_dividend、confidence 加 rejected。
+2026-10-29 日曆 v2 格式（Jun 拍板方案 A，回應本地端首輪體檢 ADR-058）：本地端 CSV 不改；合併 catalog_src/calendar_fixes.csv
+  （只補 CSV 沒有的日子，source=fix）＋發布 catalog_src/halts.csv（停盤／延後開盤／已知數據缺口）。
 用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|identity_refresh [--dry-run] [--out _catalog_out] [--rule-years 2027]
 Python 3.9 相容。
 """
@@ -40,6 +42,8 @@ ID_DIR = CAT + "/identity"
 CAL_SRC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src",
                             "nyse_holidays_and_special_schedules_2000_2026.csv")
 SPLIT_EVENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "split_events.csv")
+CAL_FIXES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "calendar_fixes.csv")
+CAL_HALTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "halts.csv")
 HIGH_FROM = "2003-01-01"          # Polygon 拆股 2003 起完整；2000～2002 明顯不全（10-17 實測）
 FAR = "9999-12-31"
 REPO = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"   # 10-28 門禁修正：環境變數經門讀（同 raw_writer）
@@ -49,6 +53,13 @@ SPLIT_COLS = ["entity_id", "symbol", "ex_date", "type", "ratio", "split_from", "
 SPLIT_UNM_COLS = ["symbol", "ex_date", "split_from", "split_to", "reason"]
 CAL_COLS = ["date", "type", "open", "close", "reason", "source", "table_version"]
 XC_COLS = ["date", "csv_type", "rule_type", "note"]
+FIX_COLS = ["date", "type", "open", "close", "reason", "source", "evidence"]
+HALT_SRC_COLS = ["date", "start", "end", "scope", "kind", "source", "note"]
+HALT_COLS = HALT_SRC_COLS + ["table_version"]
+FIX_SOURCES = ("exchange", "sec", "press")
+HALT_SOURCES = FIX_SOURCES + ("local_data",)
+HALT_SCOPES = ("all", "nyse_listed", "nasdaq_listed")
+HALT_KINDS = ("halt", "delayed_open", "feed_gap")
 
 SPLIT_SCHEMA = {
     "schema": "catalog_splits_v1",
@@ -87,6 +98,17 @@ CAL_SCHEMA = {
         "reason": "原因", "source": "local_csv＝本地端日曆 CSV｜rule＝規則推算", "table_version": "本表版本號"},
     "未列的日子": "週一至週五未列＝09:30–16:00 正常交易日；週六日一律休市（不列）",
     "crosscheck.csv": "2000～2026 規則推算與 CSV 的差異（特殊休市、規則演變等），只報告不改"}
+CAL_SCHEMA_V2 = json.loads(json.dumps(CAL_SCHEMA))
+CAL_SCHEMA_V2["schema"] = "catalog_calendar_v2"
+CAL_SCHEMA_V2["calendar.csv"]["source"] += "｜fix＝數據中心補正（BC catalog_src/calendar_fixes.csv，每列附公開來源；只補 CSV 沒有的日子）"
+CAL_SCHEMA_V2["crosscheck.csv"] += "（不含 fix 列）"
+CAL_SCHEMA_V2["halts.csv"] = {
+    "date": "YYYY-MM-DD", "start": "開始 HH:MM 美東、不帶時區", "end": "結束 HH:MM 美東（start < end）",
+    "scope": "all＝全市場｜nyse_listed＝CTA 揭示（NYSE、NYSE Arca、NYSE American 上市）｜nasdaq_listed＝UTP 揭示（Nasdaq 上市）",
+    "kind": "halt＝停盤／熔斷｜delayed_open＝延後開盤｜feed_gap＝市場有交易但行情源或 MPQ 缺數據（補不回）",
+    "source": "exchange｜sec｜press｜local_data（「+」併列；local_data＝只有本地缺根佐證、查無公開記錄）",
+    "note": "說明與證據", "table_version": "本表版本號",
+    "用法": "與時段重疊的 15 分鐘缺根＝容忍，不判不合格；feed_gap＝已知缺口；時段＝報導時間或本地實際缺的時段"}
 
 
 # ── 共用 ──
@@ -608,36 +630,133 @@ def crosscheck(csv_rows, years):
     return out
 
 
-def calendar_rows(csv_text, rule_years, version):
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _src_dict(text, cols, what):
+    rd = csv.DictReader(io.StringIO(text.lstrip("﻿")))
+    if rd.fieldnames != cols:
+        raise SystemExit("⛔ %s 欄位不對：%s（應為 %s）" % (what, rd.fieldnames, ",".join(cols)))
+    return [{k: (v or "").strip() for k, v in r.items()} for r in rd]
+
+
+def _weekday(d, what):
+    try:
+        ok = dt.date.fromisoformat(d).weekday() < 5 and re.match(r"^\d{4}-\d{2}-\d{2}$", d)
+    except ValueError:
+        ok = False
+    if not ok:
+        raise SystemExit("⛔ %s 日期不對或不是平日：%s" % (what, d))
+
+
+def _sources(s, allowed, what, d):
+    if not s or any(x not in allowed for x in s.split("+")):
+        raise SystemExit("⛔ %s %s 來源不對：%s（允許 %s，「+」併列）" % (what, d, s, "｜".join(allowed)))
+
+
+def parse_calendar_fixes(text, csv_dates):
+    """數據中心日曆補正清單（10-29 方案 A）→ calendar.csv 列（source=fix）。只准補 CSV 沒有的日子；任何不對就整次失敗。"""
+    out = []
+    for r in _src_dict(text, FIX_COLS, "日曆補正"):
+        d = r["date"]
+        _weekday(d, "日曆補正")
+        if d in csv_dates:
+            raise SystemExit("⛔ 日曆補正 %s 與本地端 CSV 同日期，不准覆蓋 CSV" % d)
+        if r["type"] not in ("full_closure", "early_close", "delayed_open"):
+            raise SystemExit("⛔ 日曆補正 %s 類型不對：%s" % (d, r["type"]))
+        if r["type"] == "full_closure":
+            if r["open"] or r["close"]:
+                raise SystemExit("⛔ 日曆補正 %s 全日休市不該有時段" % d)
+        elif not (_HHMM.match(r["open"]) and _HHMM.match(r["close"]) and r["open"] < r["close"]):
+            raise SystemExit("⛔ 日曆補正 %s 時段不對：%s–%s" % (d, r["open"], r["close"]))
+        _sources(r["source"], FIX_SOURCES, "日曆補正", d)
+        if not r["reason"] or not r["evidence"]:
+            raise SystemExit("⛔ 日曆補正 %s 缺原因或證據" % d)
+        out.append({"date": d, "type": r["type"], "open": r["open"], "close": r["close"],
+                    "reason": r["reason"], "source": "fix"})
+    dates = [x["date"] for x in out]
+    if len(dates) != len(set(dates)):
+        raise SystemExit("⛔ 日曆補正有重複日期")
+    return out
+
+
+def parse_halts(text):
+    """停盤／已知缺口清單（10-29 方案 A）→ halts.csv 列。任何不對就整次失敗。"""
+    out = []
+    for r in _src_dict(text, HALT_SRC_COLS, "停盤清單"):
+        d = r["date"]
+        _weekday(d, "停盤清單")
+        if not (_HHMM.match(r["start"]) and _HHMM.match(r["end"]) and r["start"] < r["end"]):
+            raise SystemExit("⛔ 停盤清單 %s 時段不對：%s–%s" % (d, r["start"], r["end"]))
+        if r["scope"] not in HALT_SCOPES or r["kind"] not in HALT_KINDS:
+            raise SystemExit("⛔ 停盤清單 %s 範圍或類型不對：%s／%s" % (d, r["scope"], r["kind"]))
+        _sources(r["source"], HALT_SOURCES, "停盤清單", d)
+        if not r["note"]:
+            raise SystemExit("⛔ 停盤清單 %s 缺說明" % d)
+        out.append(r)
+    keys = [(x["date"], x["start"], x["scope"]) for x in out]
+    if len(keys) != len(set(keys)):
+        raise SystemExit("⛔ 停盤清單有重複（日期、開始、範圍）")
+    return sorted(out, key=lambda x: (x["date"], x["start"], x["scope"]))
+
+
+def calendar_rows(csv_text, rule_years, version, fixes_text=None, halts_text=None):
+    """回傳 (calendar 列, crosscheck 列, (CSV 首年, 末年), halts 列或 None, fix 列數)。"""
     csv_rows = parse_calendar_csv(csv_text)
     csv_years = sorted({int(r["date"][:4]) for r in csv_rows})
-    rows = list(csv_rows)
+    fixes = parse_calendar_fixes(fixes_text, {r["date"] for r in csv_rows}) if fixes_text is not None else []
+    rows = list(csv_rows) + fixes
     for y in rule_years:
         if y in csv_years:
             raise SystemExit("⛔ %d 年 CSV 已有，不用規則覆蓋" % y)
         rows += [dict(r, source="rule") for r in nyse_year(y)]
+    dates = [r["date"] for r in rows]
+    if len(dates) != len(set(dates)):
+        raise SystemExit("⛔ 日曆補正與規則推算撞日期")
+    halts = None
+    if halts_text is not None:
+        closed = {r["date"] for r in rows if r["type"] == "full_closure"}
+        halts = parse_halts(halts_text)
+        bad = sorted({h["date"] for h in halts} & closed)
+        if bad:
+            raise SystemExit("⛔ 停盤清單的日子是全日休市：%s" % ",".join(bad))
+        for h in halts:
+            h["table_version"] = version
     for r in rows:
         r["table_version"] = version
     rows.sort(key=lambda r: r["date"])
     xc = crosscheck(csv_rows, list(range(csv_years[0], csv_years[-1] + 1)))
-    return rows, xc, (csv_years[0], csv_years[-1])
+    return rows, xc, (csv_years[0], csv_years[-1]), halts, len(fixes)
 
 
-def plan_calendar(files, read, csv_text, rule_years):
+def plan_calendar(files, read, csv_text, rule_years, fixes_text=None, halts_text=None):
     last_v, last = last_manifest(files, read, CAL_DIR)
     ver = last_v + 1
-    rows, xc, (y0, y1) = calendar_rows(csv_text, rule_years, ver)
+    rows, xc, (y0, y1), halts, n_fix = calendar_rows(csv_text, rule_years, ver, fixes_text, halts_text)
+    v2 = fixes_text is not None or halts_text is not None
     csha = content_sha(rows, CAL_COLS)
+    if halts is not None:      # v2：只改停盤清單也要發新版
+        csha = _sha(csha + content_sha(halts, HALT_COLS))
     if last and last.get("content_sha256") == csha:
         return [], "沿用 v%d（內容未變）" % last_v
     f = {"calendar.csv": to_csv(rows, CAL_COLS), "crosscheck.csv": to_csv(xc, XC_COLS),
-         "schema.json": json.dumps(CAL_SCHEMA, ensure_ascii=False, indent=1)}
+         "schema.json": json.dumps(CAL_SCHEMA_V2 if v2 else CAL_SCHEMA, ensure_ascii=False, indent=1)}
+    if halts is not None:
+        f["halts.csv"] = to_csv(halts, HALT_COLS)
     n_rule = sum(1 for r in rows if r["source"] == "rule")
-    man = manifest(ver, "local_csv %d～%d（sha256 %s）＋rule %s" % (y0, y1, _sha(csv_text)[:12],
-                                                                   ",".join(map(str, rule_years)) or "無"), f,
-                   {"content_sha256": csha, "csv_years": [y0, y1], "rule_years": rule_years})
-    summ = "發布 v%d：%d 列（CSV %d～%d 共 %d、規則推算 %d）｜交叉核對差異 %d" % (
-        ver, len(rows), y0, y1, len(rows) - n_rule, n_rule, len(xc))
+    extra = {"content_sha256": csha, "csv_years": [y0, y1], "rule_years": rule_years}
+    if fixes_text is not None:
+        extra.update(fixes_sha256=_sha(fixes_text), fixes_rows=n_fix)
+    if halts is not None:
+        extra.update(halts_sha256=_sha(halts_text), halts_rows=len(halts))
+    man = manifest(ver, "local_csv %d～%d（sha256 %s）＋rule %s%s" % (
+        y0, y1, _sha(csv_text)[:12], ",".join(map(str, rule_years)) or "無",
+        "＋fix %d" % n_fix if fixes_text is not None else ""), f, extra)
+    summ = "發布 v%d：%d 列（CSV %d～%d 共 %d、補正 %d、規則推算 %d）｜交叉核對差異 %d" % (
+        ver, len(rows), y0, y1, len(rows) - n_rule - n_fix, n_fix, n_rule, len(xc))
+    if halts is not None:
+        summ += "｜停盤清單 %d（%s）" % (len(halts), "、".join(
+            "%s %d" % (k, sum(1 for h in halts if h["kind"] == k)) for k in HALT_KINDS))
     return emit(CAL_DIR, ver, f, man), summ
 
 
@@ -686,7 +805,14 @@ def main():
         with open(CAL_SRC_FILE, encoding="utf-8") as fh:
             src = fh.read()
         years = [int(y) for y in a.rule_years.split(",") if y.strip()]
-        adds, summ = plan_calendar(files, hf.read, src, years)
+        extra = []
+        for p in (CAL_FIXES_FILE, CAL_HALTS_FILE):
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as fh:
+                    extra.append(fh.read())
+            else:
+                extra.append(None)
+        adds, summ = plan_calendar(files, hf.read, src, years, *extra)
     for p, _ in adds:
         if p in files:
             raise SystemExit("⛔ %s 已存在，不覆蓋" % p)

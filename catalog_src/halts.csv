@@ -1,0 +1,14 @@
+date,start,end,scope,kind,source,note
+2000-04-11,09:30,09:45,nyse_listed,delayed_open,local_data,原因未證實：查無公開記錄；本地 NYSE 股與 SPY 缺 09:30 一根，疑 NYSE 延後開盤
+2000-09-14,14:45,15:00,all,feed_gap,local_data,原因未證實：查無公開記錄；SPY、QQQ、AAPL 等全缺 14:45 一根，市場不可能整體無成交
+2001-06-08,10:10,11:35,nyse_listed,halt,exchange+press,NYSE 軟體故障全所停盤，11:35 大部分恢復（少數股票停到 14:26）
+2001-11-15,09:30,09:45,nyse_listed,delayed_open,local_data,原因未證實：查無公開記錄；本地 NYSE 股缺 09:30 一根，像延後開盤也可能是數據
+2002-12-03,10:00,10:15,nasdaq_listed,feed_gap,local_data,原因未證實：查無公開記錄；AAPL、AMZN、CSCO 等 Nasdaq 股缺 10:00 一根
+2003-04-24,14:15,14:30,nasdaq_listed,feed_gap,local_data,原因未證實：查無公開記錄；Nasdaq 股缺 14:15 一根
+2013-08-22,12:14,15:25,nasdaq_listed,halt,exchange+sec+press,Nasdaq SIP（UTP）故障，Nasdaq 上市股停止交易，15:25 恢復
+2014-10-30,13:45,14:30,nyse_listed,feed_gap,press+local_data,CTA SIP 網路硬體故障約 13:07 起、市場未停；本地缺 13:45–14:15 三根（比報導晚約 40 分鐘，疑 MPQ 供應商恢復較慢）
+2020-03-09,09:34,09:49,all,halt,exchange+press,全市場一級熔斷（S&P 500 跌 7%）停 15 分鐘
+2020-03-12,09:35,09:50,all,halt,exchange+press,全市場一級熔斷（S&P 500 跌 7%）停 15 分鐘
+2020-03-16,09:30,09:45,all,halt,exchange+press,全市場一級熔斷，開盤即觸發，停 15 分鐘
+2020-03-18,12:56,13:11,all,halt,exchange+press,全市場一級熔斷（S&P 500 跌 7%）停 15 分鐘
+2024-06-03,10:30,11:30,nyse_listed,feed_gap,exchange+press+local_data,CTA SIP 價格帶軟體問題（約 11:45 修好），觸發部分 NYSE 股錯誤熔斷；市場有交易，本地 GLD、IVV、DIA 等也缺 10:30–11:15 四根

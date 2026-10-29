@@ -119,7 +119,8 @@ try:
 except SystemExit:
     check("認不得的 Type 報錯", True)
 
-cal, xc, yrs = CR.calendar_rows(CSV, [2027], 1)
+cal, xc, yrs, _h, _nf = CR.calendar_rows(CSV, [2027], 1)
+check("沒給清單＝halts None、補正 0", _h is None and _nf == 0)
 check("CSV 年份 2025～2026", yrs == (2025, 2026))
 check("2027 由規則補上", any(r["date"].startswith("2027") and r["source"] == "rule" for r in cal))
 check("CSV 內容原樣保留", sum(1 for r in cal if r["source"] == "local_csv") == 6)
@@ -141,6 +142,61 @@ adds2, summ2 = CR.plan_calendar(set(cstore), cstore.get, CSV, [2027])
 check("日曆內容沒變不發新版", adds2 == [], summ2)
 adds3, _ = CR.plan_calendar(set(cstore), cstore.get, CSV, [2027, 2028])
 check("加 2028 發 v2", adds3 and adds3[0][0].startswith("_catalog/calendar/v2/"))
+
+# ── 日曆 v2：補正清單＋停盤清單（2026-10-29 方案 A）──
+FIX = ("date,type,open,close,reason,source,evidence\n"
+       "2025-07-07,early_close,09:30,13:00,test early,exchange,NYSE notice x\n")
+HALT = ("date,start,end,scope,kind,source,note\n"
+        "2025-03-12,09:35,09:50,all,halt,exchange+press,熔斷\n"
+        "2025-02-03,10:30,11:30,nyse_listed,feed_gap,local_data,原因未證實\n")
+
+
+def raises(name, fn):
+    try:
+        fn()
+        check(name, False)
+    except SystemExit:
+        check(name, True)
+
+
+cal2, xc2, _, h2, nf2 = CR.calendar_rows(CSV, [2027], 3, FIX, HALT)
+fx = [r for r in cal2 if r["source"] == "fix"]
+check("補正列 source=fix、時段對", len(fx) == 1 and fx[0]["date"] == "2025-07-07" and fx[0]["close"] == "13:00" and nf2 == 1)
+check("CSV 列不變", sum(1 for r in cal2 if r["source"] == "local_csv") == 6)
+check("crosscheck 不受補正影響", xc2 == xc)
+check("halts 按日期排、帶版本", [h["date"] for h in h2] == ["2025-02-03", "2025-03-12"] and h2[0]["table_version"] == 3)
+raises("補正撞 CSV 日期報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("2025-07-07", "2025-07-03"), None))
+raises("補正撞規則年份報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("2025-07-07", "2027-01-01")
+                                                       .replace("early_close,09:30,13:00", "full_closure,,"), None))
+raises("補正週末報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("2025-07-07", "2025-07-05"), None))
+raises("補正缺證據報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace(",NYSE notice x", ","), None))
+raises("補正來源不在名單報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("exchange", "yahoo"), None))
+raises("補正時段倒置報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("09:30,13:00", "13:00,09:30"), None))
+raises("補正休市日帶時段報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("early_close", "full_closure"), None))
+raises("補正欄位不對報錯", lambda: CR.calendar_rows(CSV, [2027], 1, FIX.replace("evidence", "proof"), None))
+raises("停盤時段倒置報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT.replace("09:35,09:50", "09:50,09:35")))
+raises("停盤範圍不對報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT.replace("nyse_listed", "arca")))
+raises("停盤類型不對報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT.replace("feed_gap", "glitch")))
+raises("停盤來源不對報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT.replace("local_data", "yahoo")))
+raises("停盤缺說明報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT.replace(",原因未證實", ",")))
+raises("停盤落在休市日報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT.replace("2025-02-03", "2025-01-09")))
+raises("停盤重複報錯", lambda: CR.calendar_rows(CSV, [2027], 1, None, HALT + "2025-03-12,09:35,09:40,all,halt,press,x\n"))
+
+c2 = {}
+a1, _ = CR.plan_calendar(set(c2), c2.get, CSV, [2027], FIX, HALT)
+f1 = dict(a1)
+m1 = json.loads(f1["_catalog/calendar/v1/manifest.json"])
+check("v2 格式產出 halts.csv", "_catalog/calendar/v1/halts.csv" in f1 and len(rows(f1["_catalog/calendar/v1/halts.csv"])) == 2)
+check("schema 名 catalog_calendar_v2", json.loads(f1["_catalog/calendar/v1/schema.json"])["schema"] == "catalog_calendar_v2")
+check("manifest 記補正與停盤 sha／筆數", m1["fixes_sha256"] == CR._sha(FIX) and m1["fixes_rows"] == 1
+      and m1["halts_sha256"] == CR._sha(HALT) and m1["halts_rows"] == 2)
+check("manifest 檔案 sha 對得上", all(m1["files"][p.split("/")[-1]]["sha256"] == CR._sha(t) for p, t in a1[:-1]))
+for p, t in a1:
+    c2[p] = t
+a2, s2 = CR.plan_calendar(set(c2), c2.get, CSV, [2027], FIX, HALT)
+check("v2 內容沒變不發新版", a2 == [], s2)
+a3, _ = CR.plan_calendar(set(c2), c2.get, CSV, [2027], FIX, HALT.replace("原因未證實", "原因未證實（補註）"))
+check("只改停盤清單也發新版", a3 and a3[0][0].startswith("_catalog/calendar/v2/"))
 
 # ── 拆股表 v2：身份表 v2 有 mpq 列（2026-10-25 A8 重掛）──
 import hashlib  # noqa: E402
