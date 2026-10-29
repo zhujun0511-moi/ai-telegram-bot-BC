@@ -29,13 +29,17 @@ MAX_PER_RUN = 20                   # 每張單約 4～5 次 Polygon 呼叫 × 13
 SEC_LOOKBACK_DAYS = 120
 
 # 回覆類型（規格 §4）：kind → body 必填欄位。改名／下市必須附已發布的身份表版本。
+# 2026-10-28 本地端同意的規格補充：market_changed（本端：換交易所代號不變＝視同 source_gap 補抓接續；
+#   轉 OTC＝停止跟蹤、舊數據保留）；delisted 加選填 reason／successor（本端只記入 meta.json，successor 不自動跟蹤）。
 REPLY_KINDS = {
-    "renamed":    ("new_symbol", "effective", "identity_version"),
-    "delisted":   ("last_trading_day", "identity_version"),
-    "halted":     ("expected_resume",),          # 可為 None
-    "source_gap": ("trading_days",),
-    "unknown":    (),                            # note 必填
+    "renamed":        ("new_symbol", "effective", "identity_version"),
+    "delisted":       ("last_trading_day", "identity_version"),
+    "halted":         ("expected_resume",),      # 可為 None
+    "source_gap":     ("trading_days",),
+    "market_changed": ("new_market", "effective"),
+    "unknown":        (),                        # note 必填
 }
+DELISTED_REASONS = ("acquired", "merged", "spun_off", "deregistered", "exchange_delist")
 
 
 def now_et_iso():
@@ -66,6 +70,13 @@ def validate_reply(kind, body, note):
         return "trading_days 要是 YYYY-MM-DD 字串清單"
     if kind == "unknown" and not (note or "").strip():
         return "unknown 必須寫 note"
+    if kind == "delisted":
+        if body.get("reason") not in (None,) + DELISTED_REASONS:
+            return "delisted 的 reason 只能是 %s（或不填）" % "／".join(DELISTED_REASONS)
+        if body.get("successor") is not None and not (isinstance(body["successor"], str) and body["successor"].strip()):
+            return "delisted 的 successor 要是代號字串（或不填）"
+    if kind == "market_changed" and not (isinstance(body["new_market"], str) and body["new_market"].strip()):
+        return "market_changed 的 new_market 要寫交易所代碼（例 XNYS、XNAS）或 OTC"
     return None
 
 
@@ -109,7 +120,7 @@ def classify(ticket, facts):
         return "needs_human", "unsupported_type", "工單類型 %s 尚未支援自動預審" % ticket.get("type"), None
     if int(ticket.get("round") or 1) > 1:
         return "needs_human", "follow_up", "本地端追問（第 %s 輪），交人工" % ticket.get("round"), None
-    if new_days and ov and ov.get("active") is True:
+    if new_days and ov and ov.get("active") is True and (ov.get("market") or "stocks").lower() != "otc":
         return ("auto_replied", "source_gap", "Polygon 在 %s 之後有 %d 天日線" % (last or "?", len(new_days)),
                 ("source_gap", {"trading_days": new_days},
                  "Polygon 該代號這幾天有日線（不復權），代號仍現役；請補抓"))
@@ -138,8 +149,13 @@ def classify(ticket, facts):
         reasons.append("SEC Form 10-12B：可能有分拆上市")
     if forms & {"8-A12B", "8-A12G"}:
         reasons.append("SEC 8-A：有新的交易所註冊（可能換市場或新代號）")
-    if ov and ov.get("active") is True and not new_days:
-        reasons.append("Polygon 代號仍現役（%s）但那幾天沒有日線：可能停牌或轉場外" % (ov.get("primary_exchange") or "交易所不明"))
+    otc = bool(ov) and ((ov.get("market") or "").lower() == "otc" or (ov.get("primary_exchange") or "").upper().startswith("OTC"))
+    if otc:
+        reasons.append("Polygon 顯示代號現在在場外市場（market=%s、%s）" % (ov.get("market"), ov.get("primary_exchange") or "交易所不明"))
+        if suggest == "unknown":
+            suggest = "market_changed"
+    elif ov and ov.get("active") is True and not new_days:
+        reasons.append("Polygon 代號仍現役（%s）但那幾天沒有日線：可能停牌或換市場" % (ov.get("primary_exchange") or "交易所不明"))
         if suggest == "unknown":
             suggest = "halted_or_market_changed"
     if bars is None:

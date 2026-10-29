@@ -51,6 +51,9 @@ check("很久以前的下市／改名不算 → unknown", s == "unknown" and v =
 v, s, r, a = RT.classify(T(), {"overview": ACTIVE, "bar_dates": []})
 check("現役但沒日線 → 建議停牌或換市場、交人工", s == "halted_or_market_changed" and a is None, (v, s))
 
+v, s, r, a = RT.classify(T(), {"overview": dict(ACTIVE, market="otc", primary_exchange="OTCM"), "bar_dates": ["2026-10-27"]})
+check("代號轉到場外 → 建議 market_changed、不自動回 source_gap", s == "market_changed" and a is None, (v, s, r))
+
 v, s, r, a = RT.classify(T(), {"overview": None, "bar_dates": ["2026-10-27"]})
 check("代號現況查不到（狀態未知）時不自動回", v == "needs_human" and a is None, (v, s))
 
@@ -67,7 +70,16 @@ check("renamed 完整通過", RT.validate_reply("renamed", {"new_symbol": "X", "
 check("delisted 完整通過", RT.validate_reply("delisted", {"last_trading_day": "2026-10-26", "identity_version": 3}, "") is None)
 check("halted 的 expected_resume 可空", RT.validate_reply("halted", {"expected_resume": None}, "") is None)
 check("unknown 沒寫 note 擋下", RT.validate_reply("unknown", {}, " ") is not None)
-check("未同意的 market_changed 擋下", RT.validate_reply("market_changed", {"new_market": "OTC"}, "") is not None)
+check("market_changed 缺 effective 擋下", RT.validate_reply("market_changed", {"new_market": "OTC"}, "") is not None)
+check("market_changed 完整通過（本地端 10-28 同意）", RT.validate_reply("market_changed", {"new_market": "OTC", "effective": "2026-10-27"}, "") is None)
+check("market_changed new_market 空擋下", RT.validate_reply("market_changed", {"new_market": " ", "effective": "2026-10-27"}, "") is not None)
+check("delisted 帶 reason／successor 通過", RT.validate_reply("delisted", {"last_trading_day": "2026-10-26", "identity_version": 3,
+                                                                     "reason": "acquired", "successor": "XYZ"}, "") is None)
+check("delisted reason 不在清單擋下", RT.validate_reply("delisted", {"last_trading_day": "2026-10-26", "identity_version": 3,
+                                                                "reason": "bought"}, "") is not None)
+check("delisted successor 空字串擋下", RT.validate_reply("delisted", {"last_trading_day": "2026-10-26", "identity_version": 3,
+                                                                 "successor": ""}, "") is not None)
+check("不認得的類型擋下", RT.validate_reply("ack", {}, "x") is not None)
 check("source_gap 日期格式不對擋下", RT.validate_reply("source_gap", {"trading_days": ["10/27"]}, "") is not None)
 
 q, u = RT.reply_update(T(round_=2), "unknown", {}, "查無", "2026-10-29T08:00:00-04:00")
