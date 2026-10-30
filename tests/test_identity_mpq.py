@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import identity_mpq as IM   # noqa: E402
 
+IM.CUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_no_such_cuts.csv")   # 假資料不套真清單
 PASS, FAIL = [], []
 
 
@@ -181,6 +182,44 @@ check("超出容差 → 切段、後段自成一家、列 polygon_ended",
       [(r["entity_id"], r["from"], r["to"]) for r in r3 if r["source"] == "mpq"]
       == [("FIGI:DEAD", "2000-01-03", "2015-06-01"), ("MPQ:DEAD-DELISTED", "2015-06-01", "")]
       and [p["kind"] for p in p3] == ["polygon_ended"], (r3, p3))
+
+# ── 10-30 代號重用切分（ADR-060）──
+CUT_H = "symbol,asset,hole_before,hole_after,first_trade,source,evidence,note\n"
+CUT_T = CUT_H + "NEWCO,etf,2005-04-21,2020-09-10,2020-09-17,yahoo,Yahoo 上市 2020,\n"
+C_ID = [{"entity_id": "FIGI:NEW", "source": "polygon", "symbol": "NEWCO", "from": "", "to": ""}]
+C_SRC = [{"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2005-01-03", "d_last": "2005-04-21", "m5_first": "", "m5_last": ""},
+         {"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2020-09-10", "d_last": "2026-10-01", "m5_first": "", "m5_last": ""}]
+c_rows, c_ents, c_probs, c_st = IM.build(C_ID, C_SRC, 4, "2026-10-01", IM.parse_cuts(CUT_T))
+c_rows.sort(key=lambda r: r["from"])
+check("切分：洞前自成一家", c_rows[0]["entity_id"] == "MPQ:NEWCO:pre-2020-09-10" and c_rows[0]["evidence"] == "mpq_cut"
+      and c_rows[0]["to"] == "2020-09-10", c_rows[0])
+check("切分：洞後仍掛現任", c_rows[1]["entity_id"] == "FIGI:NEW" and c_rows[1]["from"] == "2020-09-10", c_rows[1])
+check("切分：entities 與 problems 有記", c_ents[0]["entity_id"] == "MPQ:NEWCO:pre-2020-09-10" and c_ents[0]["active"] == 0
+      and c_probs[0]["kind"] == "cut_reuse" and c_st["cut_reuse"] == 1, (c_ents, c_probs))
+c_one = [dict(C_SRC[0], d_last="2026-10-01")]
+c_rows2 = sorted(IM.build(C_ID, c_one, 4, "2026-10-01", IM.parse_cuts(CUT_T))[0], key=lambda r: r["from"])
+check("切分：連續一段從洞後首日切開", [r["entity_id"] for r in c_rows2] == ["MPQ:NEWCO:pre-2020-09-10", "FIGI:NEW"]
+      and c_rows2[1]["from"] == "2020-09-10", c_rows2)
+
+
+def c_fails(name, fn):
+    try:
+        fn()
+        check(name, False)
+    except SystemExit:
+        check(name, True)
+
+
+c_fails("切分：切不出後段要停", lambda: IM.build(C_ID, C_SRC[:1], 4, "2026-10-01", IM.parse_cuts(CUT_T)))
+c_fails("切分：切不出前段要停", lambda: IM.build(C_ID, C_SRC[1:], 4, "2026-10-01", IM.parse_cuts(CUT_T)))
+c_fails("切分：代號對不到要停", lambda: IM.build(C_ID, C_SRC, 4, "2026-10-01", IM.parse_cuts(CUT_T.replace("NEWCO", "OTHER"))))
+c_fails("切分：缺證據要停", lambda: IM.parse_cuts(CUT_T.replace("Yahoo 上市 2020", "")))
+c_fails("切分：來源不在名單要停", lambda: IM.parse_cuts(CUT_T.replace("yahoo", "reddit")))
+c_fails("切分：洞日期倒置要停", lambda: IM.parse_cuts(CUT_T.replace("2005-04-21", "2021-01-01")))
+c_fails("切分：重複要停", lambda: IM.parse_cuts(CUT_T + CUT_T[len(CUT_H):]))
+c_fails("切分：欄位不對要停", lambda: IM.parse_cuts("a,b\n"))
+check("真清單：格式全過", len(IM.parse_cuts(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "catalog_src",
+                                                     "identity_cuts.csv"), encoding="utf-8").read())) == 143)
 
 print("\n%d 通過、%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

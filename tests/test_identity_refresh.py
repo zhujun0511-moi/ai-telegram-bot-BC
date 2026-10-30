@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import catalog_publish as CP   # noqa: E402
 import identity_mpq as IM      # noqa: E402
 
+IM.CUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_no_such_cuts.csv")   # 假資料不套真清單
+
 PASS, FAIL = [], []
 
 

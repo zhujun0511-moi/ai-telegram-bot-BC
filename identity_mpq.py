@@ -15,12 +15,15 @@ identity_mpq.py — 身份表 v2：把 MPQ 代號掛到公司（2026-10-25 Jun �
 - v1 有「Polygon 標已下市但沒有結束日」的段（to＝0000-00-00）：該代號只有這一段＝照掛、to 空、note 註明；
   該代號還有別段＝邊界不明，自成一家＋polygon_ambiguous。
 - 兩個 MPQ 代號同時掛同一家公司（A4 同行情或代號重用，例 FEED）：只列 mpq_problems.csv，不處理（A4 不在本次範圍）。
+- 2026-10-30 代號重用切分（ADR-060）：catalog_src/identity_cuts.csv 列的代號，hole_after 以前的 MPQ 段不對 Polygon、自成一家
+  MPQ:{代號}:pre-{hole_after}。Polygon 沒有舊公司的記錄，不切的話前後兩家會併成現任公司一條序列。
 登記：MongoDB_Standard_v3 §六-D 10-25 條。寫入方＝catalog_rules.py --step identity_mpq。日誌只印筆數。Python 3.9 相容。
 """
 import csv
 import datetime as dt
 import io
 import json
+import os
 import re
 from collections import Counter, defaultdict
 
@@ -35,6 +38,9 @@ FAR = "9999-12-31"
 NODATE = "0000-00-00"   # 身份表 v1：Polygon 標已下市但沒有 delisted_utc（v1 problems.csv 有列）
 ID_COLS_V2 = ["entity_id", "source", "symbol", "from", "to", "evidence", "note", "table_version", "asset"]
 PROB_COLS = ["symbol", "asset", "from", "to", "kind", "detail"]
+CUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "identity_cuts.csv")
+CUT_COLS = ["symbol", "asset", "hole_before", "hole_after", "first_trade", "source", "evidence", "note"]
+CUT_SOURCES = ("yahoo", "sec", "company", "exchange")
 
 SCHEMA_V2 = dict(ID_SCHEMA)
 SCHEMA_V2["schema"] = "catalog_identity_v2"
@@ -44,13 +50,14 @@ SCHEMA_V2["identity.csv"].update({
     "symbol": "polygon 列＝Polygon 代號（點換成橫線，例 BRK-B）；mpq 列＝MPQ 原樣寫法（含 -DELISTED、點號，例 BRK.B）",
     "from": "polygon 列同 v1；mpq 列＝該段第一根 bar 的日子（被易主邊界切開時＝邊界日）",
     "to": "結束日（當天已不屬於這段）；mpq 列只在 Polygon 有結束日時填，空＝未判結束（不等於確定現役）",
-    "evidence": "polygon｜mpq_overlap＝代號＋日期對上 Polygon 段｜mpq_residue＝改名殘渣併入 X-DELISTED｜mpq_only＝對不上，自成一家",
+    "evidence": "polygon｜mpq_overlap＝代號＋日期對上 Polygon 段｜mpq_residue＝改名殘渣併入 X-DELISTED｜mpq_only＝對不上，自成一家｜"
+                "mpq_cut＝代號重用，洞前段切出、自成一家（MPQ:{代號}:pre-{洞後首日}，v4 起）",
     "asset": "mpq 列：stock／etf（A6，按段）；polygon 列空"})
 SCHEMA_V2["entities.csv"] = dict(ID_SCHEMA["entities.csv"])
 SCHEMA_V2["entities.csv"]["type"] = "Polygon 類型（CS、ETF…）；MPQ:{代號} 自成一家者＝mpq_stock／mpq_etf"
 SCHEMA_V2["mpq_problems.csv"] = {
     "kind": "no_polygon＝Polygon 身份表沒有可對的段｜polygon_ended＝MPQ 在 Polygon 結束日後還有 >10 天數據（那段自成一家）｜"
-            "delisted_polygon_active＝MPQ 標 -DELISTED、Polygon 該代號只剩現役段（不掛，自成一家）｜split_by_polygon＝一條 MPQ 序列被 Polygon 易主邊界切成多家（照切，供人工看）｜polygon_ambiguous＝Polygon 該代號多段且有段沒結束日，分不出邊界（自成一家）｜same_entity_overlap＝兩個 MPQ 代號同時掛同一家",
+            "delisted_polygon_active＝MPQ 標 -DELISTED、Polygon 該代號只剩現役段（不掛，自成一家）｜split_by_polygon＝一條 MPQ 序列被 Polygon 易主邊界切成多家（照切，供人工看）｜polygon_ambiguous＝Polygon 該代號多段且有段沒結束日，分不出邊界（自成一家）｜same_entity_overlap＝兩個 MPQ 代號同時掛同一家｜cut_reuse＝人工清單切出的洞前段（代號重用）",
     "detail": "說明"}
 SCHEMA_V2["查詢"] = ("polygon：某代號某天＝該 symbol 中第一筆 to 晚於該天（或 to 空）的行；"
                    "mpq：用 (symbol, asset) 查，同一代號 stock 與 etf 的段可時間重疊")
@@ -104,6 +111,63 @@ def mpq_segments(src_rows):
                 cur = dict(x)
         out.append(cur)
     return out, merged
+
+
+def parse_cuts(text):
+    """代號重用切分清單 → {(symbol, asset): 列}。任何不對就整次失敗。"""
+    rd = csv.DictReader(io.StringIO((text or "").lstrip("﻿")))
+    if rd.fieldnames != CUT_COLS:
+        raise SystemExit("⛔ identity_cuts 欄位不對：%s" % rd.fieldnames)
+    out = {}
+    for r in rd:
+        k = (r["symbol"], r["asset"])
+        for f in ("hole_before", "hole_after", "first_trade"):
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", r[f] or ""):
+                raise SystemExit("⛔ identity_cuts %s %s 日期不對" % (k, f))
+        if r["asset"] not in ("stock", "etf") or r["hole_before"] >= r["hole_after"]:
+            raise SystemExit("⛔ identity_cuts %s 類別或洞的日期不對" % (k,))
+        if not r["source"] or any(x not in CUT_SOURCES for x in r["source"].split("+")) or not (r["evidence"] or "").strip():
+            raise SystemExit("⛔ identity_cuts %s 缺來源或證據" % (k,))
+        if k in out:
+            raise SystemExit("⛔ identity_cuts 重複：%s" % (k,))
+        out[k] = r
+    return out
+
+
+def apply_cuts(segs, cuts):
+    """把段切在 hole_after：之前的標 cut（自成一家）。每列清單都要切得出前段和後段，否則整次失敗。回 (段, 切出的段數)。"""
+    out, n, pre, post = [], 0, set(), set()
+    for s in segs:
+        k = (s["symbol"], s["asset"])
+        c = cuts.get(k)
+        if c is None:
+            out.append(s)
+        elif s["end"] < c["hole_after"]:
+            out.append(dict(s, cut=c))
+            pre.add(k)
+            n += 1
+        elif s["start"] >= c["hole_after"]:
+            out.append(s)
+            post.add(k)
+        else:
+            out.append(dict(s, end=_prev_day(c["hole_after"]), cut=c))
+            out.append(dict(s, start=c["hole_after"]))
+            pre.add(k)
+            post.add(k)
+            n += 1
+    bad = sorted(k for k in cuts if k not in pre or k not in post)
+    if bad:
+        raise SystemExit("⛔ identity_cuts %d 列切不出前後兩段：%s" % (len(bad), bad[:10]))
+    return out, n
+
+
+def load_cuts():
+    """讀清單：回 (內容, 解析結果)；沒有檔＝(None, {})。"""
+    if not os.path.exists(CUTS_FILE):
+        return None, {}
+    with open(CUTS_FILE, encoding="utf-8") as fh:
+        txt = fh.read()
+    return txt, parse_cuts(txt)
 
 
 class PolyIndex:
@@ -161,7 +225,7 @@ def _absorb(ps):
     return ps
 
 
-def build(id_rows, src_rows, version, cal_end=None):
+def build(id_rows, src_rows, version, cal_end=None, cuts=None):
     """純函數：Polygon 身份段＋MPQ 代號摘要 → (mpq 身份列, 新增 entities, problems, stats)。"""
     idx = PolyIndex(id_rows)
     segs, merged = mpq_segments(src_rows)
@@ -169,8 +233,22 @@ def build(id_rows, src_rows, version, cal_end=None):
     rows, probs = [], []
     stats = Counter(merged_segments=merged, mpq_segments=len(segs))
     pending_residue = []
+    new_ents = {}
+    if cuts:
+        segs, stats["cut_segments"] = apply_cuts(segs, cuts)
     for s in segs:
         sym, asset = s["symbol"], s["asset"]
+        if s.get("cut"):                   # 代號重用：洞前是別家，不對 Polygon（Polygon 沒有舊公司的記錄，對了就併進現任）
+            c = s["cut"]
+            eid = "MPQ:%s:pre-%s" % (sym, c["hole_after"])
+            rows.append({"entity_id": eid, "source": "mpq", "symbol": sym, "from": s["start"], "to": c["hole_after"],
+                         "evidence": "mpq_cut", "note": c["evidence"], "table_version": version, "asset": asset,
+                         "_last": s["end"]})
+            probs.append({"symbol": sym, "asset": asset, "from": s["start"], "to": c["hole_after"], "kind": "cut_reuse",
+                          "detail": c["evidence"] + ("；" + c["note"] if c["note"] else "")})
+            stats["cut_reuse"] += 1
+            new_ents[eid] = {"entity_id": eid, "name": "", "type": "mpq_" + asset, "active": 0}
+            continue
         delisted = sym.upper().endswith(SUFFIX)
         ps = _absorb(idx.pieces(base_symbol(sym), s["start"], s["end"]))
         for k, p in enumerate(ps):
@@ -212,7 +290,6 @@ def build(id_rows, src_rows, version, cal_end=None):
     by_sym = defaultdict(list)
     for r in rows:
         by_sym[(r["symbol"].upper(), r["asset"])].append(r)
-    new_ents = {}
     pending_residue.sort(key=lambda x: not x[0]["symbol"].upper().endswith(SUFFIX))   # X-DELISTED 先自成一家，殘渣才併得上
     for r, kind, prev in pending_residue:
         xd = None
@@ -293,11 +370,12 @@ def _mpq_input(files, read):
 def plan(files, read):
     """決定要發布什麼：回 (adds, 摘要)。純計算，不寫東西。"""
     src_v, src_man, src_txt = _mpq_input(files, read)
+    cuts_txt, cuts = load_cuts()
     id_v, id_man = _latest(files, read, ID_DIR)
     if not id_v:
         raise SystemExit("⛔ 找不到 _catalog/identity 已發布版本")
     if id_man.get("mpq_symbols"):            # 最新版已含 MPQ：基底取它所根據的 Polygon 版
-        if id_man["mpq_symbols"] == "%s/v%d" % (SRC_DIR, src_v):
+        if id_man["mpq_symbols"] == "%s/v%d" % (SRC_DIR, src_v) and id_man.get("cuts_sha256") == (_sha(cuts_txt) if cuts_txt else None):
             return [], "沿用 v%d（輸入未變）" % id_v
         base_v = int(id_man["polygon_base_version"])
     else:
@@ -307,7 +385,7 @@ def plan(files, read):
     poly = [r for r in id_rows if (r.get("source") or "polygon") == "polygon"]
     ver = id_v + 1
     mrows, ments, probs, stats = build(poly, list(csv.DictReader(io.StringIO(src_txt, newline=""))), ver,
-                                       (src_man.get("calendar") or [None, None])[1])
+                                       (src_man.get("calendar") or [None, None])[1], cuts)
     for r in poly:
         r["table_version"] = ver
         r.setdefault("asset", "")
@@ -330,6 +408,8 @@ def plan(files, read):
            "mpq_symbols_sha256": src_man["files"]["mpq_symbols.csv"]["sha256"],
            "rules": {"tol_days": TOL, "merge_gap_days": MERGE_GAP}, "stats": stats,
            "note": "v2 起含 source=mpq（A1／A2／A3／A6／A7）；A4 去重、A5 改名拼接不在本版"}
+    if cuts_txt:
+        man.update(cuts_sha256=_sha(cuts_txt), cuts_rows=len(cuts))
     d = "%s/v%d" % (ID_DIR, ver)
     adds = [("%s/%s" % (d, k), v) for k, v in f.items()]
     adds.append((d + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1)))   # manifest 最後
@@ -338,6 +418,8 @@ def plan(files, read):
         ver, stats["mpq_symbols"], stats["mpq_rows"], stats.get("overlap", 0), stats.get("residue", 0),
         stats["mpq_only_entities"], stats.get("no_polygon", 0), stats.get("polygon_ended", 0),
         stats.get("polygon_ambiguous", 0), stats.get("delisted_polygon_active", 0), stats.get("split_by_polygon", 0), stats.get("same_entity_overlap", 0), stats["merged_segments"], base_v)
+    if cuts_txt:
+        summ += "｜代號重用切分 %d 支、切出 %d 段" % (len(cuts), stats.get("cut_reuse", 0))
     return adds, summ
 
 
@@ -372,8 +454,10 @@ def plan_refresh(files, read):
         raise SystemExit("⛔ 找不到 %s 來源（先跑 ticker_identity.py）" % TI.OUT_PREFIX)
     poly_source = "%s/%s" % (TI.OUT_PREFIX, id_src)
     src_v, src_man, src_txt = _mpq_input(files, read)
+    cuts_txt, cuts = load_cuts()
     id_v, id_man = _latest(files, read, ID_DIR)
-    if id_man and poly_source_of(read, id_man) == poly_source and id_man.get("mpq_symbols") == "%s/v%d" % (SRC_DIR, src_v):
+    if (id_man and poly_source_of(read, id_man) == poly_source and id_man.get("mpq_symbols") == "%s/v%d" % (SRC_DIR, src_v)
+            and id_man.get("cuts_sha256") == (_sha(cuts_txt) if cuts_txt else None)):
         return [], "沿用 v%d（Polygon 來源 %s 與 MPQ 輸入都未變）" % (id_v, id_src)
     ver = id_v + 1
     ident = list(csv.DictReader(io.StringIO(read("%s/identity.csv" % poly_source))))
@@ -382,7 +466,7 @@ def plan_refresh(files, read):
     for r in poly:
         r["asset"] = ""
     mrows, ments, probs, stats = build(poly, list(csv.DictReader(io.StringIO(src_txt, newline=""))), ver,
-                                       (src_man.get("calendar") or [None, None])[1])
+                                       (src_man.get("calendar") or [None, None])[1], cuts)
     f = {"identity.csv": to_csv(poly + mrows, ID_COLS_V2),
          "entities.csv": to_csv(entity_rows(ident) + ments, ENT_COLS)}
     for name in ("renames.csv", "reuse.csv", "problems.csv"):
@@ -406,6 +490,8 @@ def plan_refresh(files, read):
            "mpq_symbols_sha256": src_man["files"]["mpq_symbols.csv"]["sha256"],
            "rules": {"tol_days": TOL, "merge_gap_days": MERGE_GAP}, "stats": stats, "diff_vs_prev": diff,
            "note": "identity_refresh（2026-10-28）：Polygon 重建＋併 MPQ 一次發版，不產生不含 MPQ 的中間版；規則同 v2"}
+    if cuts_txt:
+        man.update(cuts_sha256=_sha(cuts_txt), cuts_rows=len(cuts))
     d = "%s/v%d" % (ID_DIR, ver)
     adds = [("%s/%s" % (d, k), v) for k, v in f.items()]
     adds.append((d + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1)))   # manifest 最後
