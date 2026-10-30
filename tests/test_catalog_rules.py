@@ -3,6 +3,7 @@
 test_catalog_rules.py — 拆股表、交易日曆發布（catalog_rules.py）離線測試：
 假的 dataset 與假的 Polygon 記錄（記憶體裡），不連網。用法：python tests/test_catalog_rules.py
 """
+import collections
 import csv
 import io
 import json
@@ -327,6 +328,25 @@ check("清單：manifest 記 events", e_man["events_sha256"] == CR._sha(EV) and 
       and e_man["events"] == {"add_split": 1, "add_spinoff": 1, "override_stock_dividend": 1, "reject": 1}, e_man.get("events"))
 check("清單：摘要有數", "新增 2、更正 1、駁回 1" in e_summ, e_summ)
 check("清單：不給清單＝照 v3 行為", CR.plan_splits(set(g2), g2.get, G_RAW)[0] == [])
+
+# ── 回歸（10-30）：同事件兩筆、比例寫法不同只留一筆；比例不同（組合式拆股）不去重 ──
+D_RAW = [
+    {"id": "E2", "ticker": "NVDA", "execution_date": "2011-09-16", "split_from": 20, "split_to": 21},
+    {"id": "E1", "ticker": "NVDA", "execution_date": "2011-09-16", "split_from": 1, "split_to": 1.05},
+    {"id": "P1", "ticker": "FB", "execution_date": "2012-09-29", "split_from": 10, "split_to": 11},
+    {"id": "P2", "ticker": "FB", "execution_date": "2012-09-29", "split_from": 100, "split_to": 110},
+    {"id": "C1", "ticker": "BRK.B", "execution_date": "2019-04-16", "split_from": 8000, "split_to": 1},
+    {"id": "C2", "ticker": "BRK.B", "execution_date": "2019-04-16", "split_from": 1, "split_to": 800},
+]
+d_rows, _, d_st = CR.split_rows(D_RAW, rows(IDENT), 1)
+d_by = collections.Counter(x["symbol"] for x in d_rows)
+check("去重：20:21 與 1:1.05 只留一筆", d_by["NVDA"] == 1, d_rows)
+check("去重：10:11 與 100:110 只留一筆", d_by["FB"] == 1, d_rows)
+check("去重：一拆一併不去重", d_by["BRK.B"] == 2, d_rows)
+check("去重：dup 計數＝2", d_st.get("dup") == 2, d_st)
+check("去重：留 id 最小者、與回傳順序無關",
+      next(x for x in d_rows if x["symbol"] == "NVDA")["evidence"] == "E1"
+      and CR.split_rows(list(reversed(D_RAW)), rows(IDENT), 1)[0] == d_rows)
 
 # ── 回歸（10-30）：表裡有人工新增列之後「再發一版」不得撞鍵（守衛基準只收 Polygon 來源列）──
 g3 = dict(g2)

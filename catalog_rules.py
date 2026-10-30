@@ -261,13 +261,13 @@ def split_rows(raw, id_rows, version, src_rows=None, keep_notes=None):
     midx = MpqIndex(id_rows, src_rows) if src_rows is not None else None
     rows, unm, seen = [], [], set()
     stats = defaultdict(int)
-    for r in sorted(raw, key=lambda x: (x.get("execution_date") or "", norm(x.get("ticker")))):
+    for r in sorted(raw, key=lambda x: (x.get("execution_date") or "", norm(x.get("ticker")), str(x.get("id") or ""))):
         sym, d = (r.get("ticker") or "").strip(), (r.get("execution_date") or "").strip()
         sf, st = r.get("split_from"), r.get("split_to")
         if not sym or not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
             stats["bad"] += 1
             continue
-        key = (norm(sym), d, str(sf), str(st))
+        key = (norm(sym), d, _rkey(sf, st))      # 10-30：比約分後比例，20:21 與 1:1.05 算同一筆（否則累乘兩次）
         if key in seen:
             stats["dup"] += 1
             continue
