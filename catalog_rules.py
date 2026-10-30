@@ -324,6 +324,7 @@ def _rkey(sf, st):
 
 def baseline(files, read):
     """各（代號, 除權日）最早出現那一版的 Polygon 原值（splits.csv＋unmapped.csv）。
+    只收 Polygon 來源列：v4 起表裡有人工清單新增的列（source＝yahoo 等），它們不是 Polygon 記錄，算進來會被守衛補回、與清單撞鍵。
     回 {鍵: {"version": v, "recs": [{ticker, execution_date, split_from, split_to, id}]}}。"""
     base = {}
     for v in published(files, SPLIT_DIR):
@@ -331,6 +332,8 @@ def baseline(files, read):
         for name, idcol in (("splits.csv", "evidence"), ("unmapped.csv", None)):
             txt = read("%s/v%d/%s" % (SPLIT_DIR, v, name))
             for r in csv.DictReader(io.StringIO(txt or "")):
+                if (r.get("source") or "polygon").split("+")[0] != "polygon":
+                    continue
                 seen[(norm(r["symbol"]), r["ex_date"])].append(
                     {"ticker": r["symbol"], "execution_date": r["ex_date"], "split_from": r["split_from"],
                      "split_to": r["split_to"], "id": r.get(idcol) or "" if idcol else ""})

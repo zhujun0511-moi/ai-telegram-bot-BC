@@ -328,6 +328,27 @@ check("清單：manifest 記 events", e_man["events_sha256"] == CR._sha(EV) and 
 check("清單：摘要有數", "新增 2、更正 1、駁回 1" in e_summ, e_summ)
 check("清單：不給清單＝照 v3 行為", CR.plan_splits(set(g2), g2.get, G_RAW)[0] == [])
 
+# ── 回歸（10-30）：表裡有人工新增列之後「再發一版」不得撞鍵（守衛基準只收 Polygon 來源列）──
+g3 = dict(g2)
+g3.update(e)
+r_base = CR.baseline(set(g3), g3.get)
+check("再發一版：人工新增列不進基準", ("NVDA", "2000-06-27") not in r_base and ("META", "2024-01-02") not in r_base)
+check("再發一版：override 過的 polygon+yahoo 列仍在基準", ("BALL", "2004-08-24") in r_base)
+r_adds, r_summ = CR.plan_splits(set(g3), g3.get, G_RAW, EV)
+check("再發一版：同輸入不撞鍵、內容未變不發新版", r_adds == [] and "沿用 v4" in r_summ, r_summ)
+r_new = G_RAW + [{"id": "n2", "ticker": "NVDA", "execution_date": "2021-07-20", "split_from": 1, "split_to": 4}]
+r_adds2, r_summ2 = CR.plan_splits(set(g3), g3.get, r_new, EV)
+r = dict(r_adds2)
+r_rows = rows(r.get("_catalog/splits/v5/splits.csv", ""))
+r_sp = {(x["symbol"], x["ex_date"]): x for x in r_rows}
+check("再發一版：有新事件發 v5", ("NVDA", "2021-07-20") in r_sp, r_summ2)
+check("再發一版：人工新增列只有一筆、內容不變", sum(1 for x in r_rows if (x["symbol"], x["ex_date"]) == ("NVDA", "2000-06-27")) == 1
+      and r_sp[("NVDA", "2000-06-27")]["source"] == "yahoo" and r_sp[("META", "2024-01-02")]["type"] == "spinoff")
+check("再發一版：人工新增列不算 Polygon 刪除", not any(c["symbol"] == "META" or c["ex_date"] == "2000-06-27"
+                                             for c in rows(r["_catalog/splits/v5/changes.csv"])))
+check("再發一版：override 不重複疊加 evidence", r_sp[("BALL", "2004-08-24")]["evidence"].count("Yahoo 100:105") == 1
+      and r_sp[("BALL", "2004-08-24")]["type"] == "stock_dividend", r_sp[("BALL", "2004-08-24")])
+
 
 def fails(text, name):
     try:
