@@ -5,6 +5,8 @@ ticker_identity.py — 身份時間表（2026-10-18 Jun：預先處理「公司�
 以「股份」為主鍵，不以代號（10-18 第 2 版）：entity＝FIGI:{share_class_figi}（優先；同一股份跨改名不變、
   不同股份類別不同，例 GOOG／GOOGL 分開）→ 沒有 FIGI 但該 CIK 只有一種股份＝借用那個 FIGI → CIK:{10 碼} → NAME:{名稱}。
   權證、權利、單位、優先股（WARRANT／RIGHT／UNIT／PFD）不進時間表（第 1 版把 SPAC 的 ABC／ABCU／ABCW 算成改名）。
+  10-30 第 3 版：公司債、結構型商品也不進表（SP 類型＋名稱規則，見 skip_reason）：它們沒有自己的 FIGI，
+  借用後被掛到普通股，本地端拿債券價對股票價（暫扣序列 identity_mismatch）。
   - 同一 entity 用過多個代號＝改名（FB 已下市紀錄的 CIK＝META 現役的 CIK）
   - 同一代號屬於多個 entity＝易主（舊公司在 delisted_utc 那天結束，之後才是新公司）
 登記：MongoDB_Standard_v3 §六-D `swing_ai/identity/{日期}/`。來源：Polygon 現役＋已下市總表、SEC 代號→CIK（經門 courier/）。
@@ -15,6 +17,7 @@ import csv
 import datetime as dt
 import io
 import json
+import re
 from collections import Counter, defaultdict
 
 REPO = "zhujun0511-AI/ai-telegram-bot-dataset"
@@ -27,6 +30,24 @@ def norm(t):
 
 
 SKIP_TYPES = ("WARRANT", "RIGHT", "UNIT", "PFD")
+_PCT = re.compile(r"\d+(\.\d+)?\s?%")
+_DEBT = re.compile(r"\b(NOTES?|NTS|DEBENTURES?|BONDS?|DUE|SUBORDINATED|PERPETUAL|CAPITAL SECURITIES|PREFERRED|PREFERENCE"
+                   r"|PFD|PRF|DEPOSITARY|QUIPS|TOPRS|TRUPS)\b", re.I)
+_PREF = re.compile(r"\b(PREFERRED|PREFERENCE|PFD)\b", re.I)
+
+
+def skip_reason(r):
+    """不進時間表的原因；None＝進表。name 規則：Polygon 會把公司債標成 CS／ETF 或不標類型。"""
+    ty, nm = r.get("type") or "", r.get("name") or ""
+    if ty in SKIP_TYPES:
+        return "type"
+    if ty == "SP":
+        return "sp"
+    if ty in ("", "CS", "ETF") and _PCT.search(nm) and _DEBT.search(nm):
+        return "name"
+    if not ty and _PREF.search(nm):
+        return "name"
+    return None
 
 
 def _cik(r):
@@ -56,12 +77,12 @@ def build(active_rows, inactive_rows, sec_t2c=None):
     recs, problems = [], []
     cik2figi = defaultdict(set)
     for r in list(active_rows) + list(inactive_rows):
-        if r.get("type") not in SKIP_TYPES and r.get("share_class_figi") and _cik(r) is not None:
+        if not skip_reason(r) and r.get("share_class_figi") and _cik(r) is not None:
             cik2figi[_cik(r)].add(r["share_class_figi"])
     for active, rows in ((True, active_rows), (False, inactive_rows)):
         for r in rows:
             t = norm(r.get("ticker"))
-            if not t or r.get("type") in SKIP_TYPES:
+            if not t or skip_reason(r):
                 continue
             ent = entity_of(r, cik2figi)
             if ent is None:
@@ -160,6 +181,7 @@ def main():
         raise SystemExit("⛔ Polygon 總表讀取失敗")
     t2c = PD.sec_company_tickers() if PD.has_sec_contact() else None
     ident, ren, reu, prob = build(act, ina, t2c)
+    skipped = Counter(skip_reason(r) for r in list(act) + list(ina))
 
     def to_csv(rows, cols):
         b = io.StringIO()
@@ -186,7 +208,8 @@ def main():
            "inactive_rows": len(ina), "identity_rows": len(ident), "entities": len({x["entity"] for x in ident}),
            "renames": len(ren), "reuse": len(reu), "problems": len(prob),
            "entity_kinds": dict(Counter(x["entity"].split(":")[0] for x in ident)), "version": base.split("/")[-1],
-           "build": "v2：股份 FIGI 主鍵、排除 WARRANT／RIGHT／UNIT／PFD、同時現役不算改名"}
+           "skipped_debt_pref": {"sp": skipped.get("sp", 0), "name": skipped.get("name", 0)},
+           "build": "v3：股份 FIGI 主鍵、排除 WARRANT／RIGHT／UNIT／PFD／SP 與名稱像債券優先股者、同時現役不算改名"}
     hf.add(base + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1))
     n = hf.flush(a.out, "ticker identity %s" % today)
     print("身份時間表：現役 %d、已下市 %d 筆 → %d 段、%d 家公司｜改名 %d｜易主 %d｜問題 %d｜寫出 %d 個檔（%s）" % (

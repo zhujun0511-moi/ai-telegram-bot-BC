@@ -91,5 +91,47 @@ check("第 2 版：單位、權證不進時間表（ABCDU、ABCDW、SPAC1W 都�
 check("第 2 版：SPAC 的 ABCD／ABCDU／ABCDW 不算改名", not any("ABCD" in x for pr in pairs for x in pr), pairs)
 check("第 2 版：改名總數＝2（FB→META、SPAC1→XYZ）", len(r2) == 2, r2)
 
+# ── 10-30 第 3 版：債券／優先股不進表、不借用普通股 FIGI ──
+act3 = [
+    {"ticker": "DTE", "name": "DTE Energy Company", "type": "CS", "cik": "0000936340", "share_class_figi": "BBGDTE"},
+    {"ticker": "DTG", "name": "DTE Energy Company 2021 Series E 4.375% Junior Subordinated Debentures", "type": "SP",
+     "cik": "0000936340"},
+    {"ticker": "RILY", "name": "BRC Group Holdings, Inc. Common Stock", "type": "CS", "cik": "0001464790",
+     "share_class_figi": "BBGRILY"},
+    {"ticker": "RILYG", "name": "BRC Group Holdings, Inc. 5.00% Senior Notes due 2026", "type": "CS",
+     "cik": "0001464790", "share_class_figi": "BBGRILYG"},
+    {"ticker": "RILYW", "name": "BRC Group W.I.", "type": "", "cik": "0001464790"},
+    {"ticker": "GECCM", "name": "Great Elm Capital Corp. 6.75% Notes Due 2025", "type": "ETF", "cik": "0001675033"},
+    {"ticker": "SPY", "name": "SPDR S&P 500 ETF Trust", "type": "ETF", "cik": "0000884394", "share_class_figi": "BBGSPY"},
+    {"ticker": "BUFR", "name": "FT Vest 10% Buffer ETF", "type": "ETF", "share_class_figi": "BBGBUFR"},
+    {"ticker": "PFF", "name": "iShares Preferred and Income Securities ETF", "type": "ETF", "share_class_figi": "BBGPFF"},
+    {"ticker": "DUEX", "name": "Due West Holdings Inc", "type": "CS", "share_class_figi": "BBGDUEX"},
+    {"ticker": "NOTE", "name": "Noteworthy 5% Growth Corp", "type": "CS", "share_class_figi": "BBGNOTE"},
+]
+ina3 = [
+    {"ticker": "EBAY-L", "name": "EBAY INC 6.0% DUE 02/01/2056 (DE)", "cik": "0001065088",
+     "delisted_utc": "2021-01-01T00:00:00Z"},
+    {"ticker": "HBHC-P", "name": "HANCOCK HOLDING CO PFD CONV PFD SER", "type": None, "cik": "0000750577",
+     "delisted_utc": "2015-01-01T00:00:00Z"},
+    {"ticker": "HEPS", "name": "HAWAIIAN ELEC IND 8.36%(TOPRS)", "cik": "0000354707",
+     "delisted_utc": "2005-01-01T00:00:00Z"},
+    {"ticker": "CDW", "name": "CENDANT CORPORATION COM EX-DISTRIBUTION W.I.", "cik": "0000723612",
+     "delisted_utc": "2006-01-01T00:00:00Z"},
+]
+for t3, want in (("DTG", "sp"), ("RILYG", "name"), ("GECCM", "name")):
+    check("跳過 %s" % t3, TI.skip_reason(next(r for r in act3 if r["ticker"] == t3)) == want)
+check("空類型債券跳過", TI.skip_reason(ina3[0]) == "name")
+check("type None 優先股跳過", TI.skip_reason(ina3[1]) == "name")
+check("TOPRS 跳過", TI.skip_reason(ina3[2]) == "name")
+check("W.I. 不受影響（不在這次範圍）", TI.skip_reason(ina3[3]) is None)
+check("原有 PFD 類型仍跳過", TI.skip_reason({"ticker": "X", "type": "PFD", "name": "X"}) == "type")
+for t3 in ("DTE", "SPY", "BUFR", "PFF", "DUEX", "NOTE"):
+    check("不誤殺 %s" % t3, TI.skip_reason(next(r for r in act3 if r["ticker"] == t3)) is None)
+id3 = TI.build(act3, ina3)[0]
+t3s = {x["ticker"]: x for x in id3}
+check("債券不進表", not ({"DTG", "RILYG", "GECCM", "EBAY-L", "HBHC-P", "HEPS"} & set(t3s)), sorted(t3s))
+check("普通股、ETF 仍在表", {"DTE", "RILY", "SPY", "BUFR", "PFF", "DUEX", "NOTE", "CDW"} <= set(t3s), sorted(t3s))
+check("被標成 CS 的債不占借用名額（RILYW 仍借到 RILY）", t3s["RILYW"]["entity"] == "FIGI:BBGRILY", t3s.get("RILYW"))
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
