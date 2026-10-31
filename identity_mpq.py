@@ -17,6 +17,7 @@ identity_mpq.py — 身份表 v2：把 MPQ 代號掛到公司（2026-10-25 Jun �
 - 兩個 MPQ 代號同時掛同一家公司（A4 同行情或代號重用，例 FEED）：只列 mpq_problems.csv，不處理（A4 不在本次範圍）。
 - 2026-10-30 代號重用切分（ADR-060）：catalog_src/identity_cuts.csv 列的代號，hole_after 以前的 MPQ 段不對 Polygon、自成一家
   MPQ:{代號}:pre-{hole_after}。Polygon 沒有舊公司的記錄，不切的話前後兩家會併成現任公司一條序列。
+  2026-10-31 加 mode=whole：X-DELISTED 舊段整段不是現任公司，自成一家 MPQ:X-DELISTED（不用同代號切出前後兩段）。
 登記：MongoDB_Standard_v3 §六-D 10-25 條。寫入方＝catalog_rules.py --step identity_mpq。日誌只印筆數。Python 3.9 相容。
 """
 import csv
@@ -39,8 +40,8 @@ NODATE = "0000-00-00"   # 身份表 v1：Polygon 標已下市但沒有 delisted_
 ID_COLS_V2 = ["entity_id", "source", "symbol", "from", "to", "evidence", "note", "table_version", "asset"]
 PROB_COLS = ["symbol", "asset", "from", "to", "kind", "detail"]
 CUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "identity_cuts.csv")
-CUT_COLS = ["symbol", "asset", "hole_before", "hole_after", "first_trade", "source", "evidence", "note"]
-CUT_SOURCES = ("yahoo", "sec", "company", "exchange")
+CUT_COLS = ["symbol", "asset", "mode", "hole_before", "hole_after", "first_trade", "source", "evidence", "note"]
+CUT_SOURCES = ("yahoo", "sec", "company", "exchange", "polygon")
 
 SCHEMA_V2 = dict(ID_SCHEMA)
 SCHEMA_V2["schema"] = "catalog_identity_v2"
@@ -121,11 +122,15 @@ def parse_cuts(text):
     out = {}
     for r in rd:
         k = (r["symbol"], r["asset"])
-        for f in ("hole_before", "hole_after", "first_trade"):
+        if r["mode"] not in ("hole", "whole"):
+            raise SystemExit("⛔ identity_cuts %s mode 不對：%s" % (k, r["mode"]))
+        for f in ("hole_before", "hole_after", "first_trade") if r["mode"] == "hole" else ("first_trade",):
             if not re.match(r"^\d{4}-\d{2}-\d{2}$", r[f] or ""):
                 raise SystemExit("⛔ identity_cuts %s %s 日期不對" % (k, f))
-        if r["asset"] not in ("stock", "etf") or r["hole_before"] >= r["hole_after"]:
+        if r["asset"] not in ("stock", "etf") or (r["mode"] == "hole" and r["hole_before"] >= r["hole_after"]):
             raise SystemExit("⛔ identity_cuts %s 類別或洞的日期不對" % (k,))
+        if r["mode"] == "whole" and (r["hole_before"] or r["hole_after"]):
+            raise SystemExit("⛔ identity_cuts %s 整段切出不該有洞的日期" % (k,))
         if not r["source"] or any(x not in CUT_SOURCES for x in r["source"].split("+")) or not (r["evidence"] or "").strip():
             raise SystemExit("⛔ identity_cuts %s 缺來源或證據" % (k,))
         if k in out:
@@ -142,6 +147,11 @@ def apply_cuts(segs, cuts):
         c = cuts.get(k)
         if c is None:
             out.append(s)
+        elif c["mode"] == "whole":
+            out.append(dict(s, cut=c))
+            pre.add(k)
+            post.add(k)            # 整段切出：舊公司只有這些段，不要求有後段
+            n += 1
         elif s["end"] < c["hole_after"]:
             out.append(dict(s, cut=c))
             pre.add(k)
@@ -240,11 +250,11 @@ def build(id_rows, src_rows, version, cal_end=None, cuts=None):
         sym, asset = s["symbol"], s["asset"]
         if s.get("cut"):                   # 代號重用：洞前是別家，不對 Polygon（Polygon 沒有舊公司的記錄，對了就併進現任）
             c = s["cut"]
-            eid = "MPQ:%s:pre-%s" % (sym, c["hole_after"])
-            rows.append({"entity_id": eid, "source": "mpq", "symbol": sym, "from": s["start"], "to": c["hole_after"],
+            eid = "MPQ:" + sym if c["mode"] == "whole" else "MPQ:%s:pre-%s" % (sym, c["hole_after"])
+            rows.append({"entity_id": eid, "source": "mpq", "symbol": sym, "from": s["start"], "to": c["hole_after"] or "",
                          "evidence": "mpq_cut", "note": c["evidence"], "table_version": version, "asset": asset,
                          "_last": s["end"]})
-            probs.append({"symbol": sym, "asset": asset, "from": s["start"], "to": c["hole_after"], "kind": "cut_reuse",
+            probs.append({"symbol": sym, "asset": asset, "from": s["start"], "to": c["hole_after"] or "", "kind": "cut_reuse",
                           "detail": c["evidence"] + ("；" + c["note"] if c["note"] else "")})
             stats["cut_reuse"] += 1
             new_ents[eid] = {"entity_id": eid, "name": "", "type": "mpq_" + asset, "active": 0}

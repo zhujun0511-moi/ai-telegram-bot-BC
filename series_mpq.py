@@ -16,6 +16,7 @@ import csv
 import datetime as dt
 import io
 import json
+import os
 from collections import Counter, defaultdict
 
 from catalog_publish import CAT, _sha, published, to_csv
@@ -165,6 +166,8 @@ def plan(files, read):
 
 
 # ── 正本發布（2026-10-30 Jun 拍板）：本地端核對結果＋候選表 → _catalog/series/v<N>/ ──
+OVERRIDES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "series_overrides.csv")
+OVERRIDE_COLS = ["sym_a", "sym_b", "asset", "source", "evidence", "note"]
 MAX_DUP_OFF = 0.005     # duplicate 的中位比值偏離超過這個就不併（AHP／BHR 差約 1%：更像少一個係數，不是四捨五入）
 SERIES_COLS = ["entity_id", "asset", "primary_symbol", "n_members", "members", "first", "last", "table_version"]
 ALIAS_COLS = ["entity_id", "asset", "symbol", "primary_symbol", "role", "from", "to", "pair_ids", "price_basis", "table_version"]
@@ -177,12 +180,28 @@ SERIES_SCHEMA = {
                    "members": "組內代號，「|」分隔", "first／last": "組內最早首日、最晚末日"},
     "aliases.csv": {"role": "primary＝主代號｜duplicate＝同一份數據，用主代號，這條不用｜splice＝接在同一條序列上",
                     "from／to": "該代號 MPQ 有 bar 的首末日", "pair_ids": "依據哪些核對對", "price_basis": "actual｜mpq_adjusted，有混用時用 actual|mpq_adjusted"},
-    "hold.csv": {"reason": "verdict 原值，或 ratio_off＝duplicate 但比值偏離、not_actual＝接縫只有調整價、candidate_hold＝候選表本就 hold"},
+    "hold.csv": {"reason": "verdict 原值，或 ratio_off＝duplicate 但比值偏離、not_actual＝接縫只有調整價、candidate_hold＝候選表本就 hold、unchecked＝本地端還沒核過這一對"},
     "限制": ["沒列在 aliases.csv 的代號維持自己一條序列", "只處理候選表裡的對；hold 的對不代表錯，只是還沒核准"]}
 
 
-def adopt(pair, chk):
-    """這一對採不採用：回 (去向, 原因)，去向＝dedupe／splice／None。純函數。"""
+def parse_overrides(text):
+    """放行清單 → {(asset, sym_a, sym_b): 列}。任何不對就整次失敗。"""
+    rd = csv.DictReader(io.StringIO((text or "").lstrip("\ufeff")))
+    if rd.fieldnames != OVERRIDE_COLS:
+        raise SystemExit("⛔ series_overrides 欄位不對：%s" % rd.fieldnames)
+    out = {}
+    for r in rd:
+        k = (r["asset"], r["sym_a"], r["sym_b"])
+        if not r["source"] or not (r["evidence"] or "").strip():
+            raise SystemExit("⛔ series_overrides %s 缺來源或證據" % (k,))
+        if k in out:
+            raise SystemExit("⛔ series_overrides 重複：%s" % (k,))
+        out[k] = r
+    return out
+
+
+def adopt(pair, chk, forced=False):
+    """這一對採不採用：回 (去向, 原因)，去向＝dedupe／splice／None。forced＝在放行清單上。純函數。"""
     v = chk["verdict"]
     act = pair["proposed_action"]
     if chk["check"] == "overlap_identity":
@@ -193,7 +212,7 @@ def adopt(pair, chk):
         return ("dedupe", "") if act.startswith("dedupe") else (None, "candidate_hold")
     if v != "continuous":
         return None, v
-    if act != "splice":
+    if act != "splice" and not forced:
         return None, "candidate_hold"
     return ("splice", "") if chk["price_basis"] == "actual" else (None, "not_actual")
 
@@ -208,15 +227,20 @@ def _spans(groups):
     return out
 
 
-def build_series(groups, pairs, checks, version):
-    """純函數：候選表＋核對結果 → (series 列, aliases 列, hold 列, 統計)。對不上或同組矛盾就整次失敗。"""
-    by_id = {c["pair_id"]: c for c in checks}
-    if len(by_id) != len(checks) or set(by_id) != {p["pair_id"] for p in pairs}:
-        raise SystemExit("⛔ 核對結果與候選表的對不一致")
-    for p in pairs:
-        c = by_id[p["pair_id"]]
-        if (c["sym_a"], c["sym_b"], c["asset"], c["check"], c["entity_id"]) != (p["sym_a"], p["sym_b"], p["asset"], p["check"], p["entity_id"]):
-            raise SystemExit("⛔ %s 核對結果與候選表內容不同" % p["pair_id"])
+def build_series(groups, pairs, checks, version, overrides=None):
+    """純函數：候選表＋核對結果 → (series 列, aliases 列, hold 列, 統計)。同組矛盾或放行清單對不上就整次失敗。
+    核對結果按代號對比（候選表重算後 pair_id 會變）；沒核過的對進 hold。"""
+    ck = lambda r: (r["asset"], r["sym_a"], r["sym_b"], r["check"])
+    by_key = {ck(c): c for c in checks}
+    if len(by_key) != len(checks):
+        raise SystemExit("⛔ 核對結果有重複的對")
+    overrides = overrides or {}
+    for k in overrides:
+        c = by_key.get((k[0], k[1], k[2], "splice_continuity"))
+        if not any((p["asset"], p["sym_a"], p["sym_b"]) == k for p in pairs):
+            raise SystemExit("⛔ series_overrides %s 不在候選表" % (k,))
+        if c is None or c["verdict"] != "continuous" or c["price_basis"] != "actual":
+            raise SystemExit("⛔ series_overrides %s 不是實際價的 continuous" % (k,))
     spans = _spans(groups)
     par = {}
 
@@ -230,8 +254,12 @@ def build_series(groups, pairs, checks, version):
     used, hold, dropped = [], [], set()
     st = Counter()
     for p in pairs:
-        c = by_id[p["pair_id"]]
-        how, why = adopt(p, c)
+        c = by_key.get(ck(p))
+        if c is None:
+            c = {"verdict": "", "price_basis": ""}
+            how, why = None, "unchecked"
+        else:
+            how, why = adopt(p, c, (p["asset"], p["sym_a"], p["sym_b"]) in overrides)
         a, b = (p["entity_id"], p["asset"], p["sym_a"]), (p["entity_id"], p["asset"], p["sym_b"])
         if how is None:
             hold.append({"pair_id": p["pair_id"], "entity_id": p["entity_id"], "asset": p["asset"], "sym_a": p["sym_a"],
@@ -275,7 +303,8 @@ def build_series(groups, pairs, checks, version):
                             "price_basis": "|".join(sorted({x[1] for x in ls})), "table_version": version})
     series.sort(key=lambda r: (r["entity_id"], r["asset"], r["primary_symbol"]))
     aliases.sort(key=lambda r: (r["entity_id"], r["asset"], r["symbol"]))
-    st.update(series=len(series), aliases=len(aliases), hold=len(hold))
+    st.update(series=len(series), aliases=len(aliases), hold=len(hold),
+              check_unused=len(set(by_key) - {ck(p) for p in pairs}))
     return series, aliases, hold, dict(st)
 
 
@@ -289,22 +318,28 @@ def plan_publish(files, read):
     chk_txt = read("%s/v%d/check.csv" % (CHECK_DIR, chk_v))
     if chk_txt is None or _sha(chk_txt) != chk_man["files"]["check.csv"]["sha256"]:
         raise SystemExit("⛔ check.csv 讀不到或 sha256 與 manifest 不一致")
-    cand_v = int(chk_man["candidates_version"])
+    cand_v = published(files, CAND_DIR)[-1]
     d = "%s/v%d" % (CAND_DIR, cand_v)
     cand_man = json.loads(read(d + "/manifest.json"))
     id_ver = published(files, ID_DIR)[-1]
     if cand_man["identity_version"] != id_ver:
         raise SystemExit("⛔ 候選表 v%d 用身份表 v%s，最新是 v%d" % (cand_v, cand_man["identity_version"], id_ver))
+    ov_txt = None
+    if os.path.exists(OVERRIDES_FILE):
+        with open(OVERRIDES_FILE, encoding="utf-8") as fh:
+            ov_txt = fh.read()
+    ov = parse_overrides(ov_txt) if ov_txt else {}
     pub = published(files, SERIES_DIR)
     if pub:
         last = json.loads(read("%s/v%d/manifest.json" % (SERIES_DIR, pub[-1])))
-        if last.get("check_sha256") == _sha(chk_txt) and last.get("identity_version") == id_ver:
+        if (last.get("check_sha256") == _sha(chk_txt) and last.get("identity_version") == id_ver
+                and last.get("overrides_sha256") == (_sha(ov_txt) if ov_txt else None)):
             return [], "沿用 v%d（輸入未變）" % pub[-1]
     ver = (pub[-1] + 1) if pub else 1
     groups = list(csv.DictReader(io.StringIO(read(d + "/groups.csv"))))
     pairs = list(csv.DictReader(io.StringIO(read(d + "/pairs.csv"))))
     checks = list(csv.DictReader(io.StringIO(chk_txt)))
-    series, aliases, hold, st = build_series(groups, pairs, checks, ver)
+    series, aliases, hold, st = build_series(groups, pairs, checks, ver, ov)
     f = {"series.csv": to_csv(series, SERIES_COLS), "aliases.csv": to_csv(aliases, ALIAS_COLS), "hold.csv": to_csv(hold, HOLD_COLS),
          "schema.json": json.dumps(SERIES_SCHEMA, ensure_ascii=False, indent=1)}
     man = {"version": ver, "created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -313,6 +348,8 @@ def plan_publish(files, read):
                          else {"sha256": _sha(v)}) for k, v in f.items()},
            "candidates_version": cand_v, "identity_version": id_ver, "check_version": chk_v, "check_sha256": _sha(chk_txt),
            "rules": {"max_dup_off": MAX_DUP_OFF}, "counts": st}
+    if ov_txt:
+        man.update(overrides_sha256=_sha(ov_txt), overrides_rows=len(ov))
     out = "%s/v%d" % (SERIES_DIR, ver)
     adds = [("%s/%s" % (out, k), v) for k, v in f.items()]
     adds.append((out + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1)))   # manifest 最後

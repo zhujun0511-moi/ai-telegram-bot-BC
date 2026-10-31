@@ -166,8 +166,21 @@ def s_fails(name, fn):
         check(name, True)
 
 
-s_fails("正本：少一對要停", lambda: SM.build_series(G, P, C[:-1], 1))
-s_fails("正本：代號對不上要停", lambda: SM.build_series(G, P, [dict(C[0], sym_b="OTHER")] + C[1:], 1))
+h3 = SM.build_series(G, P, C[:-1], 1)
+check("正本：沒核過的對進 hold", {r["pair_id"]: r["reason"] for r in h3[2]}.get("P5") == "unchecked", h3[2])
+check("正本：候選表沒有的核對結果不用、有記數", SM.build_series(G, P[:-1], C, 1)[3]["check_unused"] == 1)
+P_id = [dict(p, pair_id="N" + p["pair_id"]) for p in P]
+check("正本：pair_id 變了仍按代號對上", SM.build_series(G, P_id, C, 1)[3]["dedupe"] == 3)
+OV_T = "sym_a,sym_b,asset,source,evidence,note\nAA,BB,stock,sec,公告,\n"
+O = SM.parse_overrides(OV_T)
+P_o = [dict(P[0]), dict(P[1], proposed_action="hold"), P[2], P[3], P[4]]
+o_rows = SM.build_series(G, P_o, C, 1, O)
+check("正本：放行清單可拼候選 hold 的對", o_rows[3]["splice"] == 1, o_rows[3])
+s_fails("正本：放行但只有調整價要停", lambda: SM.build_series(G, P_o, [C[0], _c(P[1], "continuous", "mpq_adjusted"), C[2], C[3], C[4]], 1, O))
+s_fails("正本：放行但不是 continuous 要停", lambda: SM.build_series(G, P_o, [C[0], _c(P[1], "jump"), C[2], C[3], C[4]], 1, O))
+s_fails("正本：放行的對不在候選表要停", lambda: SM.build_series(G, P_o, C, 1, SM.parse_overrides(OV_T.replace("AA,BB", "ZZ,YY"))))
+s_fails("正本：放行缺證據要停", lambda: SM.parse_overrides(OV_T.replace("公告", "")))
+s_fails("正本：放行重複要停", lambda: SM.parse_overrides(OV_T + "AA,BB,stock,sec,公告,\n"))
 G2 = G + [_g("E5", "stock", "M1@2000-01-03~2020-01-01", "M2@2001-01-03~2020-01-01", "M3@2002-01-03~2020-01-01")]
 P2 = P + [_p("P6", "E5", "M1", "M2", OV, "dedupe_keep_a"), _p("P7", "E5", "M2", "M3", OV, "dedupe_keep_a"),
           _p("P8", "E5", "M1", "M3", OV, "dedupe_keep_a")]

@@ -184,8 +184,8 @@ check("超出容差 → 切段、後段自成一家、列 polygon_ended",
       and [p["kind"] for p in p3] == ["polygon_ended"], (r3, p3))
 
 # ── 10-30 代號重用切分（ADR-060）──
-CUT_H = "symbol,asset,hole_before,hole_after,first_trade,source,evidence,note\n"
-CUT_T = CUT_H + "NEWCO,etf,2005-04-21,2020-09-10,2020-09-17,yahoo,Yahoo 上市 2020,\n"
+CUT_H = "symbol,asset,mode,hole_before,hole_after,first_trade,source,evidence,note\n"
+CUT_T = CUT_H + "NEWCO,etf,hole,2005-04-21,2020-09-10,2020-09-17,yahoo,Yahoo 上市 2020,\n"
 C_ID = [{"entity_id": "FIGI:NEW", "source": "polygon", "symbol": "NEWCO", "from": "", "to": ""}]
 C_SRC = [{"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2005-01-03", "d_last": "2005-04-21", "m5_first": "", "m5_last": ""},
          {"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2020-09-10", "d_last": "2026-10-01", "m5_first": "", "m5_last": ""}]
@@ -219,7 +219,21 @@ c_fails("切分：洞日期倒置要停", lambda: IM.parse_cuts(CUT_T.replace("2
 c_fails("切分：重複要停", lambda: IM.parse_cuts(CUT_T + CUT_T[len(CUT_H):]))
 c_fails("切分：欄位不對要停", lambda: IM.parse_cuts("a,b\n"))
 check("真清單：格式全過", len(IM.parse_cuts(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "catalog_src",
-                                                     "identity_cuts.csv"), encoding="utf-8").read())) == 143)
+                                                     "identity_cuts.csv"), encoding="utf-8").read())) == 159)
+# 整段切出（2026-10-31）：X-DELISTED 舊段不是現任公司，X 照常掛現任
+CUT_W = CUT_H + "NEWCO-DELISTED,stock,whole,,,2025-01-02,sec,SEC 2024 才首次申報,\n"
+W_ID = [{"entity_id": "FIGI:NEW", "source": "polygon", "symbol": "NEWCO", "from": "", "to": "2026-09-22"}]
+W_SRC = [{"mpq_symbol": "NEWCO-DELISTED", "asset": "stock", "d_first": "2005-01-03", "d_last": "2015-04-21", "m5_first": "", "m5_last": ""},
+         {"mpq_symbol": "NEWCO", "asset": "stock", "d_first": "2025-01-03", "d_last": "2026-09-21", "m5_first": "", "m5_last": ""}]
+w_rows, w_ents, w_probs, w_st = IM.build(W_ID, W_SRC, 5, "2026-10-01", IM.parse_cuts(CUT_W))
+w_by = {r["symbol"]: r for r in w_rows}
+check("整段：舊段自成一家", w_by["NEWCO-DELISTED"]["entity_id"] == "MPQ:NEWCO-DELISTED" and w_by["NEWCO-DELISTED"]["evidence"] == "mpq_cut"
+      and w_by["NEWCO-DELISTED"]["to"] == "", w_by)
+check("整段：現任不動", w_by["NEWCO"]["entity_id"] == "FIGI:NEW", w_by)
+check("整段：entities 與 problems 有記", w_ents[0]["entity_id"] == "MPQ:NEWCO-DELISTED" and w_probs[0]["kind"] == "cut_reuse" and w_st["cut_reuse"] == 1)
+c_fails("整段：對不到段要停", lambda: IM.build(W_ID, W_SRC[1:], 5, "2026-10-01", IM.parse_cuts(CUT_W)))
+c_fails("整段：帶洞的日期要停", lambda: IM.parse_cuts(CUT_W.replace("whole,,,", "whole,2005-01-01,2020-01-01,")))
+c_fails("切分：mode 不對要停", lambda: IM.parse_cuts(CUT_W.replace("whole", "partial")))
 
 print("\n%d 通過、%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

@@ -1,0 +1,7 @@
+sym_a,sym_b,asset,source,evidence,note
+ARMN,ARIS,stock,exchange+company,Aris Mining 2026-02-19 轉 NYSE，代號 ARMN→ARIS（公司公告 2026-02-05；SEC CIK 1964504）,
+MPW,MPT,stock,sec,Medical Properties Trust 2026-02-02 代號 MPW→MPT，CUSIP 不變（8-K 2026-01-20）,
+RYI,RYZ,stock,sec,Ryerson 2026-02-24 起代號 RYZ（8-K，併購 Olympic Steel 後）,
+ADEX-DELISTED,GRDI-DELISTED,stock,company,Adit EdTech 2023-12-29 完成併購並改名 GRIID，2024-01-02 起 GRDI（CIK 1830029）,
+CCCX,INFQ,stock,sec,Churchill Capital Corp X 2026-02-13 完成併購改名 Infleqtion，2026-02-17 起 INFQ（10-K）,
+OAKU-DELISTED,OAKU,stock,polygon,Oak Woods Acquisition 同一 CIK 1945422，MPQ 切成兩段，空檔 12 天、比值 1.0,
