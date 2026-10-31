@@ -117,5 +117,62 @@ try:
 except SystemExit:
     check("輸入 sha256 不符要停", True)
 
+# ── 正本發布（2026-10-30）──
+def _g(e, asset, *items):
+    return {"entity_id": e, "asset": asset, "symbols": "|".join(items)}
+
+
+def _p(pid, e, a, b, check, act, asset="stock"):
+    return {"pair_id": pid, "entity_id": e, "asset": asset, "sym_a": a, "sym_b": b, "check": check, "proposed_action": act}
+
+
+def _c(p, verdict, basis="actual", med="1.0", jr=""):
+    return dict({k: p[k] for k in ("pair_id", "entity_id", "asset", "sym_a", "sym_b", "check")}, verdict=verdict,
+                price_basis=basis, median_ratio_b_over_a=med, junction_ratio=jr)
+
+
+OV, SP = "overlap_identity", "splice_continuity"
+G = [_g("E1", "stock", "OLD@2000-01-03~2010-01-01", "NEW@2005-01-03~2026-10-01"),
+     _g("E2", "stock", "AA@2000-01-03~2010-01-01", "BB@2010-01-04~2026-10-01"),
+     _g("E3", "stock", "XA@2000-01-03~2026-10-01", "XB@2001-01-03~2026-10-01"),
+     _g("E4", "stock", "CH1@2000-01-03~2020-01-01", "CH2@2001-01-03~2020-01-01", "CH3@2002-01-03~2026-10-01")]
+P = [_p("P1", "E1", "OLD", "NEW", OV, "dedupe_keep_b"), _p("P2", "E2", "AA", "BB", SP, "splice"),
+     _p("P3", "E3", "XA", "XB", OV, "dedupe_keep_a"), _p("P4", "E4", "CH1", "CH2", OV, "dedupe_keep_b"),
+     _p("P5", "E4", "CH2", "CH3", OV, "dedupe_keep_b")]
+C = [_c(P[0], "duplicate", "mpq_adjusted"), _c(P[1], "continuous", jr="1.02"), _c(P[2], "duplicate", med="0.990099"),
+     _c(P[3], "duplicate"), _c(P[4], "duplicate")]
+s_rows, a_rows, h_rows, s_st = SM.build_series(G, P, C, 1)
+s_by = {r["entity_id"]: r for r in s_rows}
+a_by = {r["symbol"]: r for r in a_rows}
+check("正本：去重留被保留的代號", s_by["E1"]["primary_symbol"] == "NEW" and a_by["OLD"]["role"] == "duplicate")
+check("正本：調整價的 duplicate 照收", a_by["OLD"]["price_basis"] == "mpq_adjusted")
+check("正本：拼接主代號取末日最晚", s_by["E2"]["primary_symbol"] == "BB" and a_by["AA"]["role"] == "splice")
+check("正本：比值偏離 1% 不併、進 hold", "E3" not in s_by and h_rows[0]["pair_id"] == "P3" and h_rows[0]["reason"] == "ratio_off", h_rows)
+check("正本：鏈式去重只留一個主代號", s_by["E4"]["primary_symbol"] == "CH3" and s_by["E4"]["n_members"] == 3
+      and a_by["CH1"]["primary_symbol"] == "CH3", s_by["E4"])
+check("正本：組的首末日", s_by["E4"]["first"] == "2000-01-03" and s_by["E4"]["last"] == "2026-10-01")
+check("正本：統計", s_st["dedupe"] == 3 and s_st["splice"] == 1 and s_st["hold"] == 1, s_st)
+h2 = SM.build_series(G, P, [_c(P[0], "duplicate"), _c(P[1], "continuous", "mpq_adjusted"), C[2], C[3], C[4]], 1)[2]
+check("正本：接縫只有調整價進 hold", {r["pair_id"]: r["reason"] for r in h2}.get("P2") == "not_actual", h2)
+P_h = [dict(P[0]), dict(P[1], proposed_action="hold"), P[2], P[3], P[4]]
+check("正本：候選表本就 hold 不拼", {r["pair_id"]: r["reason"] for r in SM.build_series(G, P_h, C, 1)[2]}.get("P2") == "candidate_hold")
+
+
+def s_fails(name, fn):
+    try:
+        fn()
+        check(name, False)
+    except SystemExit:
+        check(name, True)
+
+
+s_fails("正本：少一對要停", lambda: SM.build_series(G, P, C[:-1], 1))
+s_fails("正本：代號對不上要停", lambda: SM.build_series(G, P, [dict(C[0], sym_b="OTHER")] + C[1:], 1))
+G2 = G + [_g("E5", "stock", "M1@2000-01-03~2020-01-01", "M2@2001-01-03~2020-01-01", "M3@2002-01-03~2020-01-01")]
+P2 = P + [_p("P6", "E5", "M1", "M2", OV, "dedupe_keep_a"), _p("P7", "E5", "M2", "M3", OV, "dedupe_keep_a"),
+          _p("P8", "E5", "M1", "M3", OV, "dedupe_keep_a")]
+s_fails("正本：同組矛盾要停", lambda: SM.build_series(G2, P2, C + [_c(P2[5], "duplicate"), _c(P2[6], "duplicate"), _c(P2[7], "different")], 1))
+check("正本：不矛盾的 hold 可在同組", SM.build_series(G2, P2, C + [_c(P2[5], "duplicate"), _c(P2[6], "duplicate"), _c(P2[7], "partial")], 1)[3]["hold"] == 2)
+
 print("\n%d 通過、%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

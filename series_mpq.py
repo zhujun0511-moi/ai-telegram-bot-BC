@@ -9,6 +9,7 @@ series_mpq.py — 序列正本表的候選（2026-10-26 Jun 同意範圍＝A4 �
 - gap        前後接、空檔 >10 天 → hold（Jun 人工看）
 輸入：_catalog/identity 最新版（需含 source=mpq）＋ 它所根據的 _catalog/_src/mpq_symbols（取各段末根日）
 輸出：_catalog/series/candidates/v<N>/{groups.csv, pairs.csv, schema.json, manifest.json}（草稿，不是正本）
+2026-10-30 加正本發布 plan_publish：本地端核對結果（_src/series_check）＋候選表 → _catalog/series/v<N>/。
 登記：MongoDB_Standard_v3 §六-D 10-26 條。寫入方＝catalog_rules.py --step series_candidates。日誌只印筆數。Python 3.9 相容。
 """
 import csv
@@ -21,6 +22,8 @@ from catalog_publish import CAT, _sha, published, to_csv
 
 ID_DIR = CAT + "/identity"
 CAND_DIR = CAT + "/series/candidates"
+SERIES_DIR = CAT + "/series"
+CHECK_DIR = CAT + "/_src/series_check"
 GAP_DAYS = 10       # 天（日曆日）：前後接的空檔在這以內算改名接續（與身份表 v2 的 TOL 一致）
 FAR = "9999-12-31"
 GROUP_COLS = ["entity_id", "asset", "kind", "n_symbols", "symbols", "proposed_primary", "note"]
@@ -159,3 +162,159 @@ def plan(files, read):
         ver, len(groups), st.get("overlap", 0), st.get("sequential", 0), st.get("gap", 0), len(pairs),
         st.get("pair_overlap_identity", 0), st.get("pair_splice_continuity", 0), id_ver)
     return adds, summ
+
+
+# ── 正本發布（2026-10-30 Jun 拍板）：本地端核對結果＋候選表 → _catalog/series/v<N>/ ──
+MAX_DUP_OFF = 0.005     # duplicate 的中位比值偏離超過這個就不併（AHP／BHR 差約 1%：更像少一個係數，不是四捨五入）
+SERIES_COLS = ["entity_id", "asset", "primary_symbol", "n_members", "members", "first", "last", "table_version"]
+ALIAS_COLS = ["entity_id", "asset", "symbol", "primary_symbol", "role", "from", "to", "pair_ids", "price_basis", "table_version"]
+HOLD_COLS = ["pair_id", "entity_id", "asset", "sym_a", "sym_b", "check", "verdict", "price_basis", "reason", "median_ratio",
+             "junction_ratio", "table_version"]
+SERIES_SCHEMA = {
+    "schema": "catalog_series_v1",
+    "說明": "同一家公司同類別的 MPQ 代號怎麼合併：只有本地端價格核對過的才併，其餘在 hold.csv",
+    "series.csv": {"primary_symbol": "這組的主代號：沒被去重掉的成員中末日最晚者（同日取覆蓋天數長者）",
+                   "members": "組內代號，「|」分隔", "first／last": "組內最早首日、最晚末日"},
+    "aliases.csv": {"role": "primary＝主代號｜duplicate＝同一份數據，用主代號，這條不用｜splice＝接在同一條序列上",
+                    "from／to": "該代號 MPQ 有 bar 的首末日", "pair_ids": "依據哪些核對對", "price_basis": "actual｜mpq_adjusted，有混用時用 actual|mpq_adjusted"},
+    "hold.csv": {"reason": "verdict 原值，或 ratio_off＝duplicate 但比值偏離、not_actual＝接縫只有調整價、candidate_hold＝候選表本就 hold"},
+    "限制": ["沒列在 aliases.csv 的代號維持自己一條序列", "只處理候選表裡的對；hold 的對不代表錯，只是還沒核准"]}
+
+
+def adopt(pair, chk):
+    """這一對採不採用：回 (去向, 原因)，去向＝dedupe／splice／None。純函數。"""
+    v = chk["verdict"]
+    act = pair["proposed_action"]
+    if chk["check"] == "overlap_identity":
+        if v != "duplicate":
+            return None, v
+        if abs(float(chk["median_ratio_b_over_a"]) - 1) > MAX_DUP_OFF:
+            return None, "ratio_off"
+        return ("dedupe", "") if act.startswith("dedupe") else (None, "candidate_hold")
+    if v != "continuous":
+        return None, v
+    if act != "splice":
+        return None, "candidate_hold"
+    return ("splice", "") if chk["price_basis"] == "actual" else (None, "not_actual")
+
+
+def _spans(groups):
+    """groups.csv 的 代號@首日~末日 → {(entity, asset, symbol): (首, 末)}。"""
+    out = {}
+    for g in groups:
+        for x in g["symbols"].split("|"):
+            sym, d = x.rsplit("@", 1)
+            out[(g["entity_id"], g["asset"], sym)] = tuple(d.split("~"))
+    return out
+
+
+def build_series(groups, pairs, checks, version):
+    """純函數：候選表＋核對結果 → (series 列, aliases 列, hold 列, 統計)。對不上或同組矛盾就整次失敗。"""
+    by_id = {c["pair_id"]: c for c in checks}
+    if len(by_id) != len(checks) or set(by_id) != {p["pair_id"] for p in pairs}:
+        raise SystemExit("⛔ 核對結果與候選表的對不一致")
+    for p in pairs:
+        c = by_id[p["pair_id"]]
+        if (c["sym_a"], c["sym_b"], c["asset"], c["check"], c["entity_id"]) != (p["sym_a"], p["sym_b"], p["asset"], p["check"], p["entity_id"]):
+            raise SystemExit("⛔ %s 核對結果與候選表內容不同" % p["pair_id"])
+    spans = _spans(groups)
+    par = {}
+
+    def find(x):
+        par.setdefault(x, x)
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+
+    used, hold, dropped = [], [], set()
+    st = Counter()
+    for p in pairs:
+        c = by_id[p["pair_id"]]
+        how, why = adopt(p, c)
+        a, b = (p["entity_id"], p["asset"], p["sym_a"]), (p["entity_id"], p["asset"], p["sym_b"])
+        if how is None:
+            hold.append({"pair_id": p["pair_id"], "entity_id": p["entity_id"], "asset": p["asset"], "sym_a": p["sym_a"],
+                         "sym_b": p["sym_b"], "check": p["check"], "verdict": c["verdict"], "price_basis": c["price_basis"],
+                         "reason": why, "median_ratio": c.get("median_ratio_b_over_a") or "",
+                         "junction_ratio": c.get("junction_ratio") or "", "table_version": version})
+            st["hold_" + why] += 1
+            continue
+        par[find(a)] = find(b)
+        used.append((p, c, how, a, b))
+        st[how] += 1
+        if how == "dedupe":
+            dropped.add(b if p["proposed_action"] == "dedupe_keep_a" else a)
+    for h in hold:
+        a, b = (h["entity_id"], h["asset"], h["sym_a"]), (h["entity_id"], h["asset"], h["sym_b"])
+        if a in par and b in par and find(a) == find(b) and h["reason"] in ("different", "scaled", "jump"):
+            raise SystemExit("⛔ 同組矛盾：%s %s／%s 判 %s，卻被其他對併成一組" % (h["pair_id"], h["sym_a"], h["sym_b"], h["reason"]))
+    comp = defaultdict(list)
+    for k in list(par):
+        comp[find(k)].append(k)
+    series, aliases = [], []
+    links = defaultdict(list)
+    for p, c, how, a, b in used:
+        links[a].append((p["pair_id"], c["price_basis"], how))
+        links[b].append((p["pair_id"], c["price_basis"], how))
+    for ks in comp.values():
+        for k in ks:
+            if k not in spans:
+                raise SystemExit("⛔ %s 不在候選表 groups.csv" % (k,))
+        pool = [k for k in ks if k not in dropped] or ks
+        prim = max(pool, key=lambda k: (spans[k][1], _days(*spans[k]), k[2]))
+        e, asset = prim[0], prim[1]
+        members = sorted(k[2] for k in ks)
+        series.append({"entity_id": e, "asset": asset, "primary_symbol": prim[2], "n_members": len(ks), "members": "|".join(members),
+                       "first": min(spans[k][0] for k in ks), "last": max(spans[k][1] for k in ks), "table_version": version})
+        for k in sorted(ks, key=lambda x: x[2]):
+            ls = links[k]
+            role = "primary" if k == prim else "duplicate" if k in dropped else "splice"
+            aliases.append({"entity_id": e, "asset": asset, "symbol": k[2], "primary_symbol": prim[2], "role": role,
+                            "from": spans[k][0], "to": spans[k][1], "pair_ids": "|".join(sorted({x[0] for x in ls})),
+                            "price_basis": "|".join(sorted({x[1] for x in ls})), "table_version": version})
+    series.sort(key=lambda r: (r["entity_id"], r["asset"], r["primary_symbol"]))
+    aliases.sort(key=lambda r: (r["entity_id"], r["asset"], r["symbol"]))
+    st.update(series=len(series), aliases=len(aliases), hold=len(hold))
+    return series, aliases, hold, dict(st)
+
+
+def plan_publish(files, read):
+    """回 (adds, 摘要)。純計算，不寫東西。"""
+    cv = published(files, CHECK_DIR)
+    if not cv:
+        raise SystemExit("⛔ 找不到 %s（先跑 tools/upload_series_check.py）" % CHECK_DIR)
+    chk_v = cv[-1]
+    chk_man = json.loads(read("%s/v%d/manifest.json" % (CHECK_DIR, chk_v)))
+    chk_txt = read("%s/v%d/check.csv" % (CHECK_DIR, chk_v))
+    if chk_txt is None or _sha(chk_txt) != chk_man["files"]["check.csv"]["sha256"]:
+        raise SystemExit("⛔ check.csv 讀不到或 sha256 與 manifest 不一致")
+    cand_v = int(chk_man["candidates_version"])
+    d = "%s/v%d" % (CAND_DIR, cand_v)
+    cand_man = json.loads(read(d + "/manifest.json"))
+    id_ver = published(files, ID_DIR)[-1]
+    if cand_man["identity_version"] != id_ver:
+        raise SystemExit("⛔ 候選表 v%d 用身份表 v%s，最新是 v%d" % (cand_v, cand_man["identity_version"], id_ver))
+    pub = published(files, SERIES_DIR)
+    if pub:
+        last = json.loads(read("%s/v%d/manifest.json" % (SERIES_DIR, pub[-1])))
+        if last.get("check_sha256") == _sha(chk_txt) and last.get("identity_version") == id_ver:
+            return [], "沿用 v%d（輸入未變）" % pub[-1]
+    ver = (pub[-1] + 1) if pub else 1
+    groups = list(csv.DictReader(io.StringIO(read(d + "/groups.csv"))))
+    pairs = list(csv.DictReader(io.StringIO(read(d + "/pairs.csv"))))
+    checks = list(csv.DictReader(io.StringIO(chk_txt)))
+    series, aliases, hold, st = build_series(groups, pairs, checks, ver)
+    f = {"series.csv": to_csv(series, SERIES_COLS), "aliases.csv": to_csv(aliases, ALIAS_COLS), "hold.csv": to_csv(hold, HOLD_COLS),
+         "schema.json": json.dumps(SERIES_SCHEMA, ensure_ascii=False, indent=1)}
+    man = {"version": ver, "created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "source": "%s ＋ %s/v%d" % (d, CHECK_DIR, chk_v),
+           "files": {k: ({"sha256": _sha(v), "rows": max(v.count("\n") - 1, 0)} if k.endswith(".csv")
+                         else {"sha256": _sha(v)}) for k, v in f.items()},
+           "candidates_version": cand_v, "identity_version": id_ver, "check_version": chk_v, "check_sha256": _sha(chk_txt),
+           "rules": {"max_dup_off": MAX_DUP_OFF}, "counts": st}
+    out = "%s/v%d" % (SERIES_DIR, ver)
+    adds = [("%s/%s" % (out, k), v) for k, v in f.items()]
+    adds.append((out + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1)))   # manifest 最後
+    return adds, "發布 v%d：%d 組、%d 個代號（去重 %d 對、拼接 %d 對）｜hold %d 對｜候選 v%d、身份表 v%d" % (
+        ver, st["series"], st["aliases"], st.get("dedupe", 0), st.get("splice", 0), st["hold"], cand_v, id_ver)

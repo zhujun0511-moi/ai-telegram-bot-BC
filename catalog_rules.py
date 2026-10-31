@@ -18,7 +18,7 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
   回應本地端暫扣序列需求 ADR-055）；新類型 spinoff／special_dividend／stock_dividend、confidence 加 rejected。
 2026-10-29 日曆 v2 格式（Jun 拍板方案 A，回應本地端首輪體檢 ADR-058）：本地端 CSV 不改；合併 catalog_src/calendar_fixes.csv
   （只補 CSV 沒有的日子，source=fix）＋發布 catalog_src/halts.csv（停盤／延後開盤／已知數據缺口）。
-用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|identity_refresh [--dry-run] [--out _catalog_out] [--rule-years 2027]
+用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|series_publish|identity_refresh [--dry-run] [--out _catalog_out] [--rule-years 2027]
 Python 3.9 相容。
 """
 import argparse
@@ -776,7 +776,7 @@ def fetch_polygon_splits():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "identity_refresh"),
+    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "series_publish", "identity_refresh"),
                     help="identity_mpq＝身份表 v2 含 MPQ 代號（2026-10-25，identity_mpq.py）｜"
                          "series_candidates＝序列正本表候選（2026-10-26，series_mpq.py）｜"
                          "identity_refresh＝身份表重建：最新 Polygon 來源＋併 MPQ 一次發版（2026-10-28 工單通道）")
@@ -799,6 +799,9 @@ def main():
     elif a.step == "identity_refresh":
         import identity_mpq
         adds, summ = identity_mpq.plan_refresh(files, hf.read)
+    elif a.step == "series_publish":
+        import series_mpq
+        adds, summ = series_mpq.plan_publish(files, hf.read)
     elif a.step == "series_candidates":
         import series_mpq
         adds, summ = series_mpq.plan(files, hf.read)
@@ -822,7 +825,7 @@ def main():
     for p, t in adds:
         hf.add(p, t)
     n = hf.flush(a.out, "catalog %s" % a.step)
-    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "identity_refresh": "身份表重建"}[a.step], summ), flush=True)
+    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "series_publish": "序列正本表", "identity_refresh": "身份表重建"}[a.step], summ), flush=True)
     print("寫出 %d 個檔（%s）" % (n, "本機試跑 " + a.out if a.dry_run else "私有 dataset"), flush=True)
     return 0
 
