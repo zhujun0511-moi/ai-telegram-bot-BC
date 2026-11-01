@@ -388,5 +388,30 @@ fails(EVH + "reject,FIGI:SLM,SLM,2003-06-23,,,,,,ev,\n", "清單：reject 沒 no
 fails(EVH + "add,FIGI:NVDA,NVDA,2020-01-02,split,2,1,2,yahoo,ev,\n" * 2, "清單：同鍵重複要停")
 fails("action,entity_id\n", "清單：欄位不符要停")
 
+# ── 11-01 新類型與參考價修正表 ──
+nk = CR.parse_events(EVH + "add,FIGI:X,X,2020-01-02,event_no_k,2,,,sec,ev,\nadd,FIGI:X,X,2021-01-04,mpq_fix,2,,,data_check,ev,\n")
+check("清單：event_no_k、mpq_fix 收", [e["type"] for e in nk] == ["event_no_k", "mpq_fix"])
+RH = "symbol,from,to,divide_by,source,evidence,note\n"
+rf = CR.parse_ref_fixes(RH + "ON,2014-03-11,2014-03-12,10,yahoo,ev,\nON,2000-01-01,2014-03-10,100,yahoo,ev,\n")
+check("修正表：按日期排序", [r["from"] for r in rf] == ["2000-01-01", "2014-03-11"])
+
+
+def ref_fails(t, name):
+    try:
+        CR.parse_ref_fixes(t)
+        check(name, False)
+    except SystemExit:
+        check(name, True)
+
+
+ref_fails(RH + "ON,2014-03-11,2014-03-12,0,yahoo,ev,\n", "修正表：除數 0 要停")
+ref_fails(RH + "ON,2014-03-12,2014-03-11,2,yahoo,ev,\n", "修正表：日期倒置要停")
+ref_fails(RH + "ON,2014-03-11,2014-03-12,2,yahoo,,\n", "修正表：缺證據要停")
+ref_fails(RH + "ON,2014-01-01,2014-03-12,2,yahoo,ev,\nON,2014-03-12,2014-04-01,2,yahoo,ev,\n", "修正表：區間重疊要停")
+ref_fails("a,b\n", "修正表：欄位不符要停")
+got = dict(CR.plan_ref_fixes(set(), {}.get, RH + "ON,2014-03-11,2014-03-12,10,yahoo,ev,\n")[0])
+check("修正表：發 v1 含 sha256", "_catalog/ref_fixes/v1/ref_fixes.csv" in got and "content_sha256" in got["_catalog/ref_fixes/v1/manifest.json"])
+check("修正表：內容未變沿用", CR.plan_ref_fixes(set(got), got.get, RH + "ON,2014-03-11,2014-03-12,10,yahoo,ev,\n")[0] == [])
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

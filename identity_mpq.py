@@ -18,6 +18,8 @@ identity_mpq.py — 身份表 v2：把 MPQ 代號掛到公司（2026-10-25 Jun �
 - 2026-10-30 代號重用切分（ADR-060）：catalog_src/identity_cuts.csv 列的代號，hole_after 以前的 MPQ 段不對 Polygon、自成一家
   MPQ:{代號}:pre-{hole_after}。Polygon 沒有舊公司的記錄，不切的話前後兩家會併成現任公司一條序列。
   2026-10-31 加 mode=whole：X-DELISTED 舊段整段不是現任公司，自成一家 MPQ:X-DELISTED（不用同代號切出前後兩段）。
+  2026-11-01 加 mode=trim：first_trade 以前的 MPQ 數據不進序列（S4 只按 from 過濾，不讀 use_from）；
+  mode=pin：Polygon 邊界不明時指定公司（entity_id 欄）。
 登記：MongoDB_Standard_v3 §六-D 10-25 條。寫入方＝catalog_rules.py --step identity_mpq。日誌只印筆數。Python 3.9 相容。
 """
 import csv
@@ -40,8 +42,8 @@ NODATE = "0000-00-00"   # 身份表 v1：Polygon 標已下市但沒有 delisted_
 ID_COLS_V2 = ["entity_id", "source", "symbol", "from", "to", "evidence", "note", "table_version", "asset"]
 PROB_COLS = ["symbol", "asset", "from", "to", "kind", "detail"]
 CUTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "identity_cuts.csv")
-CUT_COLS = ["symbol", "asset", "mode", "hole_before", "hole_after", "first_trade", "source", "evidence", "note"]
-CUT_SOURCES = ("yahoo", "sec", "company", "exchange", "polygon")
+CUT_COLS = ["symbol", "asset", "mode", "hole_before", "hole_after", "first_trade", "source", "evidence", "note", "entity_id"]
+CUT_SOURCES = ("yahoo", "sec", "company", "exchange", "polygon", "data_check")
 
 SCHEMA_V2 = dict(ID_SCHEMA)
 SCHEMA_V2["schema"] = "catalog_identity_v2"
@@ -52,7 +54,7 @@ SCHEMA_V2["identity.csv"].update({
     "from": "polygon 列同 v1；mpq 列＝該段第一根 bar 的日子（被易主邊界切開時＝邊界日）",
     "to": "結束日（當天已不屬於這段）；mpq 列只在 Polygon 有結束日時填，空＝未判結束（不等於確定現役）",
     "evidence": "polygon｜mpq_overlap＝代號＋日期對上 Polygon 段｜mpq_residue＝改名殘渣併入 X-DELISTED｜mpq_only＝對不上，自成一家｜"
-                "mpq_cut＝代號重用，洞前段切出、自成一家（MPQ:{代號}:pre-{洞後首日}，v4 起）",
+                "mpq_cut＝代號重用，洞前段切出、自成一家（MPQ:{代號}:pre-{洞後首日}，v4 起）｜mpq_pin＝人工清單指定公司（v6 起）",
     "asset": "mpq 列：stock／etf（A6，按段）；polygon 列空"})
 SCHEMA_V2["entities.csv"] = dict(ID_SCHEMA["entities.csv"])
 SCHEMA_V2["entities.csv"]["type"] = "Polygon 類型（CS、ETF…）；MPQ:{代號} 自成一家者＝mpq_stock／mpq_etf"
@@ -122,15 +124,17 @@ def parse_cuts(text):
     out = {}
     for r in rd:
         k = (r["symbol"], r["asset"])
-        if r["mode"] not in ("hole", "whole"):
+        if r["mode"] not in ("hole", "whole", "trim", "pin"):
             raise SystemExit("⛔ identity_cuts %s mode 不對：%s" % (k, r["mode"]))
-        for f in ("hole_before", "hole_after", "first_trade") if r["mode"] == "hole" else ("first_trade",):
+        if (r["mode"] == "pin") != bool(r.get("entity_id")):
+            raise SystemExit("⛔ identity_cuts %s entity_id 只有 pin 要填" % (k,))
+        for f in {"hole": ("hole_before", "hole_after", "first_trade"), "pin": ()}.get(r["mode"], ("first_trade",)):
             if not re.match(r"^\d{4}-\d{2}-\d{2}$", r[f] or ""):
                 raise SystemExit("⛔ identity_cuts %s %s 日期不對" % (k, f))
         if r["asset"] not in ("stock", "etf") or (r["mode"] == "hole" and r["hole_before"] >= r["hole_after"]):
             raise SystemExit("⛔ identity_cuts %s 類別或洞的日期不對" % (k,))
-        if r["mode"] == "whole" and (r["hole_before"] or r["hole_after"]):
-            raise SystemExit("⛔ identity_cuts %s 整段切出不該有洞的日期" % (k,))
+        if r["mode"] != "hole" and (r["hole_before"] or r["hole_after"]):
+            raise SystemExit("⛔ identity_cuts %s 不是 hole 不該有洞的日期" % (k,))
         if not r["source"] or any(x not in CUT_SOURCES for x in r["source"].split("+")) or not (r["evidence"] or "").strip():
             raise SystemExit("⛔ identity_cuts %s 缺來源或證據" % (k,))
         if k in out:
@@ -147,6 +151,17 @@ def apply_cuts(segs, cuts):
         c = cuts.get(k)
         if c is None:
             out.append(s)
+        elif c["mode"] == "pin":
+            out.append(dict(s, pin=c))
+            pre.add(k)
+            post.add(k)
+        elif c["mode"] == "trim":
+            if s["start"] < c["first_trade"]:      # 沒有被切到的代號＝清單過期，留在 pre 之外，下面整次失敗
+                pre.add(k)
+                n += 1
+            if s["end"] >= c["first_trade"]:
+                out.append(dict(s, start=max(s["start"], c["first_trade"])))
+                post.add(k)
         elif c["mode"] == "whole":
             out.append(dict(s, cut=c))
             pre.add(k)
@@ -258,6 +273,15 @@ def build(id_rows, src_rows, version, cal_end=None, cuts=None):
                           "detail": c["evidence"] + ("；" + c["note"] if c["note"] else "")})
             stats["cut_reuse"] += 1
             new_ents[eid] = {"entity_id": eid, "name": "", "type": "mpq_" + asset, "active": 0}
+            continue
+        if s.get("pin"):                   # Polygon 邊界不明、公開資料已確認是哪家：照清單掛，不再走 ambiguous
+            c = s["pin"]
+            if not any(x["entity"] == c["entity_id"] for x in idx.by.get(norm(base_symbol(sym)), [])):
+                raise SystemExit("⛔ identity_cuts pin %s 的 entity_id 不是該代號的 Polygon 段" % sym)
+            rows.append({"entity_id": c["entity_id"], "source": "mpq", "symbol": sym, "from": s["start"], "to": "",
+                         "evidence": "mpq_pin", "note": c["evidence"], "table_version": version, "asset": asset,
+                         "_last": s["end"]})
+            stats["pin"] += 1
             continue
         delisted = sym.upper().endswith(SUFFIX)
         ps = _absorb(idx.pieces(base_symbol(sym), s["start"], s["end"]))

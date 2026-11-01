@@ -178,3 +178,98 @@ add,FIGI:BBG01H9FTHS9,BGC,2018-12-03,spinoff,1.56,,,yahoo,Yahoo chart events.spl
 add,FIGI:BBG01HLMBDC5,FWONK,2014-11-05,spinoff,1.32,,,yahoo,Yahoo chart events.splits 2014-11-05 1000:1323；MPQ 實測跳變 1.32 於 2014-11-05（本地端 10-28 附件）,Polygon 無此記錄；Yahoo 以拆股記載的分拆／重組調整，ratio 用實測跳變（與 Yahoo 值差 ≤5%）
 add,FIGI:BBG01HLMBDC5,FWONK,2016-04-18,spinoff,1.37,,,yahoo,Yahoo chart events.splits 2016-04-18 1000000:1365940；MPQ 實測跳變 1.37 於 2016-04-18（本地端 10-28 附件）,Polygon 無此記錄；Yahoo 以拆股記載的分拆／重組調整，ratio 用實測跳變（與 Yahoo 值差 ≤5%）
 add,FIGI:BBG020WJG351,FWDI,2024-06-18,reverse_split,0.1,10,1,yahoo,Yahoo chart events.splits 2024-06-18 10:1；MPQ 實測跳變 0.1 於 2024-06-18（本地端 10-28 附件）,Polygon 無此記錄
+override,FIGI:BBG001SCTQY4,A,2014-11-03,spinoff,1.398,,,yahoo,Yahoo chart events.splits 2014-11-03 1398:1000；實測台階 1.3980（11-01）,分拆 Keysight
+override,FIGI:BBG001S5QGT0,DHR,2016-07-05,spinoff,1.319,,,yahoo,Yahoo chart events.splits 2016-07-05 1319:1000；實測台階 1.3190（11-01）,分拆 Fortive
+add,FIGI:BBG001S5QGT0,DHR,2023-10-02,spinoff,1.128,,,yahoo,Yahoo chart events.splits 2023-10-02 1128:1000；實測台階 1.1280（11-01）,分拆 Veralto
+override,FIGI:BBG001S9B9J5,EBAY,2015-07-20,spinoff,2.376,,,yahoo,Yahoo chart events.splits 2015-07-20 2376:1000；實測台階 2.3760（11-01）,分拆 PayPal
+override,FIGI:BBG001S5S399,IBM,2021-11-04,spinoff,1.046,,,yahoo,Yahoo chart events.splits 2021-11-04 1046:1000；實測台階 1.0460（11-01）,分拆 Kyndryl
+override,FIGI:BBG001S5X8K9,VLO,2013-05-02,spinoff,1.094,,,yahoo,Yahoo chart events.splits 2013-05-02 1094:1000；實測台階 1.0940（11-01）,分拆 CST Brands
+override,FIGI:BBG001S7T223,XLF,2016-09-19,special_dividend,1.231,,,yahoo,Yahoo chart events.splits 2016-09-19 1231:1000；實測台階 1.2310（11-01）,XLRE 份額分派；原 Polygon 比值 1.139 與 Yahoo、實測不符
+override,FIGI:BBG001S5SRK3,LEN,2017-11-09,stock_dividend,1.017,,,yahoo,Yahoo chart events.splits 2017-11-09 1017:1000；實測台階 1.0170（11-01）,B 類股股票股利
+override,FIGI:BBG001S5SRK3,LEN,2025-01-21,spinoff,1.033,,,yahoo,Yahoo chart events.splits 2025-01-21 1033:1000；實測台階 1.0330（11-01）,分拆 Millrose
+add,FIGI:BBG001S5PVD5,GE,2019-02-26,spinoff,1.04,,,yahoo,Yahoo chart events.splits 2019-02-26 104:100；實測台階 1.0400（11-01）,運輸業務併 Wabtec
+override,FIGI:BBG001S5PVD5,GE,2023-01-04,spinoff,1.281,,,yahoo,Yahoo chart events.splits 2023-01-04 1281:1000；實測台階 1.2810（11-01）,分拆 GE HealthCare
+override,FIGI:BBG001S5T2W4,MDU,2023-06-01,spinoff,1.457,,,yahoo,Yahoo chart events.splits 2023-06-01 1457:1000；實測台階 1.4570（11-01）,分拆 Knife River
+override,FIGI:BBG001S5QXJ4,EQT,2018-11-13,spinoff,1.837,,,yahoo,Yahoo chart events.splits 2018-11-13 1837:1000；實測台階 1.8370（11-01）,分拆 Equitrans
+override,FIGI:BBG00DW3SZT0,DELL,2021-11-02,spinoff,1.973,,,yahoo,Yahoo chart events.splits 2021-11-02 1973:1000；實測台階 1.9730（11-01）,分拆 VMware
+override,FIGI:BBG00HVV7984,APG,2025-07-01,split,1.5,2,3,yahoo,Yahoo chart events.splits 2025-07-01 3:2；實測台階 1.5000（11-01）,3 拆 2
+add,FIGI:BBG001S5N9M6,ABT,2013-01-02,spinoff,2.0842,,,yahoo,Yahoo chart events.splits 2013-01-02 10000:4798；實測台階 2.0842（11-01）,分拆 AbbVie
+add,FIGI:BBG001S5P1K3,BAX,2015-07-01,spinoff,1.841,,,yahoo,Yahoo chart events.splits 2015-07-01 1841:1000；實測台階 1.8410（11-01）,分拆 Baxalta
+add,FIGI:BBG001S5PGY5,CAG,2016-11-10,spinoff,1.285,,,yahoo,Yahoo chart events.splits 2016-11-10 1285:1000；實測台階 1.2850（11-01）,分拆 Lamb Weston
+add,FIGI:BBG001S5TZM2,COP,2012-05-01,spinoff,1.3118,,,yahoo,Yahoo chart events.splits 2012-05-01 1311791:1000000；實測台階 1.3118（11-01）,分拆 Phillips 66
+add,FIGI:BBG001S5QHF3,DIS,2007-06-13,spinoff,1.0137,,,yahoo,Yahoo chart events.splits 2007-06-13 10000:9865；實測台階 1.0137（11-01）,ABC Radio 併 Citadel
+add,FIGI:BBG001SBJMT2,EXC,2022-02-02,spinoff,1.402,,,yahoo,Yahoo chart events.splits 2022-02-02 1402:1000；實測台階 1.4020（11-01）,分拆 Constellation
+add,FIGI:BBG001S5SLZ0,KMB,2014-11-03,spinoff,1.043,,,yahoo,Yahoo chart events.splits 2014-11-03 1043:1000；實測台階 1.0430（11-01）,分拆 Halyard
+add,FIGI:BBG001S78K44,MAR,2009-06-23,stock_dividend,1.004,,,yahoo,Yahoo chart events.splits 2009-06-23 1004:1000；實測台階 1.0040（11-01）,股票股利
+add,FIGI:BBG001S78K44,MAR,2009-08-18,stock_dividend,1.004,,,yahoo,Yahoo chart events.splits 2009-08-18 1004:1000；實測台階 1.0040（11-01）,股票股利
+add,FIGI:BBG001S78K44,MAR,2009-11-17,stock_dividend,1.003,,,yahoo,Yahoo chart events.splits 2009-11-17 1003:1000；實測台階 1.0030（11-01）,股票股利
+add,FIGI:BBG001S78K44,MAR,2011-11-22,spinoff,1.061,,,yahoo,Yahoo chart events.splits 2011-11-22 1061:1000；實測台階 1.0610（11-01）,分拆 Marriott Vacations
+add,FIGI:BBG001S5T3R8,MET,2017-08-07,spinoff,1.122,,,yahoo,Yahoo chart events.splits 2017-08-07 1122:1000；實測台階 1.1220（11-01）,分拆 Brighthouse
+add,FIGI:BBG001S5TC52,MRK,2021-06-03,spinoff,1.048,,,yahoo,Yahoo chart events.splits 2021-06-03 1048:1000；實測台階 1.0480（11-01）,分拆 Organon
+add,FIGI:BBG001S5TMF9,NI,2015-07-02,spinoff,2.545,,,yahoo,Yahoo chart events.splits 2015-07-02 2545:1000；實測台階 2.5450（11-01）,分拆 Columbia Pipeline
+add,FIGI:BBG001S5TZG9,OXY,2014-12-01,spinoff,1.042,,,yahoo,Yahoo chart events.splits 2014-12-01 1042:1000；實測台階 1.0420（11-01）,分拆 California Resources
+add,FIGI:BBG001S5TZG9,OXY,2016-02-25,spinoff,1.0017,,,yahoo,Yahoo chart events.splits 2016-02-25 10000:9983；實測台階 1.0017（11-01）,California Resources 餘股分派
+add,FIGI:BBG001S5V466,PFE,2020-11-17,spinoff,1.054,,,yahoo,Yahoo chart events.splits 2020-11-17 1054:1000；實測台階 1.0540（11-01）,Upjohn 併 Viatris
+add,FIGI:BBG001S77WM9,SPG,2009-08-13,stock_dividend,1.0072,,,yahoo,Yahoo chart events.splits 2009-08-13 100722:100000；實測台階 1.0072（11-01）,股票股利
+add,FIGI:BBG001S77WM9,SPG,2009-11-12,stock_dividend,1.0063,,,yahoo,Yahoo chart events.splits 2009-11-12 10063:10000；實測台階 1.0063（11-01）,股票股利
+add,FIGI:BBG001S77WM9,SPG,2014-05-29,spinoff,1.063,,,yahoo,Yahoo chart events.splits 2014-05-29 1063:1000；實測台階 1.0630（11-01）,分拆 Washington Prime
+add,FIGI:BBG001S5VWH2,T,2022-04-11,spinoff,1.324,,,yahoo,Yahoo chart events.splits 2022-04-11 1324:1000；實測台階 1.3240（11-01）,WarnerMedia 併 Discovery
+add,FIGI:BBG001S67QY1,VZ,2006-11-20,spinoff,1.0381,,,yahoo,Yahoo chart events.splits 2006-11-20 100000:96334；實測台階 1.0381（11-01）,分拆 Idearc
+add,FIGI:BBG001S67QY1,VZ,2008-04-01,spinoff,1.0047,,,yahoo,Yahoo chart events.splits 2008-04-01 100000:99537；實測台階 1.0047（11-01）,分拆併 FairPoint
+add,FIGI:BBG001S67QY1,VZ,2010-07-02,spinoff,1.0662,,,yahoo,Yahoo chart events.splits 2010-07-02 1000000:937889；實測台階 1.0662（11-01）,分拆併 Frontier
+add,FIGI:BBG001S5XD28,WDC,2025-02-24,spinoff,1.323,,,yahoo,Yahoo chart events.splits 2025-02-24 1323:1000；實測台階 1.3230（11-01）,分拆 Sandisk
+add,FIGI:BBG001S5XH10,WMB,2012-01-03,spinoff,1.2267,,,yahoo,Yahoo chart events.splits 2012-01-03 10000:8152；實測台階 1.2267（11-01）,分拆 WPX
+add,FIGI:BBG001S5SBF4,IP,2014-07-02,spinoff,1.014,,,yahoo,Yahoo chart events.splits 2014-07-02 1014:1000；實測台階 1.0140（11-01）,xpedx 併 Veritiv
+add,FIGI:BBG001S5SBF4,IP,2021-10-01,spinoff,1.056,,,yahoo,Yahoo chart events.splits 2021-10-01 1056:1000；實測台階 1.0560（11-01）,分拆 Sylvamo
+add,FIGI:BBG001S5QM08,DRI,2015-11-10,spinoff,1.1205,,,yahoo,Yahoo chart events.splits 2015-11-10 10000:8939；實測台階 1.1205（11-01）,分拆 Four Corners；Yahoo 1.1187，比值用實測
+add,FIGI:BBG001S5X5Q9,RTX,2020-04-03,spinoff,1.589,,,yahoo,Yahoo chart events.splits 2020-04-03 15890:10000；實測台階 1.5890（11-01）,分拆 Carrier、Otis
+add,CIK:0001466258,TT,2013-12-02,spinoff,1.252,,,yahoo,Yahoo chart events.splits 2013-12-02 1252:1000；實測台階 1.2520（11-01）,分拆 Allegion
+add,CIK:0001466258,TT,2020-03-02,spinoff,1.289,,,yahoo,Yahoo chart events.splits 2020-03-02 1289:1000；實測台階 1.2890（11-01）,工業業務併 Gardner Denver
+add,FIGI:BBG001SCQ2X1,IRM,2014-09-26,special_dividend,1.082,,,yahoo,Yahoo chart events.splits 2014-09-26 1082:1000；實測台階 1.0820（11-01）,REIT 轉換特別分派
+add,FIGI:BBG001S5P374,BDX,2022-04-01,spinoff,1.025,,,yahoo,Yahoo chart events.splits 2022-04-01 1025:1000；實測台階 1.0250（11-01）,分拆 Embecta
+add,FIGI:BBG001S5NSB6,APD,2016-10-03,spinoff,1.081,,,yahoo,Yahoo chart events.splits 2016-10-03 1081:1000；實測台階 1.0810（11-01）,分拆 Versum
+add,FIGI:BBG001SF4NY1,ILMN,2024-06-25,spinoff,1.028,,,yahoo,Yahoo chart events.splits 2024-06-25 1028:1000；實測台階 1.0280（11-01）,分拆 Grail
+add,FIGI:BBG024TZWVS6,OKE,2014-02-03,spinoff,1.1422,,,yahoo,Yahoo chart events.splits 2014-02-03 11422:10000；實測台階 1.1422（11-01）,分拆 ONE Gas
+add,FIGI:BBG001S5TP26,NOC,2011-03-31,spinoff,1.1068,,,yahoo,Yahoo chart events.splits 2011-03-31 10000:9035；實測台階 1.1068（11-01）,分拆 Huntington Ingalls
+add,FIGI:BBG001S884K0,O,2021-11-15,spinoff,1.032,,,yahoo,Yahoo chart events.splits 2021-11-15 1032:1000；實測台階 1.0320（11-01）,分拆 Orion Office
+add,FIGI:BBG001S73MB7,CUZ,2016-10-07,spinoff,1.417,,,yahoo,Yahoo chart events.splits 2016-10-07 1417:1000；實測台階 1.4170（11-01）,Parkway 合併與分拆
+add,FIGI:BBG00VT0KP47,MTCH,2020-07-01,spinoff,3.502,,,yahoo,Yahoo chart events.splits 2020-07-01 3502:1000；實測台階 3.5020（11-01）,IAC 分離
+add,FIGI:BBG001SGJPH7,BWXT,2015-07-01,spinoff,1.398,,,yahoo,Yahoo chart events.splits 2015-07-01 1398:1000；實測台階 1.3980（11-01）,分拆 Babcock & Wilcox
+add,FIGI:BBG001WTBC45,POST,2022-03-11,spinoff,1.528,,,yahoo,Yahoo chart events.splits 2022-03-11 1528:1000；實測台階 1.5280（11-01）,BellRing 分派
+add,FIGI:BBG009S3NB21,GOOG,2014-03-27,stock_dividend,2.002,,,yahoo,Yahoo chart events.splits 2014-03-27 2002:1000；實測台階 2.0020（11-01）,C 類股分派
+add,FIGI:BBG009S3NB21,GOOG,2015-04-27,special_dividend,1.0027,,,yahoo,Yahoo chart events.splits 2015-04-27 10027455:10000000；實測台階 1.0027（11-01）,C 類股調整款
+add,FIGI:BBG001SD32Z2,FLG,2024-07-12,reverse_split,0.3333333333,3,1,yahoo,Yahoo chart events.splits 2024-07-12 1:3；實測台階 0.3333（11-01）,1 併 3
+add,FIGI:BBG001S9T7M6,VTR,2015-08-18,spinoff,0.8757,,,yahoo,Yahoo chart events.splits 2015-08-18 8757:10000；實測台階 0.8757（11-01）,分拆 Care Capital，含併股的淨值
+add,FIGI:BBG00BN961H3,DD,2019-04-02,spinoff,1.487,,,yahoo,Yahoo chart events.splits 2019-04-02 1487:1000；實測台階 1.4870（11-01）,分拆 Dow
+override,FIGI:BBG00BN961H3,DD,2019-06-03,reverse_split,0.4725,,,yahoo,Yahoo chart events.splits 2019-06-03 4725:10000；實測台階 0.4725（11-01）,1 併 3＋分拆 Corteva 的淨值
+override,FIGI:BBG00BN961H3,DD,2025-11-03,spinoff,2.39,,,yahoo,Yahoo chart events.splits 2025-11-03 239:100；實測台階 2.3900（11-01）,分拆 Qnity
+add,FIGI:BBG001S5RTS2,DOC,2016-11-01,spinoff,1.098,,,yahoo,Yahoo chart events.splits 2016-11-01 1098:1000；實測台階 1.0980（11-01）,分拆 QCP
+add,FIGI:BBG001S5S0N9,LHX,2009-05-11,spinoff,1.0584,,,yahoo,Yahoo chart events.splits 2009-05-11 10000:9448；實測台階 1.0584（11-01）,分拆 Harris Stratex
+override,FIGI:BBG0058KMH49,HLT,2017-01-04,reverse_split,0.4873,,,yahoo,Yahoo chart events.splits 2017-01-04 1000:2052；實測台階 0.4873（11-01）,1 併 3＋分拆 Park、HGV 的淨值
+add,FIGI:BBG001S5T9L1,MSI,2011-01-04,spinoff,0.2474,,,yahoo,Yahoo chart events.splits 2011-01-04 10000:40425；實測台階 0.2474（11-01）,1 併 7＋分拆 Motorola Mobility 的淨值
+add,FIGI:BBG001S5X1N1,HON,2016-10-03,spinoff,1.0053,,,yahoo,Yahoo chart events.splits 2016-10-03 10000:9947；實測台階 1.0053（11-01）,分拆 AdvanSix
+add,FIGI:BBG001S5X1N1,HON,2018-10-01,spinoff,1.011,,,yahoo,Yahoo chart events.splits 2018-10-01 1011:1000；實測台階 1.0110（11-01）,分拆 Garrett
+add,FIGI:BBG001S5X1N1,HON,2018-10-29,spinoff,1.032,,,yahoo,Yahoo chart events.splits 2018-10-29 1032:1000；實測台階 1.0320（11-01）,分拆 Resideo
+override,CIK:0000937966,ASML,2012-11-29,reverse_split,0.77,,,sec,ASML 6-K 2012-11：合成回購，77 併 100，加現金退資 https://www.sec.gov/Archives/edgar/data/0000937966/000119312512470856/d439738dex991.htm；實測台階 0.77,公告除權基準日 11-26，MPQ 與參考台階都在 11-29，日期取實測
+add,FIGI:BBG00BN961H3,DD,2015-07-01,spinoff,1.0548,,,sec,Chemours 8-K：1 配 5，2015-07-01 完成 https://www.sec.gov/Archives/edgar/data/0001627223/000119312515227957/d945349dex991.htm；實測台階 1.0548,分拆 Chemours；Yahoo 沒有此事件，比值用實測
+add,FIGI:BBG00BN969D0,CTVA,2026-10-01,event_no_k,6.665,,,sec+yahoo,Vylor 8-K：1 配 1，2026-10-01 完成 https://www.sec.gov/Archives/edgar/data/0002128626/000119312526402928/ck0002128626-ex99_1.htm；Yahoo 6665:1000；實測台階 1.0000,分拆 Vylor；MPQ 未調整
+override,FIGI:BBG023TM45X9,CLBK,2026-07-21,event_no_k,2.2,,,company+yahoo,公司公告 2026-07-20 完成二次轉換 https://www.stocktitan.net/news/CLBK/columbia-financial-inc-announces-completion-of-second-step-6e8xbomger71.html；Yahoo 22:10；實測台階 1.0000,二手報導比值寫 22.2，招股書區間 1.87～2.53，取 Yahoo；一手比值未找到
+override,FIGI:BBG001S5XL11,WY,2010-07-20,event_no_k,2.4434,,,company,公司公告除息日 2010-07-20 https://investor.weyerhaeuser.com/2010-07-15-Weyerhaeuser-Announces-Ex-Dividend-Date-for-Special-Dividend；實測台階 1.0000,REIT 轉換特別股息，比值取表上
+override,CIK:0001811216,BAOS,2022-05-25,event_no_k,0.3125,,,exchange,Nasdaq eca2022-115：1 併 3.2 https://www.nasdaqtrader.com/TraderNews.aspx?id=eca2022-115；實測台階 1.0000,併股，MPQ 未調整
+override,FIGI:BBG009H33QN9,FCPT,2016-01-14,event_no_k,1.37,,,sec,FCPT 10-K：Pre-Spin Dividend https://www.sec.gov/Archives/edgar/data/0001650132/000165013217000002/fcpt201610-k.htm；實測台階 1.0000,除息日公開文件未寫，日期與比值取表上
+override,FIGI:BBG001SRV422,SAR,2010-11-17,event_no_k,1.2,,,sec,Saratoga 10-Q：股票股息 https://www.sec.gov/Archives/edgar/data/0001377936/000110465911001639/a11-1493_110q.htm；實測台階 1.0000,比值取表上
+override,FIGI:BBG001SRV422,SAR,2011-11-22,event_no_k,1.094,,,sec,Saratoga 10-K：2011-11-15 宣告股票股息 https://www.prnewswire.com/news-releases/saratoga-investment-corp-declares-425-dividend-per-share-178215621.html；實測台階 1.0000,比值取表上；除息日未見公開文件
+override,FIGI:BBG001SRV422,SAR,2012-11-16,event_no_k,1.097,,,company,公司公告：登記日 2012-11-20 https://www.prnewswire.com/news-releases/saratoga-investment-corp-declares-425-dividend-per-share-178215621.html；實測台階 1.0000,比值取表上
+override,FIGI:BBG001S5PVD5,GE,2024-04-02,event_no_k,1.253,,,yahoo,Yahoo 1253:1000；實測台階 1.0000,分拆 GE Vernova；MPQ 未調整
+override,FIGI:BBG001S5T2W4,MDU,2024-11-01,event_no_k,1.805,,,yahoo,Yahoo 1805:1000；實測台階 1.0000,分拆 Everus；MPQ 未調整
+add,FIGI:BBG001S5P374,BDX,2026-02-10,event_no_k,1.272,,,sec+yahoo,BD 10-Q：2026-02-09 完成 Waters 反向莫里斯信託 https://www.sec.gov/Archives/edgar/data/0000010795/000001079526000026/bdx-20260331.htm；Yahoo 1272:1000；實測台階 1.0000,MPQ 未調整
+override,FIGI:BBG001S5X1N1,HON,2025-10-30,event_no_k,1.061,,,yahoo,Yahoo 1061:1000；實測台階 1.0000,分拆 Solstice；MPQ 未調整
+add,FIGI:BBG001S5X1N1,HON,2026-06-29,event_no_k,0.9535,,,sec+yahoo,Honeywell Aerospace 10-Q：2026-06-29 完成分拆 https://www.sec.gov/Archives/edgar/data/0002089271/000208927126000021/hona-20260627.htm；Yahoo 1907:2000,1 配 2 分拆＋1 併 2 的淨值；MPQ 為實際價未調整；併股比例來自二手報導
+add,FIGI:BBG001S5RTS2,DOC,2013-07-22,mpq_fix,0.9107468124,,,data_check,MPQ 當日憑空斷開，參考價連續；吻合段到 2016-10-31 由此補回,MPQ 2013-07-22～2016-10-31 提前按 QCP 分拆調整
+add,FIGI:BBG001S7SBP9,ALB,2014-04-03,mpq_fix,2,,,data_check,MPQ 當日憑空翻倍，參考價連續；本地端量比 0.5→1.0 佐證,沒有公司事件
+add,FIGI:BBG009S3NB21,GOOG,2008-09-30,mpq_fix,0.8064268478,,,data_check,MPQ 單日異常，前後日正常，參考價連續,和下一交易日一對，只修這一天的比例
+add,FIGI:BBG009S3NB21,GOOG,2008-10-01,mpq_fix,1.24003808,,,data_check,MPQ 單日異常的反向修補,和前一交易日一對
+add,FIGI:BBG00BN961H3,DD,2007-06-01,mpq_fix,0.09368192488,,,data_check,MPQ 單日異常，前後日正常，參考價連續,和下一交易日一對，只修這一天的比例
+add,FIGI:BBG00BN961H3,DD,2007-06-04,mpq_fix,10.67441773,,,data_check,MPQ 單日異常的反向修補,和前一交易日一對
+reject,FIGI:BBG001S5RTQ4,WELL,2014-07-03,,,,,,表上 1:165 併股不存在：MPQ 與參考當日都連續，公開無此事件,表上 1:165 併股不存在：MPQ 與參考當日都連續，公開無此事件
+reject,FIGI:BBG001SB2HG5,AXON,2007-09-28,,,,,,表上 1:600 併股不存在：MPQ 與參考當日都連續，公開無此事件,表上 1:600 併股不存在：MPQ 與參考當日都連續，公開無此事件

@@ -14,11 +14,12 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
+2026-11-01 加 --step ref_fixes：參考價修正表（catalog_src/ref_fixes.csv）；拆股類型加 event_no_k、mpq_fix。
 2026-10-29 拆股表 v4：合併人工查證清單 catalog_src/split_events.csv（add／override／reject，每列附公開來源；Jun 10-29 拍板三點，
   回應本地端暫扣序列需求 ADR-055）；新類型 spinoff／special_dividend／stock_dividend、confidence 加 rejected。
 2026-10-29 日曆 v2 格式（Jun 拍板方案 A，回應本地端首輪體檢 ADR-058）：本地端 CSV 不改；合併 catalog_src/calendar_fixes.csv
   （只補 CSV 沒有的日子，source=fix）＋發布 catalog_src/halts.csv（停盤／延後開盤／已知數據缺口）。
-用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|series_publish|identity_refresh [--dry-run] [--out _catalog_out] [--rule-years 2027]
+用法：python catalog_rules.py --step splits|calendar|identity_mpq|series_candidates|series_publish|identity_refresh|ref_fixes [--dry-run] [--out _catalog_out] [--rule-years 2027]
 Python 3.9 相容。
 """
 import argparse
@@ -44,6 +45,7 @@ CAL_SRC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog
 SPLIT_EVENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "split_events.csv")
 CAL_FIXES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "calendar_fixes.csv")
 CAL_HALTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "halts.csv")
+REF_FIXES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog_src", "ref_fixes.csv")
 HIGH_FROM = "2003-01-01"          # Polygon 拆股 2003 起完整；2000～2002 明顯不全（10-17 實測）
 FAR = "9999-12-31"
 REPO = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"   # 10-28 門禁修正：環境變數經門讀（同 raw_writer）
@@ -440,12 +442,13 @@ def plan_splits(files, read, raw, events_text=None):
 # ── 人工查證清單（2026-10-29 Jun 拍板：①新類型沿用 splits.csv ②每筆要公開來源、跳變只當線索 ③錯的不刪標 rejected）──
 EVENT_COLS = ["action", "entity_id", "symbol", "ex_date", "type", "ratio", "split_from", "split_to", "source", "evidence", "note"]
 EVENT_ACTIONS = ("add", "override", "reject")
-EVENT_TYPES = ("split", "reverse_split", "spinoff", "special_dividend", "stock_dividend")
-EVENT_SOURCES = ("polygon", "polygon_dividend", "sec", "company", "exchange", "yahoo")
+EVENT_TYPES = ("split", "reverse_split", "spinoff", "special_dividend", "stock_dividend", "event_no_k", "mpq_fix")
+EVENT_SOURCES = ("polygon", "polygon_dividend", "sec", "company", "exchange", "yahoo", "data_check")
 SPLIT_SCHEMA_V3 = json.loads(json.dumps(SPLIT_SCHEMA_V2))
 SPLIT_SCHEMA_V3["schema"] = "catalog_splits_v3"
 SPLIT_SCHEMA_V3["splits.csv"]["type"] += ("｜spinoff＝分拆（含合併分拆的重組調整）｜special_dividend＝特別股息｜stock_dividend＝股票股利"
-                                          "（後三種只來自人工查證清單，ratio＝還原倍數，split_from／split_to 可空）")
+                                          "（後三種只來自人工查證清單，ratio＝還原倍數，split_from／split_to 可空）"
+                                          "｜event_no_k＝真事件但 MPQ 當段沒調整，只記錄、不進 K｜mpq_fix＝MPQ 自身斷開的 K 修補，不是公司行動")
 SPLIT_SCHEMA_V3["splits.csv"]["source"] = ("polygon｜人工查證清單的來源（yahoo／sec／company／exchange／polygon_dividend）；"
                                            "更正過的 Polygon 列＝polygon+<來源>")
 SPLIT_SCHEMA_V3["splits.csv"]["evidence"] = "Polygon 記錄 id｜清單附的公開記錄與實測跳變（「；」分隔）"
@@ -534,6 +537,51 @@ def apply_events(rows, events, version, msyms=None):
             st["reject"] += 1
     out.sort(key=lambda x: (x["entity_id"], x["ex_date"]))
     return out, dict(st)
+
+
+# ── 參考價修正表（2026-11-01 本地端審核：會改變判定結果，比照規則表帶版本與 sha256）──
+REF_DIR = CAT + "/ref_fixes"
+REF_SRC_COLS = ["symbol", "from", "to", "divide_by", "source", "evidence", "note"]
+REF_COLS = REF_SRC_COLS + ["table_version"]
+REF_SCHEMA = {
+    "schema": "catalog_ref_fixes_v1",
+    "ref_fixes.csv": {
+        "symbol": "參考實際價 d_raw 的代號", "from": "起（含）", "to": "訖（含）",
+        "divide_by": "d_raw 的價格在區間內除以這個數才是實際價；量乘以它",
+        "source": "同人工查證清單", "evidence": "公開依據與實測", "note": "說明", "table_version": "本表版本號"},
+    "限制": ["只修 S4 用的參考價，不改 MPQ；線上 dataset 的 d_raw 不在範圍內"]}
+
+
+def parse_ref_fixes(text):
+    """修正清單 CSV → 列表；任何一列不合格或區間重疊就整次停。純函數。"""
+    rd = csv.DictReader(io.StringIO(text))
+    if rd.fieldnames != REF_SRC_COLS:
+        raise SystemExit("⛔ ref_fixes.csv 欄位不符：%s" % rd.fieldnames)
+    out = []
+    for i, r in enumerate(rd, 2):
+        dates = all(re.match(r"^\d{4}-\d{2}-\d{2}$", r[k] or "") for k in ("from", "to"))
+        if not (r["symbol"] and dates and r["from"] <= r["to"] and _ratio_ok(r["divide_by"]) and (r["evidence"] or "").strip()
+                and all(x in EVENT_SOURCES for x in (r["source"] or "-").split("+"))):
+            raise SystemExit("⛔ ref_fixes.csv 第 %d 列不合格" % i)
+        out.append(r)
+    out.sort(key=lambda r: (r["symbol"], r["from"]))
+    for a, b in zip(out, out[1:]):
+        if a["symbol"] == b["symbol"] and b["from"] <= a["to"]:
+            raise SystemExit("⛔ ref_fixes.csv 區間重疊：%s" % a["symbol"])
+    return out
+
+
+def plan_ref_fixes(files, read, text):
+    rows = parse_ref_fixes(text)
+    last_v, last = last_manifest(files, read, REF_DIR)
+    ver = last_v + 1
+    rows = [dict(r, table_version=ver) for r in rows]
+    csha = content_sha(rows, REF_COLS)
+    if last and last.get("content_sha256") == csha:
+        return [], "沿用 v%d（內容未變）" % last_v
+    f = {"ref_fixes.csv": to_csv(rows, REF_COLS), "schema.json": json.dumps(REF_SCHEMA, ensure_ascii=False, indent=1)}
+    man = manifest(ver, "catalog_src/ref_fixes.csv", f, {"content_sha256": csha})
+    return emit(REF_DIR, ver, f, man), "發布 v%d：%d 區間、%d 代號" % (ver, len(rows), len({r["symbol"] for r in rows}))
 
 
 # ── 交易日曆 ──
@@ -776,7 +824,7 @@ def fetch_polygon_splits():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "series_publish", "identity_refresh"),
+    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "series_publish", "identity_refresh", "ref_fixes"),
                     help="identity_mpq＝身份表 v2 含 MPQ 代號（2026-10-25，identity_mpq.py）｜"
                          "series_candidates＝序列正本表候選（2026-10-26，series_mpq.py）｜"
                          "identity_refresh＝身份表重建：最新 Polygon 來源＋併 MPQ 一次發版（2026-10-28 工單通道）")
@@ -793,6 +841,9 @@ def main():
             with open(SPLIT_EVENTS_FILE, encoding="utf-8") as fh:
                 ev = fh.read()
         adds, summ = plan_splits(files, hf.read, fetch_polygon_splits(), ev)
+    elif a.step == "ref_fixes":
+        with open(REF_FIXES_FILE, encoding="utf-8") as fh:
+            adds, summ = plan_ref_fixes(files, hf.read, fh.read())
     elif a.step == "identity_mpq":
         import identity_mpq
         adds, summ = identity_mpq.plan(files, hf.read)
@@ -825,7 +876,7 @@ def main():
     for p, t in adds:
         hf.add(p, t)
     n = hf.flush(a.out, "catalog %s" % a.step)
-    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "series_publish": "序列正本表", "identity_refresh": "身份表重建"}[a.step], summ), flush=True)
+    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "series_publish": "序列正本表", "identity_refresh": "身份表重建", "ref_fixes": "參考價修正表"}[a.step], summ), flush=True)
     print("寫出 %d 個檔（%s）" % (n, "本機試跑 " + a.out if a.dry_run else "私有 dataset"), flush=True)
     return 0
 

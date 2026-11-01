@@ -184,8 +184,8 @@ check("超出容差 → 切段、後段自成一家、列 polygon_ended",
       and [p["kind"] for p in p3] == ["polygon_ended"], (r3, p3))
 
 # ── 10-30 代號重用切分（ADR-060）──
-CUT_H = "symbol,asset,mode,hole_before,hole_after,first_trade,source,evidence,note\n"
-CUT_T = CUT_H + "NEWCO,etf,hole,2005-04-21,2020-09-10,2020-09-17,yahoo,Yahoo 上市 2020,\n"
+CUT_H = "symbol,asset,mode,hole_before,hole_after,first_trade,source,evidence,note,entity_id\n"
+CUT_T = CUT_H + "NEWCO,etf,hole,2005-04-21,2020-09-10,2020-09-17,yahoo,Yahoo 上市 2020,,\n"
 C_ID = [{"entity_id": "FIGI:NEW", "source": "polygon", "symbol": "NEWCO", "from": "", "to": ""}]
 C_SRC = [{"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2005-01-03", "d_last": "2005-04-21", "m5_first": "", "m5_last": ""},
          {"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2020-09-10", "d_last": "2026-10-01", "m5_first": "", "m5_last": ""}]
@@ -218,8 +218,24 @@ c_fails("切分：來源不在名單要停", lambda: IM.parse_cuts(CUT_T.replace
 c_fails("切分：洞日期倒置要停", lambda: IM.parse_cuts(CUT_T.replace("2005-04-21", "2021-01-01")))
 c_fails("切分：重複要停", lambda: IM.parse_cuts(CUT_T + CUT_T[len(CUT_H):]))
 c_fails("切分：欄位不對要停", lambda: IM.parse_cuts("a,b\n"))
+
+# ── 11-01 trim／pin ──
+T_SRC = [{"mpq_symbol": "NEWCO", "asset": "etf", "d_first": "2005-01-03", "d_last": "2026-10-01", "m5_first": "", "m5_last": ""}]
+T_T = CUT_H + "NEWCO,etf,trim,,,2010-05-03,data_check,開頭混入舊數據,,\n"
+t_rows = IM.build(C_ID, T_SRC, 6, "2026-10-01", IM.parse_cuts(T_T))[0]
+check("trim：起始日改成指定日", len(t_rows) == 1 and t_rows[0]["from"] == "2010-05-03" and t_rows[0]["entity_id"] == "FIGI:NEW", t_rows)
+c_fails("trim：日期早於序列（清單過期）要停", lambda: IM.build(C_ID, T_SRC, 6, "2026-10-01", IM.parse_cuts(T_T.replace("2010-05-03", "2000-01-03"))))
+c_fails("trim：有洞的日期要停", lambda: IM.parse_cuts(T_T.replace(",,,2010", ",2001-01-02,,2010")))
+P_ID = [{"entity_id": "FIGI:OLD", "source": "polygon", "symbol": "NEWCO", "from": "", "to": "0000-00-00"},
+        {"entity_id": "FIGI:NEW", "source": "polygon", "symbol": "NEWCO", "from": "0000-00-00", "to": ""}]
+P_T = CUT_H + "NEWCO,etf,pin,,,,sec,公開確認,,FIGI:NEW\n"
+check("未 pin：邊界不明自成一家", IM.build(P_ID, T_SRC, 6, "2026-10-01")[0][0]["entity_id"] == "MPQ:NEWCO")
+p_rows = IM.build(P_ID, T_SRC, 6, "2026-10-01", IM.parse_cuts(P_T))[0]
+check("pin：掛到指定公司", p_rows[0]["entity_id"] == "FIGI:NEW" and p_rows[0]["evidence"] == "mpq_pin", p_rows)
+c_fails("pin：公司不是該代號的段要停", lambda: IM.build(P_ID, T_SRC, 6, "2026-10-01", IM.parse_cuts(P_T.replace("FIGI:NEW", "FIGI:X"))))
+c_fails("pin：缺 entity_id 要停", lambda: IM.parse_cuts(P_T.replace("FIGI:NEW", "")))
 check("真清單：格式全過", len(IM.parse_cuts(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "catalog_src",
-                                                     "identity_cuts.csv"), encoding="utf-8").read())) == 159)
+                                                     "identity_cuts.csv"), encoding="utf-8").read())) == 169)
 # 整段切出（2026-10-31）：X-DELISTED 舊段不是現任公司，X 照常掛現任
 CUT_W = CUT_H + "NEWCO-DELISTED,stock,whole,,,2025-01-02,sec,SEC 2024 才首次申報,\n"
 W_ID = [{"entity_id": "FIGI:NEW", "source": "polygon", "symbol": "NEWCO", "from": "", "to": "2026-09-22"}]
