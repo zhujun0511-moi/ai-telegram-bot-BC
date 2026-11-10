@@ -33,10 +33,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.9
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: pip install requests pymongo   # 2026-10-02：GCP/Mongo 段＋CFET 自計時要讀 Mongo（原只裝 requests→靜默略過）
