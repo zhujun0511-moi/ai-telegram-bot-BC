@@ -45,7 +45,7 @@ jobs:
       - name: Run nightly chain
         env:
           MONGO_URI:        ${{ secrets.MONGO_URI }}
-          GH_TOKEN:         ${{ secrets.GH_TOKEN }}
+          GH_TOKEN:         ${{ secrets.ZHUJUN0511_CHAIN_BC || secrets.GH_TOKEN }}
           CFET_REPO:        ${{ secrets.CFET_REPO }}
           GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
           PYTHONUNBUFFERED: "1"

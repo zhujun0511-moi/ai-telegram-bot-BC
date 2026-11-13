@@ -34,6 +34,6 @@ jobs:
 
       - name: Dispatch CFET judge repo
         env:
-          GH_TOKEN:  ${{ secrets.GH_TOKEN }}
+          GH_TOKEN:  ${{ secrets.ZHUJUN0511_CHAIN_BC || secrets.GH_TOKEN }}
           CFET_REPO: ${{ secrets.CFET_REPO }}
         run: python run_cfet_fanout.py

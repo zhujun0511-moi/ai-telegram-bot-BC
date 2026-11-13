@@ -43,7 +43,7 @@ jobs:
 
       - name: Run minutes watchdog
         env:
-          GH_TOKEN:          ${{ secrets.GH_TOKEN }}
+          GH_TOKEN:          ${{ secrets.ZHUJUN0511_CHAIN_BC || secrets.GH_TOKEN }}
           COMM_HUB_URL:      ${{ secrets.COMM_HUB_URL }}
           WEBHOOK_SECRET:    ${{ secrets.WEBHOOK_SECRET }}   # notify() 用 x-webhook-secret，漏了會 403
           MONGO_URI:         ${{ secrets.MONGO_URI }}        # 2026-09-26：讀 FractalRadar.System_State 的 setup_scan 自計時
