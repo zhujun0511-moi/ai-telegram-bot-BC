@@ -1,0 +1,55 @@
+name: List Review (DC 股票清單審查)
+
+# 2026-11-13 Jun「照範圍做」：審查 DC 股票清單（身份／父板塊／子籃子／重要度／可加入／清單規矩），只出報告、
+# 不改清單、不寫 Mongo、不發通知。產出 dataset swing_ai/list_review/{日期}/（登記 MongoDB_Standard_v3 六-D 2026-11-13）。
+# 父板塊標準＝SSGA 公布的 XL 實際持股；子籃子標準＝TradingView（非官方介面，Jun 11-13：至多季度審查才抓，tv_refresh=1）。
+# 只能手動觸發。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tv_refresh:
+        description: "1=重抓 TradingView 快照（只在季度審查用）"
+        required: false
+        default: "0"
+      dry_run:
+        description: "1=試跑，不寫 dataset"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  # GitHub 三條線（日常／考試／臨時）：手動審查走臨時線
+  group: temp-line
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz huggingface_hub
+
+      - name: Run list review
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          IN_TV:            ${{ github.event.inputs.tv_refresh }}
+          IN_DRY:           ${{ github.event.inputs.dry_run }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS=()
+          if [ "$IN_TV" = "1" ]; then ARGS+=(--tv-refresh); fi
+          if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
+          python tools/list_review.py "${ARGS[@]}"
