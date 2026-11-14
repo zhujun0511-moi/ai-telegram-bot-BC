@@ -89,6 +89,15 @@ adds3, _ = CR.plan_splits(set(store), read, RAW + [{"id": "z", "ticker": "NVDA",
                                                      "split_from": 1, "split_to": 4}])
 check("內容變了發 v2", adds3 and adds3[0][0].startswith("_catalog/splits/v2/"))
 check("v2 的 table_version＝2", rows(dict(adds3)["_catalog/splits/v2/splits.csv"])[0]["table_version"] == "2")
+pin = json.loads(dict(CR.plan_splits(set(store), read, RAW + [{"id": "z", "ticker": "NVDA", "execution_date": "2021-07-20",
+                                                               "split_from": 1, "split_to": 4}], identity_version=1)[0])[
+    "_catalog/splits/v2/manifest.json"])
+check("指定身份表版本：manifest 記指定的版本", pin["identity_version"] == 1, pin.get("identity_version"))
+try:
+    CR.plan_splits(set(store), read, RAW, identity_version=99)
+    check("指定不存在的身份表版本要停", False)
+except SystemExit:
+    check("指定不存在的身份表版本要停", True)
 
 # ── 日曆 ──
 y2027 = {r["date"]: r for r in CR.nyse_year(2027)}

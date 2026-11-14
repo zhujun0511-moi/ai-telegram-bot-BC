@@ -27,6 +27,10 @@ on:
         description: "日曆用規則推算的年份（逗號分隔）"
         required: false
         default: "2027"
+      identity_version:
+        description: "splits 用：指定身份表版本（空＝最新）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -70,14 +74,17 @@ jobs:
           IN_STEP:  ${{ github.event.inputs.step }}
           IN_DRY:   ${{ github.event.inputs.dry_run }}
           IN_YEARS: ${{ github.event.inputs.rule_years }}
+          IN_IDV:   ${{ github.event.inputs.identity_version }}
         run: |
           # 輸入一律經環境變數、只允許安全字元（防指令注入）
           case "$IN_STEP" in splits|calendar|identity_mpq|series_candidates|series_publish|identity_refresh|ref_fixes) ;; *) echo "step 不合法"; exit 1;; esac
           if ! [[ "$IN_YEARS" =~ ^[0-9,]*$ ]]; then echo "rule_years 含不允許的字元"; exit 1; fi
+          if ! [[ "$IN_IDV" =~ ^[0-9]*$ ]]; then echo "identity_version 只能是數字"; exit 1; fi
           if [ "$IN_STEP" = "identity_refresh" ] && [ "$IN_DRY" != "1" ]; then
             python ticker_identity.py || exit 1
           fi
           ARGS=(--step "$IN_STEP")
           if [ "$IN_DRY" = "1" ]; then ARGS+=(--dry-run); fi
           if [ -n "$IN_YEARS" ]; then ARGS+=(--rule-years "$IN_YEARS"); fi
+          if [ -n "$IN_IDV" ]; then ARGS+=(--identity-version "$IN_IDV"); fi
           python catalog_rules.py "${ARGS[@]}"

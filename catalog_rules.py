@@ -14,6 +14,7 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
+2026-11-14 splits 加 --identity-version：指定身份表版本（Jun：身份表 v7 有 5 個已知問題，拆股表 v9 照 v6）。
 2026-11-01 加 --step ref_fixes：參考價修正表（catalog_src/ref_fixes.csv）；拆股類型加 event_no_k、mpq_fix。
 2026-10-29 拆股表 v4：合併人工查證清單 catalog_src/split_events.csv（add／override／reject，每列附公開來源；Jun 10-29 拍板三點，
   回應本地端暫扣序列需求 ADR-055）；新類型 spinoff／special_dividend／stock_dividend、confidence 加 rejected。
@@ -293,8 +294,14 @@ def split_rows(raw, id_rows, version, src_rows=None, keep_notes=None):
     return rows, unm, dict(stats)
 
 
-def latest_identity(files, read):
-    ver, man = last_manifest(files, read, ID_DIR)
+def latest_identity(files, read, ver=None):
+    """ver＝指定版本（None＝最新）；指定的版本不存在就停。"""
+    if ver:
+        if ver not in published(files, ID_DIR):
+            raise SystemExit("⛔ 找不到 _catalog/identity/v%d" % ver)
+        man = json.loads(read("%s/v%d/manifest.json" % (ID_DIR, ver)))
+    else:
+        ver, man = last_manifest(files, read, ID_DIR)
     if not ver:
         raise SystemExit("⛔ 找不到 _catalog/identity 已發布版本")
     return ver, list(csv.DictReader(io.StringIO(read("%s/v%d/identity.csv" % (ID_DIR, ver))))), man
@@ -384,9 +391,10 @@ def guard(raw, base):
     return out, notes, changes, dict(st)
 
 
-def plan_splits(files, read, raw, events_text=None):
-    """events_text＝catalog_src/split_events.csv 內容（v4 起；None＝不合併，照 v3）。"""
-    id_ver, id_rows, id_man = latest_identity(files, read)
+def plan_splits(files, read, raw, events_text=None, identity_version=None):
+    """events_text＝catalog_src/split_events.csv 內容（v4 起；None＝不合併，照 v3）。
+    identity_version＝指定身份表版本（None＝最新）。"""
+    id_ver, id_rows, id_man = latest_identity(files, read, identity_version)
     src_rows = mpq_src_rows(read, id_man)
     last_v, last = last_manifest(files, read, SPLIT_DIR)
     ver = last_v + 1
@@ -831,6 +839,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="不寫 dataset，結果寫本機 --out")
     ap.add_argument("--out", default="_catalog_out")
     ap.add_argument("--rule-years", default="2027", help="規則推算的年份（逗號分隔）")
+    ap.add_argument("--identity-version", type=int, default=None, help="splits 用：指定身份表版本（預設最新）")
     a = ap.parse_args()
     from courier.dataset import RawHF
     hf = RawHF(write=not a.dry_run, repo=REPO, written_by="catalog_rules")
@@ -840,7 +849,7 @@ def main():
         if os.path.exists(SPLIT_EVENTS_FILE):
             with open(SPLIT_EVENTS_FILE, encoding="utf-8") as fh:
                 ev = fh.read()
-        adds, summ = plan_splits(files, hf.read, fetch_polygon_splits(), ev)
+        adds, summ = plan_splits(files, hf.read, fetch_polygon_splits(), ev, a.identity_version)
     elif a.step == "ref_fixes":
         with open(REF_FIXES_FILE, encoding="utf-8") as fh:
             adds, summ = plan_ref_fixes(files, hf.read, fh.read())
