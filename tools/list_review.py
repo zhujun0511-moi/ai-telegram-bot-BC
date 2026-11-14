@@ -40,6 +40,12 @@ THEMATIC = {"AIQ", "PAVE", "GRID", "ARKK", "XLY1", "IPO", "BOTZ", "URA", "LIT", 
 # 中概 ADR 黑名單（Jun 08-09 硬規則；TradingView 國家欄另抓 China／Hong Kong）
 CHINA_ADR = {"BABA", "PDD", "JD", "BIDU", "NIO", "LI", "XPEV", "TCOM", "BILI", "NTES", "TME", "ZTO", "BEKE", "VIPS",
              "FUTU", "TAL", "EDU", "IQ", "WB", "YMM", "HTHT", "ZK", "QFIN", "LU", "GDS", "KC", "TIGR", "BZ", "ATAT"}
+# 不算中概的例外（TradingView 國家欄誤標；Jun 11-13 拍板）：SIMO 慧榮＝台灣公司，被標 Hong Kong
+CHINA_EXEMPT = {"SIMO"}
+
+
+def _is_china(tk, tv):
+    return tk not in CHINA_EXEMPT and (tk in CHINA_ADR or (tv.get(tk) or {}).get("country") in ("China", "Hong Kong"))
 
 # 📝 門檻（起始值）
 STALE_DAYS = 5            # 日線落後幾個交易日算停更
@@ -313,7 +319,7 @@ def check_candidate(rep, lists, holdings, tv):
             tk = r["ticker"]
             if r["weight"] < CAND_WEIGHT or tk in have:
                 continue
-            if tk in CHINA_ADR or (tv.get(tk, {}).get("country") in ("China", "Hong Kong")):
+            if _is_china(tk, tv):
                 continue
             rep.add("candidate", "review", tk, xl, "%s 權重 %.2f%%，我們沒收" % (xl, r["weight"]),
                     evidence="SSGA %s" % as_of, suggestion="考慮加入 %s 底下的籃子" % xl,
@@ -324,7 +330,7 @@ def check_rules(rep, lists, tv):
     etf_like = lists["list_1"] | lists["list_2"] | set(XLS) | {k.upper() for k in lists["sub_sectors"]}
     for tk in sorted(set(lists["full_set"]) | set(lists["membership"])):
         t = tv.get(tk, {})
-        if tk in CHINA_ADR or t.get("country") in ("China", "Hong Kong"):
+        if _is_china(tk, tv):
             rep.add("rule", "act", tk, "", "中概股（黑名單或 TradingView 國家＝%s）" % (t.get("country") or "黑名單"),
                     suggestion="依 Jun 硬規則移除", text="%s 是中概股，違反清單規則" % tk)
     for key, sub in sorted(lists["sub_sectors"].items()):
