@@ -265,8 +265,8 @@ override,FIGI:BBG001S5T2W4,MDU,2024-11-01,event_no_k,1.805,,,yahoo,Yahoo 1805:10
 add,FIGI:BBG001S5P374,BDX,2026-02-10,event_no_k,1.272,,,sec+yahoo,BD 10-Q：2026-02-09 完成 Waters 反向莫里斯信託 https://www.sec.gov/Archives/edgar/data/0000010795/000001079526000026/bdx-20260331.htm；Yahoo 1272:1000；實測台階 1.0000,MPQ 未調整
 override,FIGI:BBG001S5X1N1,HON,2025-10-30,event_no_k,1.061,,,yahoo,Yahoo 1061:1000；實測台階 1.0000,分拆 Solstice；MPQ 未調整
 add,FIGI:BBG001S5X1N1,HON,2026-06-29,event_no_k,0.9535,,,sec+yahoo,Honeywell Aerospace 10-Q：2026-06-29 完成分拆 https://www.sec.gov/Archives/edgar/data/0002089271/000208927126000021/hona-20260627.htm；Yahoo 1907:2000,1 配 2 分拆＋1 併 2 的淨值；MPQ 為實際價未調整；併股比例來自二手報導
-add,FIGI:BBG001S5RTS2,DOC,2013-07-22,mpq_fix,0.9107468124,,,data_check,MPQ 當日憑空斷開，參考價連續；吻合段到 2016-10-31 由此補回,MPQ 2013-07-22～2016-10-31 提前按 QCP 分拆調整
-add,FIGI:BBG001S7SBP9,ALB,2014-04-03,mpq_fix,2,,,data_check,MPQ 當日憑空翻倍，參考價連續；本地端量比 0.5→1.0 佐證,沒有公司事件
+add,FIGI:BBG001S5RTS2,DOC,2013-07-22,mpq_fix_pv,0.9107468124,,,data_check,MPQ 當日憑空斷開，參考價連續；吻合段到 2016-10-31 由此補回,MPQ 2013-07-22～2016-10-31 提前按 QCP 分拆調整
+add,FIGI:BBG001S7SBP9,ALB,2014-04-03,mpq_fix_pv,2,,,data_check,MPQ 當日憑空翻倍，參考價連續；本地端量比 0.5→1.0 佐證,沒有公司事件
 add,FIGI:BBG009S3NB21,GOOG,2008-09-30,mpq_fix,0.8064268478,,,data_check,MPQ 單日異常，前後日正常，參考價連續,和下一交易日一對，只修這一天的比例
 add,FIGI:BBG009S3NB21,GOOG,2008-10-01,mpq_fix,1.24003808,,,data_check,MPQ 單日異常的反向修補,和前一交易日一對
 add,FIGI:BBG00BN961H3,DD,2007-06-01,mpq_fix,0.09368192488,,,data_check,MPQ 單日異常，前後日正常，參考價連續,和下一交易日一對，只修這一天的比例

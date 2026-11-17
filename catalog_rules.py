@@ -14,6 +14,7 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
+2026-11-17 拆股類型加 mpq_fix_pv（價和量一起修；ALB、DOC 實測量比 0.5／0.911）。
 2026-11-14 splits 加 --identity-version：指定身份表版本（Jun：身份表 v7 有 5 個已知問題，拆股表 v9 照 v6）。
 2026-11-01 加 --step ref_fixes：參考價修正表（catalog_src/ref_fixes.csv）；拆股類型加 event_no_k、mpq_fix。
 2026-10-29 拆股表 v4：合併人工查證清單 catalog_src/split_events.csv（add／override／reject，每列附公開來源；Jun 10-29 拍板三點，
@@ -450,13 +451,14 @@ def plan_splits(files, read, raw, events_text=None, identity_version=None):
 # ── 人工查證清單（2026-10-29 Jun 拍板：①新類型沿用 splits.csv ②每筆要公開來源、跳變只當線索 ③錯的不刪標 rejected）──
 EVENT_COLS = ["action", "entity_id", "symbol", "ex_date", "type", "ratio", "split_from", "split_to", "source", "evidence", "note"]
 EVENT_ACTIONS = ("add", "override", "reject")
-EVENT_TYPES = ("split", "reverse_split", "spinoff", "special_dividend", "stock_dividend", "event_no_k", "mpq_fix")
+EVENT_TYPES = ("split", "reverse_split", "spinoff", "special_dividend", "stock_dividend", "event_no_k", "mpq_fix", "mpq_fix_pv")
 EVENT_SOURCES = ("polygon", "polygon_dividend", "sec", "company", "exchange", "yahoo", "data_check")
 SPLIT_SCHEMA_V3 = json.loads(json.dumps(SPLIT_SCHEMA_V2))
 SPLIT_SCHEMA_V3["schema"] = "catalog_splits_v3"
 SPLIT_SCHEMA_V3["splits.csv"]["type"] += ("｜spinoff＝分拆（含合併分拆的重組調整）｜special_dividend＝特別股息｜stock_dividend＝股票股利"
                                           "（後三種只來自人工查證清單，ratio＝還原倍數，split_from／split_to 可空）"
-                                          "｜event_no_k＝真事件但 MPQ 當段沒調整，只記錄、不進 K｜mpq_fix＝MPQ 自身斷開的 K 修補，不是公司行動")
+                                          "｜event_no_k＝真事件但 MPQ 當段沒調整，只記錄、不進 K｜mpq_fix＝MPQ 自身斷開的 K 修補，只修價、不修量，不是公司行動"
+                                          "｜mpq_fix_pv＝MPQ 價和量一起被錯調的修補，價乘、量除（2026-11-17 Jun：ALB、DOC）")
 SPLIT_SCHEMA_V3["splits.csv"]["source"] = ("polygon｜人工查證清單的來源（yahoo／sec／company／exchange／polygon_dividend）；"
                                            "更正過的 Polygon 列＝polygon+<來源>")
 SPLIT_SCHEMA_V3["splits.csv"]["evidence"] = "Polygon 記錄 id｜清單附的公開記錄與實測跳變（「；」分隔）"

@@ -400,6 +400,8 @@ fails("action,entity_id\n", "清單：欄位不符要停")
 # ── 11-01 新類型與參考價修正表 ──
 nk = CR.parse_events(EVH + "add,FIGI:X,X,2020-01-02,event_no_k,2,,,sec,ev,\nadd,FIGI:X,X,2021-01-04,mpq_fix,2,,,data_check,ev,\n")
 check("清單：event_no_k、mpq_fix 收", [e["type"] for e in nk] == ["event_no_k", "mpq_fix"])
+check("清單：mpq_fix_pv 收", CR.parse_events(EVH + "add,FIGI:X,X,2020-01-02,mpq_fix_pv,2,,,data_check,ev,
+")[0]["type"] == "mpq_fix_pv")
 RH = "symbol,from,to,divide_by,source,evidence,note\n"
 rf = CR.parse_ref_fixes(RH + "ON,2014-03-11,2014-03-12,10,yahoo,ev,\nON,2000-01-01,2014-03-10,100,yahoo,ev,\n")
 check("修正表：按日期排序", [r["from"] for r in rf] == ["2000-01-01", "2014-03-11"])
