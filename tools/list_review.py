@@ -36,7 +36,8 @@ VERSION = "list_review v1 (2026-11-13)"
 XLS = ("XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY")
 
 # 子籃子行業一致性檢查的豁免名單（主題籃本來就跨行業；📝 待 Jun 確認）
-THEMATIC = {"AIQ", "PAVE", "GRID", "ARKK", "XLY1", "IPO", "BOTZ", "URA", "LIT", "XLK8", "UFO", "FINX", "BITQ"}
+THEMATIC = {"AIQ", "PAVE", "GRID", "ARKK", "XLY1", "IPO", "BOTZ", "URA", "LIT", "XLK8", "UFO", "FINX", "BITQ",
+            "XLY901"}   # 2026-11-18：消費降級（合成主題籃，故意跨 XLP／XLY）
 # 中概 ADR 黑名單（Jun 08-09 硬規則；TradingView 國家欄另抓 China／Hong Kong）
 CHINA_ADR = {"BABA", "PDD", "JD", "BIDU", "NIO", "LI", "XPEV", "TCOM", "BILI", "NTES", "TME", "ZTO", "BEKE", "VIPS",
              "FUTU", "TAL", "EDU", "IQ", "WB", "YMM", "HTHT", "ZK", "QFIN", "LU", "GDS", "KC", "TIGR", "BZ", "ATAT"}
