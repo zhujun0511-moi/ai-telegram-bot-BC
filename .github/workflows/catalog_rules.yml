@@ -14,11 +14,11 @@ on:
   workflow_dispatch:
     inputs:
       step:
-        description: "splits＝拆股事件表｜calendar＝交易日曆｜identity_mpq＝身份表 v2（含 MPQ 代號）｜series_candidates＝序列正本表候選｜identity_refresh＝身份表重建（Polygon 重建＋併 MPQ 一次發版）｜ref_fixes＝參考價修正表"
+        description: "splits＝拆股事件表｜calendar＝交易日曆｜identity_mpq＝身份表 v2（含 MPQ 代號）｜series_candidates＝序列正本表候選｜identity_refresh＝身份表重建（Polygon 重建＋併 MPQ 一次發版）｜ref_fixes＝參考價修正表｜symbols＝證券名冊"
         required: true
         default: "splits"
         type: choice
-        options: [splits, calendar, identity_mpq, series_candidates, series_publish, identity_refresh, ref_fixes]
+        options: [splits, calendar, identity_mpq, series_candidates, series_publish, identity_refresh, ref_fixes, symbols]
       dry_run:
         description: "1＝只試跑不寫 dataset"
         required: false
@@ -28,7 +28,7 @@ on:
         required: false
         default: "2027"
       identity_version:
-        description: "splits／series_publish 用：指定身份表版本（空＝最新）"
+        description: "splits／series_publish／symbols 用：指定身份表版本（空＝最新）"
         required: false
         default: ""
 
@@ -63,6 +63,7 @@ jobs:
           python tests/test_series_mpq.py
           python tests/test_catalog_publish.py
           python tests/test_identity_refresh.py
+          python tests/test_catalog_symbols.py
 
       - name: Publish
         env:
@@ -77,7 +78,7 @@ jobs:
           IN_IDV:   ${{ github.event.inputs.identity_version }}
         run: |
           # 輸入一律經環境變數、只允許安全字元（防指令注入）
-          case "$IN_STEP" in splits|calendar|identity_mpq|series_candidates|series_publish|identity_refresh|ref_fixes) ;; *) echo "step 不合法"; exit 1;; esac
+          case "$IN_STEP" in splits|calendar|identity_mpq|series_candidates|series_publish|identity_refresh|ref_fixes|symbols) ;; *) echo "step 不合法"; exit 1;; esac
           if ! [[ "$IN_YEARS" =~ ^[0-9,]*$ ]]; then echo "rule_years 含不允許的字元"; exit 1; fi
           if ! [[ "$IN_IDV" =~ ^[0-9]*$ ]]; then echo "identity_version 只能是數字"; exit 1; fi
           if [ "$IN_STEP" = "identity_refresh" ] && [ "$IN_DRY" != "1" ]; then

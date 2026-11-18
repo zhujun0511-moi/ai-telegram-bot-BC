@@ -14,6 +14,7 @@ catalog_rules.py — 發布拆股事件表、交易日曆兩種規則表正本�
 2026-10-25 拆股表 v2：身份表含 mpq 列時，拆股先按「該日 MPQ 數據屬哪家」對公司（A8 重掛），多一欄 mpq_symbols。
 2026-10-25 加 --step identity_mpq：身份表 v2 含 MPQ 代號（邏輯在 identity_mpq.py；輸入 _catalog/_src/mpq_symbols，不連 Polygon）。
 2026-10-28 加 --step identity_refresh：身份表重建（先跑 ticker_identity.py；邏輯在 identity_mpq.plan_refresh；工單通道用）。
+2026-11-18 加 --step symbols：證券名冊 _catalog/symbols（邏輯在 catalog_symbols.py；Polygon 代號總表約 50 分鐘）。
 2026-11-17 拆股類型加 mpq_fix_pv（價和量一起修；ALB、DOC 實測量比 0.5／0.911）。
 2026-11-14 splits 加 --identity-version：指定身份表版本（Jun：身份表 v7 有 5 個已知問題，拆股表 v9 照 v6）。
 2026-11-01 加 --step ref_fixes：參考價修正表（catalog_src/ref_fixes.csv）；拆股類型加 event_no_k、mpq_fix。
@@ -834,14 +835,14 @@ def fetch_polygon_splits():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "series_publish", "identity_refresh", "ref_fixes"),
+    ap.add_argument("--step", required=True, choices=("splits", "calendar", "identity_mpq", "series_candidates", "series_publish", "identity_refresh", "ref_fixes", "symbols"),
                     help="identity_mpq＝身份表 v2 含 MPQ 代號（2026-10-25，identity_mpq.py）｜"
                          "series_candidates＝序列正本表候選（2026-10-26，series_mpq.py）｜"
                          "identity_refresh＝身份表重建：最新 Polygon 來源＋併 MPQ 一次發版（2026-10-28 工單通道）")
     ap.add_argument("--dry-run", action="store_true", help="不寫 dataset，結果寫本機 --out")
     ap.add_argument("--out", default="_catalog_out")
     ap.add_argument("--rule-years", default="2027", help="規則推算的年份（逗號分隔）")
-    ap.add_argument("--identity-version", type=int, default=None, help="splits／series_publish 用：指定身份表版本（預設最新）")
+    ap.add_argument("--identity-version", type=int, default=None, help="splits／series_publish／symbols 用：指定身份表版本（預設最新）")
     a = ap.parse_args()
     from courier.dataset import RawHF
     hf = RawHF(write=not a.dry_run, repo=REPO, written_by="catalog_rules")
@@ -852,6 +853,14 @@ def main():
             with open(SPLIT_EVENTS_FILE, encoding="utf-8") as fh:
                 ev = fh.read()
         adds, summ = plan_splits(files, hf.read, fetch_polygon_splits(), ev, a.identity_version)
+    elif a.step == "symbols":
+        import catalog_symbols
+        from courier import polygon as PG
+        act = PG.sector_fetch_reference_all(_log=print, active=True)
+        ina = PG.sector_fetch_reference_all(_log=print, active=False, max_pages=150)
+        if act is None or ina is None:
+            raise SystemExit("⛔ Polygon 代號總表抓取失敗")
+        adds, summ = catalog_symbols.plan(files, hf.read, act, ina, a.identity_version)
     elif a.step == "ref_fixes":
         with open(REF_FIXES_FILE, encoding="utf-8") as fh:
             adds, summ = plan_ref_fixes(files, hf.read, fh.read())
@@ -887,7 +896,7 @@ def main():
     for p, t in adds:
         hf.add(p, t)
     n = hf.flush(a.out, "catalog %s" % a.step)
-    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "series_publish": "序列正本表", "identity_refresh": "身份表重建", "ref_fixes": "參考價修正表"}[a.step], summ), flush=True)
+    print("%s：%s" % ({"splits": "拆股表", "calendar": "交易日曆", "identity_mpq": "身份表", "series_candidates": "序列正本表候選", "series_publish": "序列正本表", "identity_refresh": "身份表重建", "ref_fixes": "參考價修正表", "symbols": "證券名冊"}[a.step], summ), flush=True)
     print("寫出 %d 個檔（%s）" % (n, "本機試跑 " + a.out if a.dry_run else "私有 dataset"), flush=True)
     return 0
 
