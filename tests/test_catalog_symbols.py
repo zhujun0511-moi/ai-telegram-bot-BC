@@ -42,6 +42,9 @@ check("同實體對上", mq["NEWCO"]["match"] == "entity" and mq["NEWCO"]["name"
 check("舊公司段對到舊公司", mq["NEWCO-DELISTED"]["name"] == "Prior Owner" and mq["NEWCO-DELISTED"]["delisted"] == "2010-01-05")
 check("實體對不上就看代號", mq["OLDX-DELISTED"]["match"] == "symbol" and mq["OLDX-DELISTED"]["type"] == "CS")
 check("都沒有＝none", mq["ZZZ"]["match"] == "none" and mq["ZZZ"]["name"] == "")
+ID2 = ID + [{"entity_id": "FIGI:BBGPRIOR", "source": "mpq", "symbol": "NEWCO", "asset": "stock", "to": "2010-01-05"}]
+mq2 = [x for x in CS.mpq_rows(ID2, tk, 1) if x["mpq_symbol"] == "NEWCO"]
+check("同代號先後兩家公司各一列", sorted(x["name"] for x in mq2) == ["New Co", "Prior Owner"], mq2)
 
 idcsv = io.StringIO()
 w = csv.DictWriter(idcsv, fieldnames=["entity_id", "source", "symbol", "from", "to", "evidence", "note", "table_version", "asset"])

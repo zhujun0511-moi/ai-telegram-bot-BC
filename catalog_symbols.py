@@ -36,7 +36,7 @@ SCHEMA = {
         "composite_figi": "Polygon 原值", "share_class_figi": "Polygon 原值",
         "entity_id": "照身份表規則推出的實體（FIGI:／CIK:／NAME:；可空）", "table_version": "本表版本號"},
     "mpq.csv": {
-        "mpq_symbol": "身份表的 MPQ 代號", "asset": "stock／etf", "entity_id": "身份表該段的實體",
+        "mpq_symbol": "身份表的 MPQ 代號", "asset": "stock／etf", "entity_id": "身份表該段的實體（一列＝代號×資產×實體）",
         "name": "名稱", "type": "Polygon 類型", "primary_exchange": "主要交易所", "delisted": "下市日",
         "match": "entity＝同實體對上｜symbol＝代號相同、實體對不上｜none＝Polygon 查無", "table_version": "本表版本號"},
     "限制": ["沒有上市日：Polygon 總表沒有，請用 MPQ 第一根日期",
@@ -80,7 +80,8 @@ def _pick(cands, delisted):
 
 
 def mpq_rows(id_rows, tickers, version):
-    """純函數：身份表的 mpq 列＋tickers.csv 的列 → mpq.csv 的列（每個 MPQ 代號×資產一列）。"""
+    """純函數：身份表的 mpq 列＋tickers.csv 的列 → mpq.csv 的列（每個 MPQ 代號×資產×實體一列；
+    同代號先後屬於不同公司時各一列，2026-11-18 v2 起，與本地端總表同口徑）。"""
     by_e, by_t = defaultdict(list), defaultdict(list)
     for x in tickers:
         if x["entity_id"]:
@@ -90,7 +91,7 @@ def mpq_rows(id_rows, tickers, version):
     for r in id_rows:
         if (r.get("source") or "") != "mpq":
             continue
-        k = (r["symbol"], r.get("asset") or "")
+        k = (r["symbol"], r.get("asset") or "", r["entity_id"])
         if k in seen:
             continue
         seen.add(k)
@@ -106,7 +107,7 @@ def mpq_rows(id_rows, tickers, version):
                     "name": hit["name"] if hit else "", "type": hit["type"] if hit else "",
                     "primary_exchange": hit["primary_exchange"] if hit else "", "delisted": hit["delisted"] if hit else "",
                     "match": how, "table_version": version})
-    out.sort(key=lambda x: (x["mpq_symbol"], x["asset"]))
+    out.sort(key=lambda x: (x["mpq_symbol"], x["asset"], x["entity_id"]))
     return out
 
 
