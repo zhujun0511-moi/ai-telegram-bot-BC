@@ -45,6 +45,8 @@ STEPS = [
     ("commdata_daily",   "BCP", "commdata_daily.yml",   {"mode": "full"}, {"mode": "dry_run"}, 30),
     ("raw_writer_daily", "BC",  "raw_writer_daily.yml", {"write": "1"},   {"write": "0"},      165),
     ("bars_daily",       "BCP", "bars_daily.yml",       {"mode": "full"}, {"mode": "dry_run"}, 90),   # 要在 raw_writer 之後（讀 actions.csv）
+    # 2026-11-18：考試庫週檔搬進回測庫（Jun 同意；沒有 sealed 的週就直接結束，只搬早於切點的週）
+    ("exam_weekly_move", "BCP", "exam_weekly_move.yml", {"mode": "real"}, {"mode": "dry_run"}, 30),
 ]
 
 
