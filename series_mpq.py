@@ -9,6 +9,7 @@ series_mpq.py — 序列正本表的候選（2026-10-26 Jun 同意範圍＝A4 �
 - gap        前後接、空檔 >10 天 → hold（Jun 人工看）
 輸入：_catalog/identity 最新版（需含 source=mpq）＋ 它所根據的 _catalog/_src/mpq_symbols（取各段末根日）
 輸出：_catalog/series/candidates/v<N>/{groups.csv, pairs.csv, schema.json, manifest.json}（草稿，不是正本）
+2026-11-17 plan_publish 可指定身份表版本（Jun：身份表 v7 有已知問題，正本 v3 照 v6）。
 2026-10-30 加正本發布 plan_publish：本地端核對結果（_src/series_check）＋候選表 → _catalog/series/v<N>/。
 登記：MongoDB_Standard_v3 §六-D 10-26 條。寫入方＝catalog_rules.py --step series_candidates。日誌只印筆數。Python 3.9 相容。
 """
@@ -308,8 +309,8 @@ def build_series(groups, pairs, checks, version, overrides=None):
     return series, aliases, hold, dict(st)
 
 
-def plan_publish(files, read):
-    """回 (adds, 摘要)。純計算，不寫東西。"""
+def plan_publish(files, read, identity_version=None):
+    """回 (adds, 摘要)。純計算，不寫東西。identity_version＝指定身份表版本（None＝最新）。"""
     cv = published(files, CHECK_DIR)
     if not cv:
         raise SystemExit("⛔ 找不到 %s（先跑 tools/upload_series_check.py）" % CHECK_DIR)
@@ -321,7 +322,9 @@ def plan_publish(files, read):
     cand_v = published(files, CAND_DIR)[-1]
     d = "%s/v%d" % (CAND_DIR, cand_v)
     cand_man = json.loads(read(d + "/manifest.json"))
-    id_ver = published(files, ID_DIR)[-1]
+    id_ver = identity_version or published(files, ID_DIR)[-1]
+    if id_ver not in published(files, ID_DIR):
+        raise SystemExit("⛔ 找不到 %s/v%d" % (ID_DIR, id_ver))
     if cand_man["identity_version"] != id_ver:
         raise SystemExit("⛔ 候選表 v%d 用身份表 v%s，最新是 v%d" % (cand_v, cand_man["identity_version"], id_ver))
     ov_txt = None

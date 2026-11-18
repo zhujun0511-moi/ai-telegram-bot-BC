@@ -841,7 +841,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="不寫 dataset，結果寫本機 --out")
     ap.add_argument("--out", default="_catalog_out")
     ap.add_argument("--rule-years", default="2027", help="規則推算的年份（逗號分隔）")
-    ap.add_argument("--identity-version", type=int, default=None, help="splits 用：指定身份表版本（預設最新）")
+    ap.add_argument("--identity-version", type=int, default=None, help="splits／series_publish 用：指定身份表版本（預設最新）")
     a = ap.parse_args()
     from courier.dataset import RawHF
     hf = RawHF(write=not a.dry_run, repo=REPO, written_by="catalog_rules")
@@ -863,7 +863,7 @@ def main():
         adds, summ = identity_mpq.plan_refresh(files, hf.read)
     elif a.step == "series_publish":
         import series_mpq
-        adds, summ = series_mpq.plan_publish(files, hf.read)
+        adds, summ = series_mpq.plan_publish(files, hf.read, a.identity_version)
     elif a.step == "series_candidates":
         import series_mpq
         adds, summ = series_mpq.plan(files, hf.read)

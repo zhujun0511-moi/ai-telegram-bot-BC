@@ -28,7 +28,7 @@ on:
         required: false
         default: "2027"
       identity_version:
-        description: "splits 用：指定身份表版本（空＝最新）"
+        description: "splits／series_publish 用：指定身份表版本（空＝最新）"
         required: false
         default: ""
 
