@@ -102,5 +102,23 @@ check("開單欄位齊（from/to/status/round/replies）", d["from"] == "datacen
       and d["round"] == 1 and d["replies"] == [] and d["detail"] == {"a": 1}, d)
 check("現在時間是美東帶時區", RT.now_et_iso()[-6:] in ("-04:00", "-05:00"), RT.now_et_iso())
 
+# 2026-11-21：cannot_verify／no_change／progress
+check("cannot_verify 沒寫 note 擋下", RT.validate_reply("cannot_verify", {}, "") is not None)
+check("cannot_verify 有 note 通過", RT.validate_reply("cannot_verify", {}, "說明") is None)
+check("no_change 沒寫 note 擋下", RT.validate_reply("no_change", {}, " ") is not None)
+check("no_change 有 note 通過", RT.validate_reply("no_change", {}, "拆股表 v11 已有") is None)
+_t = {"_id": "local-x", "round": 2}
+_q, _u = RT.reply_update(_t, "no_change", {}, "n", "2026-11-21T10:00:00-05:00")
+check("no_change 會結案", _u["$set"]["status"] == "replied" and _q["round"] == 2)
+_q, _u = RT.progress_update(_t, "進度", "2026-11-21T10:00:00-05:00")
+check("progress 不改 status", "$set" not in _u and _u["$push"]["replies"]["kind"] == "progress")
+check("progress 條件鎖 working＋同輪＋給我方", _q == {"_id": "local-x", "to": "datacenter", "status": "working", "round": 2}, _q)
+try:
+    RT.progress_update(_t, " ", "2026-11-21T10:00:00-05:00")
+    check("progress 沒寫 note 擋下", False)
+except ValueError:
+    check("progress 沒寫 note 擋下", True)
+check("progress 不在一般回覆類型裡（不會結案）", "progress" not in RT.REPLY_KINDS)
+
 print("\n通過 %d／失敗 %d" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

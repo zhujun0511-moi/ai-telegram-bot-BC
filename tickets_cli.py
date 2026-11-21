@@ -68,6 +68,25 @@ def cmd_reply(a):
     print("✅ 已回覆 %s（%s）" % (a.id, a.kind) if r.modified_count == 1 else "⛔ 沒寫進去（單子狀態或輪次已變）")
 
 
+def cmd_note(a):
+    """2026-11-21：只追加一則進度說明（kind=progress），單子維持 working、不結案。"""
+    m = _mongo()
+    d = m.find_one(RT.DB, RT.COL, {"_id": a.id, "to": RT.ME})
+    if not d:
+        sys.exit("⛔ 查無給數據中心的單 %s" % a.id)
+    if d.get("status") == "open":                      # 同 reply：先搶成 working
+        if m.find_one_and_update(RT.DB, RT.COL, {"_id": a.id, "to": RT.ME, "status": "open"},
+                                 {"$set": {"status": "working"}}) is None:
+            sys.exit("⛔ 單子狀態剛變了，請重新 show")
+        d["status"] = "working"
+    if d.get("status") != "working":
+        sys.exit("⛔ 單子狀態是 %s，不能寫進度" % d.get("status"))
+    body = json.loads(a.body) if a.body else {}
+    q, u = RT.progress_update(d, a.note, RT.now_et_iso(), body)
+    r = m.update_one(RT.DB, RT.COL, q, u)
+    print("✅ 已寫進度 %s（維持 working）" % a.id if r.modified_count == 1 else "⛔ 沒寫進去（單子狀態或輪次已變）")
+
+
 def cmd_open(a):
     m = _mongo()
     detail = None
@@ -105,6 +124,11 @@ def main():
     p.add_argument("--body", default="")
     p.add_argument("--note", default="")
     p.set_defaults(fn=cmd_reply)
+    p = sp.add_parser("note")
+    p.add_argument("id")
+    p.add_argument("--note", required=True)
+    p.add_argument("--body", default="")
+    p.set_defaults(fn=cmd_note)
     p = sp.add_parser("open")
     p.add_argument("--type", required=True)
     p.add_argument("--key", required=True)

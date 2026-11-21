@@ -38,7 +38,12 @@ REPLY_KINDS = {
     "source_gap":     ("trading_days",),
     "market_changed": ("new_market", "effective"),
     "unknown":        (),                        # note 必填
+    # 2026-11-21（Jun 同意；登記 MongoDB_Standard_v3「2026-11-21 新增登記」）：兩種都 note 必填、結案
+    "cannot_verify":  (),                        # 我方無法核對／是數據源特性 → 本地端自定規則
+    "no_change":      (),                        # 規則表／名冊已有正確資料；note 寫明版本與列
 }
+NOTE_REQUIRED = ("unknown", "cannot_verify", "no_change")
+PROGRESS_KIND = "progress"                       # 只追加進度說明、status 維持 working（不在 REPLY_KINDS）
 DELISTED_REASONS = ("acquired", "merged", "spun_off", "deregistered", "exchange_delist")
 
 
@@ -68,8 +73,8 @@ def validate_reply(kind, body, note):
             return "identity_version 要是已發布的身份表版本號（正整數）"
     if kind == "source_gap" and not all(isinstance(d, str) and len(d) == 10 for d in body["trading_days"]):
         return "trading_days 要是 YYYY-MM-DD 字串清單"
-    if kind == "unknown" and not (note or "").strip():
-        return "unknown 必須寫 note"
+    if kind in NOTE_REQUIRED and not (note or "").strip():
+        return "%s 必須寫 note" % kind
     if kind == "delisted":
         if body.get("reason") not in (None,) + DELISTED_REASONS:
             return "delisted 的 reason 只能是 %s（或不填）" % "／".join(DELISTED_REASONS)
@@ -89,6 +94,18 @@ def reply_update(ticket, kind, body, note, at):
     q = {"_id": ticket["_id"], "to": ME, "status": "working", "round": rnd}
     u = {"$push": {"replies": {"by": ME, "at": at, "round": rnd, "kind": kind, "body": body or {}, "note": note or ""}},
          "$set": {"status": "replied"}}
+    return q, u
+
+
+def progress_update(ticket, note, at, body=None):
+    """回 (條件, 更新)：只追加一則進度說明（kind=progress），status 維持 working、不結案。
+    條件鎖住「給我方的、working、同一輪」；note 必填。"""
+    if not (note or "").strip():
+        raise ValueError("progress 必須寫 note")
+    rnd = int(ticket.get("round") or 1)
+    q = {"_id": ticket["_id"], "to": ME, "status": "working", "round": rnd}
+    u = {"$push": {"replies": {"by": ME, "at": at, "round": rnd, "kind": PROGRESS_KIND, "body": body or {},
+                               "note": note}}}
     return q, u
 
 
