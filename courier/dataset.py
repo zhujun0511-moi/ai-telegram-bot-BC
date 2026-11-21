@@ -44,17 +44,24 @@ class RawHF:
     def add(self, path, text):
         self.pending.append((path, text))
 
+    def delete(self, path):
+        """2026-11-21 每日上市事件：與新增同一次 commit 刪舊快照（text=None 代表刪除）。"""
+        self.pending.append((path, None))
+
     def flush(self, out_dir, note):
         if not self.pending:
             return 0
         n = len(self.pending)
         if self.write:
-            from huggingface_hub import CommitOperationAdd
-            ops = [CommitOperationAdd(path_in_repo=p, path_or_fileobj=t.encode("utf-8")) for p, t in self.pending]
+            from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+            ops = [CommitOperationDelete(path_in_repo=p) if t is None else
+                   CommitOperationAdd(path_in_repo=p, path_or_fileobj=t.encode("utf-8")) for p, t in self.pending]
             self.api.create_commit(repo_id=self.repo, repo_type="dataset", operations=ops,
                                    commit_message=f"{self.written_by}: {note}")
         else:
             for p, t in self.pending:
+                if t is None:          # 試跑：刪除只記不做
+                    continue
                 fp = os.path.join(out_dir, p)
                 os.makedirs(os.path.dirname(fp), exist_ok=True)
                 with open(fp, "w", encoding="utf-8", newline="\n") as f:

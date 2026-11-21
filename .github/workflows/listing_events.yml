@@ -1,0 +1,58 @@
+name: Listing Events (每日上市事件)
+
+# 2026-11-21 新增（Jun：「應當有每日的固定進程，查詢當日的退市、換市場、新上市等情況」）。
+# 美東 07:00 週二～週六（排在工單預審之前）：比對 Polygon 現役總表，寫 Mongo CommData.ListingEvents（保留 30 天，本地端定時讀）、
+# dataset swing_ai/listing_events/、發 Telegram。GitHub cron 只認 UTC：夏令 UTC 11:00、冬令 UTC 12:00 兩個都排，
+# 由 listing_events.schedule_ok 依當天是否夏令只放行一個。登記：MongoDB_Standard_v3「2026-11-21 新集合＋新產品登記」。
+# 公開 repo：日誌只印數量、不印代號。
+
+on:
+  schedule:
+    - cron: "0 11 * * 2-6"   # 夏令美東 07:00
+    - cron: "0 12 * * 2-6"   # 冬令美東 07:00
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1＝只讀取比對，不寫 Mongo／dataset、不通知"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: listing-events
+  cancel-in-progress: false
+
+jobs:
+  listing_events:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Offline tests
+        run: python tests/test_listing_events.py
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz huggingface_hub
+
+      - name: Run
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          WEBHOOK_SECRET:   ${{ secrets.WEBHOOK_SECRET }}
+          COMM_HUB_URL:     ${{ secrets.COMM_HUB_URL }}
+          PYTHONUNBUFFERED: "1"
+          IN_DRY:           ${{ github.event.inputs.dry_run }}
+          IN_SCHED:         ${{ github.event.schedule }}
+        run: |
+          if [ "$IN_DRY" = "1" ]; then python listing_events.py --dry-run; else python listing_events.py; fi

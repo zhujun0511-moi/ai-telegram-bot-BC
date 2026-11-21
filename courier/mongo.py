@@ -93,6 +93,13 @@ def delete_one(db, col, query):
     return _col(db, col).delete_one(query)
 
 
+def delete_many(db, col, query):
+    """2026-11-21 每日上市事件：只刪 CommData.ListingEvents 30 天前的文件（條件由 listing_events.prune_query 寫死）。"""
+    if not query:
+        raise ValueError("delete_many 不接受空條件")
+    return _col(db, col).delete_many(query)
+
+
 def create_index(db, col, keys_, **kw):
     return _col(db, col).create_index(keys_, **kw)
 
