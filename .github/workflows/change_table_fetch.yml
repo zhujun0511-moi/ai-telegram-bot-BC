@@ -23,6 +23,10 @@ on:
         description: "輸出資料夾標籤"
         required: false
         default: "20261123"
+      mode:
+        description: "full＝兩份歷史總表比對；extra＝補查（讀私有 dataset 的 extra_tickers.txt 逐支查，2026-11-23）"
+        required: false
+        default: "full"
 
 permissions:
   contents: read
@@ -35,7 +39,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 330
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,10 +65,17 @@ jobs:
           IN_END:           ${{ github.event.inputs.end }}
           IN_AHEAD:         ${{ github.event.inputs.ahead }}
           IN_TAG:           ${{ github.event.inputs.tag }}
+          IN_MODE:          ${{ github.event.inputs.mode }}
           PYTHONUNBUFFERED: "1"
         run: |
           for v in "$IN_START" "$IN_END" "$IN_AHEAD"; do
             if ! [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then echo "日期格式不對"; exit 1; fi
           done
           if ! [[ "$IN_TAG" =~ ^[A-Za-z0-9_-]+$ ]]; then echo "標籤含不允許的字元"; exit 1; fi
-          python tools/change_table_fetch.py --start "$IN_START" --end "$IN_END" --ahead "$IN_AHEAD" --tag "$IN_TAG"
+          if [ "$IN_MODE" = "extra" ]; then
+            python tools/change_table_fetch.py --extra --tag "$IN_TAG"
+          elif [ "$IN_MODE" = "full" ]; then
+            python tools/change_table_fetch.py --start "$IN_START" --end "$IN_END" --ahead "$IN_AHEAD" --tag "$IN_TAG"
+          else
+            echo "mode 只能是 full 或 extra"; exit 1
+          fi

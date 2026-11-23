@@ -146,8 +146,55 @@ def run(raw, hf, scope, start, end, ahead, tag, log=print):
     return 0
 
 
+EXTRA_EVENTS_CAP = 60
+EXTRA_COLS = ["ticker", "found", "active_ticker", "active_market", "active_exchange", "active_type", "active_name",
+              "active_entity", "inactive_n", "delisted_utc", "inactive_name", "inactive_entity"]
+
+
+def run_extra(raw, hf, tag, log=print):
+    """2026-11-23 補查：MPQ 總表 active 但不在 Polygon 交易所名單的代號，逐支查現役（不限市場，含 OTC）與下市。
+    清單由數據中心窗口放在私有 dataset（代號不進公開 repo）。"""
+    P = "swing_ai/_probe/change_table_%s/" % tag
+    txt = hf.read(P + "extra_tickers.txt")
+    if not txt:
+        log("⛔ 找不到補查清單，不查")
+        return 1
+    tickers = [t.strip() for t in txt.splitlines() if t.strip() and not t.startswith("#")]
+    rows, evs, fail = [], [], 0
+    for t in tickers:
+        lk = LE._lookup(raw, t)
+        if lk is None:
+            fail += 1
+            rows.append({"ticker": t, "found": "query_failed"})
+            continue
+        a = (lk.get("active") or [{}])[0] if lk.get("active") else {}
+        ina = sorted(lk.get("inactive") or [], key=lambda r: r.get("delisted_utc") or "", reverse=True)
+        i0 = ina[0] if ina else {}
+        rows.append({"ticker": t, "found": "active" if a else ("inactive" if ina else "none"),
+                     "active_ticker": a.get("ticker"), "active_market": a.get("market"), "active_exchange": a.get("primary_exchange"),
+                     "active_type": a.get("type"), "active_name": a.get("name"), "active_entity": LE.entity_of(a) if a else "",
+                     "inactive_n": len(ina), "delisted_utc": (i0.get("delisted_utc") or "")[:10], "inactive_name": i0.get("name"),
+                     "inactive_entity": LE.entity_of(i0) if i0 else ""})
+    cand = [r for r in rows if r["found"] in ("active", "inactive")]
+    for r in cand[:EXTRA_EVENTS_CAP]:
+        got = ticker_events(raw, r["ticker"])
+        for day, nt in (got[1] if got else [("", "")]):
+            evs.append({"queried": r["ticker"], "entity": r.get("active_entity") or r.get("inactive_entity") or "", "date": day, "ticker": nt})
+    meta = {"mode": "extra", "created": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "tickers": len(tickers),
+            "found": {k: sum(1 for r in rows if r["found"] == k) for k in ("active", "inactive", "none", "query_failed")},
+            "events_queried": min(len(cand), EXTRA_EVENTS_CAP), "events_cap": EXTRA_EVENTS_CAP, "note": "一次性補查；不含價格"}
+    hf.add(P + "extra_lookup.csv", LE.to_csv(EXTRA_COLS, rows))
+    hf.add(P + "extra_events.csv", LE.to_csv(EV_COLS, evs))
+    hf.add(P + "extra_meta.json", json.dumps(meta, ensure_ascii=False, indent=1) + "\n")
+    n = hf.flush("_change_table_out", "change table extra lookup %d" % len(tickers))
+    log("補查 %d 支：現役 %d、只有下市紀錄 %d、查無 %d、查詢失敗 %d；查改名事件 %d 支；寫入 %d 檔" % (
+        len(tickers), meta["found"]["active"], meta["found"]["inactive"], meta["found"]["none"], fail, meta["events_queried"], n))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--extra", action="store_true", help="補查模式：讀私有 dataset 的 extra_tickers.txt 逐支查")
     ap.add_argument("--start", default="2026-10-17")
     ap.add_argument("--end", default="2026-11-20")
     ap.add_argument("--ahead", default="2026-11-30")
@@ -160,6 +207,8 @@ def main():
     repo = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"
     mongo.configure(strict=True, serverSelectionTimeoutMS=20000)
     hf = RawHF(write=not a.dry_run, repo=repo, written_by="BC change_table_fetch")
+    if a.extra:
+        return run_extra(RawPolygon(print), hf, a.tag)
     dc, syms, ents, symv = LE._scope(mongo, hf)
     print("清單：DC %d 支＋本地端總表 %d 代號／%d 實體（名冊 v%s）" % (len(dc), len(syms), len(ents), symv))
     return run(RawPolygon(print), hf, (dc, syms, ents), a.start, a.end, a.ahead, a.tag)

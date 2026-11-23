@@ -81,6 +81,25 @@ def main():
     bad = FakeRaw()
     bad.all_pages = lambda path, params: [] if "date" in params else None
     assert CT.run(bad, hf2, scope, "2026-10-17", "2026-11-20", "2026-11-30", "t", log=lambda *a: None) == 1 and not hf2.files
+    # 補查模式：清單從 dataset 讀；現役（OTC）／只有下市／查無 三種
+    class ExRaw(FakeRaw):
+        def all_pages(self, path, params):
+            self.calls.append((path, dict(params)))
+            t, act = params["ticker"], params["active"] == "true"
+            if t == "OTC1" and act:
+                return [{"ticker": "OTC1", "market": "otc", "type": "CS", "name": "X", "share_class_figi": "F1"}]
+            if t == "DEAD" and not act:
+                return [{"ticker": "DEAD", "delisted_utc": "2026-11-02T00:00:00Z", "name": "D"},
+                        {"ticker": "DEAD", "delisted_utc": "2001-01-01T00:00:00Z", "name": "D0"}]
+            return []
+    hx = FakeHF()
+    hx.read = lambda p: "# 註解\nOTC1\nDEAD\nNONE\n" if p.endswith("extra_tickers.txt") else None
+    assert CT.run_extra(ExRaw(), hx, "t", log=lambda *a: None) == 0
+    lk = hx.files["swing_ai/_probe/change_table_t/extra_lookup.csv"]
+    assert "OTC1,active,OTC1,otc" in lk and "DEAD,inactive" in lk and "2026-11-02" in lk and "NONE,none" in lk, lk
+    assert json.loads(hx.files["swing_ai/_probe/change_table_t/extra_meta.json"])["events_queried"] == 2
+    hy = FakeHF(); hy.read = lambda p: None
+    assert CT.run_extra(ExRaw(), hy, "t", log=lambda *a: None) == 1 and not hy.files
     print("✅ test_change_table_fetch 全部通過")
 
 
