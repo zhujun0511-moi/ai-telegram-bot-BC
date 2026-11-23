@@ -1,0 +1,70 @@
+name: Change Table Fetch (10-20～11-20 變動表 Polygon 部分，一次性)
+
+# 2026-11-23：本地端需求「10-20～11-20 公司行動與身份變動總表」，Jun「同意」方案。
+# ListingEvents 11-21 才開始，之前一個月用 Polygon 歷史現役總表兩份比對補上。只手動觸發；
+# 結果只寫私有 dataset swing_ai/_probe/change_table_<tag>/；公開日誌只印數量（登記 MongoDB_Standard_v3 2026-11-23）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "起點總表日期（期間前一個交易日）"
+        required: false
+        default: "2026-10-17"
+      end:
+        description: "終點總表日期"
+        required: false
+        default: "2026-11-20"
+      ahead:
+        description: "拆股／股利查到哪天（含已公告未生效）"
+        required: false
+        default: "2026-11-30"
+      tag:
+        description: "輸出資料夾標籤"
+        required: false
+        default: "20261123"
+
+permissions:
+  contents: read
+
+concurrency:
+  # 2026-10-18 Jun：GitHub 三條線（日常／考試／臨時）；所有臨時任務共用 temp-line，同時最多一個在跑
+  group: temp-line
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Offline tests
+        run: python tests/test_change_table_fetch.py && python tests/test_listing_events.py
+
+      - name: Install dependencies
+        run: pip install pymongo requests pytz huggingface_hub
+
+      - name: Fetch
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          IN_START:         ${{ github.event.inputs.start }}
+          IN_END:           ${{ github.event.inputs.end }}
+          IN_AHEAD:         ${{ github.event.inputs.ahead }}
+          IN_TAG:           ${{ github.event.inputs.tag }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          for v in "$IN_START" "$IN_END" "$IN_AHEAD"; do
+            if ! [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then echo "日期格式不對"; exit 1; fi
+          done
+          if ! [[ "$IN_TAG" =~ ^[A-Za-z0-9_-]+$ ]]; then echo "標籤含不允許的字元"; exit 1; fi
+          python tools/change_table_fetch.py --start "$IN_START" --end "$IN_END" --ahead "$IN_AHEAD" --tag "$IN_TAG"
