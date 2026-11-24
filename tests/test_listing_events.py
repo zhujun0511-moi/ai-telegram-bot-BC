@@ -49,6 +49,10 @@ check("沒 FIGI 沒 CIK 無法判斷同家", L.same_company({"name": "A"}, {"nam
 check("entity：FIGI 優先", L.entity_of(R("X", "F1", "5")) == "FIGI:F1")
 check("entity：無 FIGI 用 CIK 補 10 碼", L.entity_of(R("X", "", "5")) == "CIK:0000000005")
 check("代號正規化：BRK-B 與 BRK.B 相同", L.norm("brk-b") == L.norm("BRK.B"))
+check("代號正規化：Polygon 優先股 ABRpD＝MPQ ABR.D", L.norm("ABRpD") == L.norm("ABR.D") == "ABR.D", L.norm("ABRpD"))
+check("代號正規化：結尾單獨 p（DCOMp）＝MPQ DCOMP", L.norm("DCOMp") == L.norm("DCOMP") == "DCOMP", L.norm("DCOMp"))
+check("代號正規化：一般大寫代號不動", L.norm("APP") == "APP" and L.norm("SPY") == "SPY")
+check("清單內：優先股以 Polygon 寫法命中 MPQ 代號", L.in_scope("BACpB", "CIK:0000070858", {L.norm("BAC.B")}, set()))
 
 S, E = {L.norm("ROKU")}, {"FIGI:F2"}
 check("清單內：代號命中", L.in_scope("ROKU", "FIGI:Z", S, E))

@@ -38,9 +38,18 @@ KINDS = ("new_listing", "delisted", "suspected_delisted", "market_changed", "ren
 
 # ══ 純函數（tests/test_listing_events.py）══════════════════════════
 
+_PFD_SERIES = re.compile(r"^([A-Z]+)p([A-Z]+)$")
+
+
 def norm(t):
-    """代號比對用：大寫、橫線換點（Polygon 寫 BRK.B，DC 清單可能寫 BRK-B）。"""
-    return (t or "").strip().upper().replace("-", ".")
+    """代號比對用：大寫、橫線換點（Polygon 寫 BRK.B，DC 清單可能寫 BRK-B）。
+    2026-11-24（Jun 同意）：Polygon 有系列的優先股寫 ABRpD（小寫 p），MPQ 寫 ABR.D；先換成 ABR.D 再大寫，
+    否則大寫成 ABRPD 永遠對不上。結尾單獨一個 p（DCOMp）大寫後即 MPQ 的 DCOMP，不需換。"""
+    t = (t or "").strip()
+    m = _PFD_SERIES.match(t)
+    if m:
+        t = m.group(1) + "." + m.group(2)
+    return t.upper().replace("-", ".")
 
 
 def entity_of(r):
