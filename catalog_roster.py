@@ -11,7 +11,7 @@ ListingEvents 的 new_listing＝listing）。數據中心只填自己的欄：Po
   bulk     Polygon 三份總表（stocks 現役、otc 現役、stocks 已下市）一次填大部分列；7 天重做一次或身份／拆股附件變了就重做
   check    對不上（或只對上代號）且段未結束的列逐支查（/v3/reference/tickers?ticker=，不限市場，現役＋下市）；每 50 支寫回一次
   publish  全部查完、或週日：發布 _catalog/symbols/v<N>/（版本發布後不改；內容沒變就不發）
-讓路：開始前與每查 20 支，用 GitHub API 看 raw_writer_daily／nightly_chain／listing_events／bc_tickets 有沒有未完成的 run，
+讓路：開始前與每查 5 支，用 GitHub API 看 raw_writer_daily／nightly_chain／listing_events／bc_tickets 有沒有未完成的 run，
       有就先寫回進度再結束（Jun 11-23：正式作業一開跑就停），下次從斷點續。
 登記：MongoDB_Standard_v3 2026-11-24 條。⛔ 只放私有 dataset；不含價格與量；公開日誌只印數量、不印代號。
 Python 3.9 相容。
@@ -36,7 +36,7 @@ WORK = SYM_DIR + "/_work"
 ID_DIR, SPLIT_DIR = CAT + "/identity", CAT + "/splits"
 ID_VER, SPLIT_VER = 6, 11                    # 身份表固定 v6（v7 不用、不發 v8）；拆股表 v11
 EVENTS_DIR = "swing_ai/listing_events/events"
-SAVE_EVERY, YIELD_EVERY = 50, 20
+SAVE_EVERY, YIELD_EVERY = 50, 5      # 2026-11-24：20→5，讓路延遲從約 11 分鐘縮到 3 分鐘內
 BULK_MAX_AGE_DAYS = 7
 GUARD = ("raw_writer_daily.yml", "nightly_chain.yml", "listing_events.yml", "bc_tickets.yml")
 ID_COLS = ["entity_id", "source", "symbol", "from", "to", "evidence", "note", "table_version", "asset"]

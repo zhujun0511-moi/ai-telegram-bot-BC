@@ -84,6 +84,10 @@ winter = dt.datetime(2026, 11, 24, 7, 3, tzinfo=ET)
 check("夏令只放行 UTC 11:00", L.schedule_ok("schedule", L.CRON_EDT, summer) and not L.schedule_ok("schedule", L.CRON_EST, summer))
 check("冬令只放行 UTC 12:00", L.schedule_ok("schedule", L.CRON_EST, winter) and not L.schedule_ok("schedule", L.CRON_EDT, winter))
 check("手動觸發一律放行", L.schedule_ok("workflow_dispatch", "", winter))
+EV = {L.PREFIX + "/events/2026-11-24.csv"}
+check("同日已寫過：排程重跑跳過", L.already_done(EV, "2026-11-24", "schedule"))
+check("同日已寫過：手動觸發照跑", not L.already_done(EV, "2026-11-24", "workflow_dispatch"))
+check("今天還沒寫：排程照跑", not L.already_done(EV, "2026-11-25", "schedule"))
 
 rows = L.parse_csv(L.to_csv(L.SNAP_COLS, [R("A,B", "F1")]))
 check("快照 CSV 來回（含逗號）", rows[0]["ticker"] == "A,B" and rows[0]["share_class_figi"] == "F1", rows)

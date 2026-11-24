@@ -154,6 +154,12 @@ def schedule_ok(event_name, sched, now_et):
     return (sched or "").strip() == want
 
 
+def already_done(files, today, event_name):
+    """2026-11-24（Jun 同意）：GitHub 排程常遲到，同一天可能跑兩次（手動補跑後排程又到）→ 重複發 Telegram。
+    排程觸發且今天的事件檔已在 dataset → 跳過；手動觸發照跑（人工明確要重跑）。"""
+    return event_name == "schedule" and ("%s/events/%s.csv" % (PREFIX, today)) in files
+
+
 def to_csv(cols, rows):
     b = io.StringIO()
     w = csv.DictWriter(b, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
@@ -239,6 +245,9 @@ def run(dry_run=False, log=print):
     mongo.configure(strict=True, serverSelectionTimeoutMS=20000)
     hf = RawHF(write=not dry_run, repo=repo, written_by="BC listing_events")
     raw = RawPolygon(log)
+    if already_done(hf.list_files(), today, os.environ.get("GITHUB_EVENT_NAME", "")):
+        log("今天（%s）的事件已寫過，排程重跑跳過（不打 Polygon、不重複通知）" % today)
+        return 0
 
     dc, local_syms, local_ents, symv = _scope(mongo, hf)
     scope_syms = dc | local_syms

@@ -1,7 +1,7 @@
 name: Catalog Roster (新 MPQ 名冊逐步填寫)
 
 # 2026-11-24 Jun「照範圍做」：新 MPQ 名冊（證券名冊 v3 起，本地端 ADR-078 格式的數據中心欄），每天一段慢慢填。
-# 錯開正式作業：腳本開始前與每查 20 支看 raw_writer_daily／nightly_chain／listing_events／bc_tickets，有在跑就寫回進度後結束
+# 錯開正式作業：腳本開始前與每查 5 支看 raw_writer_daily／nightly_chain／listing_events／bc_tickets，有在跑就寫回進度後結束
 # （GitHub 排程常遲到數小時，不靠排程時間錯開）。結果只寫私有 dataset _catalog/symbols/；公開日誌只印數量。
 # 登記：MongoDB_Standard_v3 2026-11-24 條。
 

@@ -171,7 +171,7 @@ def busy_later():
 CR.run(FakeRaw(), hf4, now=now, busy=busy_later, log=lambda *a: None)
 w4 = CR.parse(hf4.files[CR.WORK + "/roster.csv"])
 left = sum(1 for r in w4 if r["check_status"] == "pending")
-check("中途讓路：已查的 20 支寫回、其餘留 pending", left == 45 + 3 - 20, left)
+check("中途讓路：已查的 %d 支寫回、其餘留 pending" % CR.YIELD_EVERY, left == 45 + 3 - CR.YIELD_EVERY, left)
 
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)
