@@ -67,5 +67,7 @@ try:
 except SystemExit:
     check("指定不存在的身份表版本要停", True)
 
+check("優先股：Polygon ABRpD 與 MPQ ABR.D 同代號", CS.norm("ABRpD") == CS.norm("ABR.D") == "ABR-D", CS.norm("ABRpD"))
+check("結尾單獨 p 只大寫", CS.norm("DCOMp") == "DCOMP")
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

@@ -17,6 +17,7 @@ Python 3.9 相容。
 import csv
 import io
 import json
+import re
 from collections import defaultdict
 
 import ticker_identity as TI
@@ -43,8 +44,16 @@ SCHEMA = {
            "Polygon 代號被新公司重用時，舊公司的記錄可能已不在總表（身份表 v7 的 SUPN、NORD 即此）"]}
 
 
+_PFD_SERIES = re.compile(r"^([A-Z]+)p([A-Z]+)$")
+
+
 def norm(t):
-    return (t or "").strip().upper().replace(".", "-")
+    """2026-11-24：Polygon 有系列的優先股寫 ABRpD，MPQ 寫 ABR.D；先換成 ABR-D 再大寫（同 listing_events.norm）。"""
+    t = (t or "").strip()
+    m = _PFD_SERIES.match(t)
+    if m:
+        t = m.group(1) + "-" + m.group(2)
+    return t.upper().replace(".", "-")
 
 
 def ticker_rows(active_rows, inactive_rows, version):
