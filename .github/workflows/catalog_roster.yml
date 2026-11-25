@@ -4,6 +4,8 @@ name: Catalog Roster (新 MPQ 名冊逐步填寫)
 # 錯開正式作業：腳本開始前與每查 5 支看 raw_writer_daily／nightly_chain／listing_events／bc_tickets，有在跑就寫回進度後結束
 # （GitHub 排程常遲到數小時，不靠排程時間錯開）。結果只寫私有 dataset _catalog/symbols/；公開日誌只印數量。
 # 登記：MongoDB_Standard_v3 2026-11-24 條。
+# 2026-11-25 Jun「可以」：手動觸發可帶 chain／restore／then_run＝自動接力，跑完（或讓路／失敗／接力用完）自動開回
+# restore 名單裡暫停的排程並觸發 then_run（nightly_chain 補收尾）。排程觸發時 chain＝0，行為與原本相同。登記：同條 11-25 補登記。
 
 on:
   schedule:
@@ -26,14 +28,27 @@ on:
         description: "1＝試跑（不寫 dataset）"
         required: false
         default: "0"
+      chain:
+        description: "還可自動接力幾次（0～6；0＝不接）"
+        required: false
+        default: "0"
+      restore:
+        description: "收尾時重新啟用的排程（逗號分隔，只收名冊讓路的 4 個＋actions_minutes_watch.yml、bc_refresh_models.yml）"
+        required: false
+        default: ""
+      then_run:
+        description: "收尾後觸發（空或 nightly_chain.yml）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
-  actions: read        # 看正式作業有沒有在跑（讓路用）
+  actions: write       # 看正式作業有沒有在跑（讓路）；2026-11-25 起還要自我接力、開回暫停的排程（只限本倉庫）
 
 concurrency:
   # 2026-10-18 Jun：GitHub 三條線；臨時任務共用 temp-line，同時最多一個
-  group: temp-line
+  # 2026-11-25：試跑不寫 dataset，另走 roster-dry，不佔臨時線（也不會把排隊中的正式接力擠掉）
+  group: ${{ github.event.inputs.dry_run == '1' && 'roster-dry' || 'temp-line' }}
   cancel-in-progress: false
 
 jobs:
@@ -56,6 +71,7 @@ jobs:
         run: pip install requests pytz huggingface_hub
 
       - name: Roster
+        id: roster
         env:
           POLYGON_KEY:      ${{ secrets.POLYGON_KEY }}
           HF_TOKEN:         ${{ secrets.HF_TOKEN }}
@@ -72,4 +88,35 @@ jobs:
           ARGS="--budget-min $IN_BUDGET --publish $IN_PUBLISH"
           [ "$IN_FORCE" = "1" ] && ARGS="$ARGS --force-bulk"
           [ "$IN_DRY" = "1" ] && ARGS="$ARGS --dry-run"
-          python catalog_roster.py $ARGS
+          python catalog_roster.py $ARGS --status-out "$RUNNER_TEMP/roster_status.json"
+
+      - name: Chain or restore
+        if: always()
+        env:
+          GH_TOKEN:     ${{ github.token }}
+          GH_REPO:      ${{ github.repository }}
+          IN_CHAIN:     ${{ github.event.inputs.chain || '0' }}
+          IN_RESTORE:   ${{ github.event.inputs.restore || '' }}
+          IN_THEN:      ${{ github.event.inputs.then_run || '' }}
+          IN_BUDGET:    ${{ github.event.inputs.budget_min || '300' }}
+          IN_PUBLISH:   ${{ github.event.inputs.publish || 'auto' }}
+          IN_DRY:       ${{ github.event.inputs.dry_run || '0' }}
+          ROSTER_OK:    ${{ steps.roster.outcome == 'success' && '0' || '1' }}
+        run: |
+          set -e
+          if [ -z "$IN_RESTORE$IN_THEN" ] && [ "$IN_CHAIN" = "0" ]; then echo "沒有接力／收尾設定"; exit 0; fi
+          OUT=$(python catalog_roster.py --decide --status-file "$RUNNER_TEMP/roster_status.json"                 --chain "$IN_CHAIN" --restore "$IN_RESTORE" --then-run "$IN_THEN" --rc "$ROSTER_OK")
+          echo "$OUT"
+          ACTION=$(echo "$OUT" | sed -n 's/^ACTION=//p'); NEXT=$(echo "$OUT" | sed -n 's/^NEXT_CHAIN=//p')
+          RESTORE=$(echo "$OUT" | sed -n 's/^RESTORE=//p'); THEN=$(echo "$OUT" | sed -n 's/^THEN_RUN=//p')
+          if [ "$ACTION" = "continue" ]; then
+            gh workflow run catalog_roster.yml -f budget_min="$IN_BUDGET" -f publish="$IN_PUBLISH" -f dry_run="$IN_DRY"               -f chain="$NEXT" -f restore="$IN_RESTORE" -f then_run="$IN_THEN"
+            echo "已接力下一次（之後還可接 $NEXT 次）"
+            exit 0
+          fi
+          for w in $RESTORE; do gh workflow enable "$w"; echo "已重新啟用 $w"; done
+          for w in $RESTORE; do
+            st=$(gh api "repos/$GH_REPO/actions/workflows/$w" --jq .state)
+            echo "$w 狀態：$st"; [ "$st" = "active" ] || { echo "⛔ $w 沒有開回來"; exit 1; }
+          done
+          if [ -n "$THEN" ]; then gh workflow run "$THEN" -f trigger=manual; echo "已觸發 $THEN"; fi

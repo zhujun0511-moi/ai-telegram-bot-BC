@@ -176,5 +176,40 @@ w4 = CR.parse(hf4.files[CR.WORK + "/roster.csv"])
 left = sum(1 for r in w4 if r["check_status"] == "pending")
 check("中途讓路：已查的 %d 支寫回、其餘留 pending" % CR.YIELD_EVERY, left == 45 + 3 - CR.YIELD_EVERY, left)
 
+# 接力狀態（status）與判斷
+st = {}
+CR.run(FakeRaw(), FakeHF(s4), now=now, busy=lambda: None, budget_min=0, log=lambda *a: None, status=st)
+check("到時間上限：status 記 budget_out、left>0、沒讓路", st["budget_out"] and st["left"] > 0 and not st["yielded"], st)
+st2 = {}
+CR.run(FakeRaw(), FakeHF(store()), now=now, busy=lambda: "nightly_chain.yml", log=lambda *a: None, status=st2)
+check("一開始就讓路：status 記 yielded", st2["yielded"] and st2["left"] is None, st2)
+st3 = {}
+CR.run(FakeRaw(), FakeHF(store()), now=now, busy=lambda: None, publish=True, log=lambda *a: None, status=st3)
+check("查完發布：status 記 published、left=0", st3["left"] == 0 and st3["published"].startswith("發布 v3"), st3)
+
+D = CR.chain_decision
+check("還有待查、沒讓路、chain>0＝接下一次", D({"left": 9, "yielded": False}, "3", 0) == ("continue", 2))
+check("chain 用完＝收尾（開回排程）", D({"left": 9, "yielded": False}, "0", 0) == ("finish", 0))
+check("查完＝收尾", D({"left": 0}, 4, 0) == ("finish", 0))
+check("讓路＝收尾（不跟正式作業搶）", D({"left": 9, "yielded": True}, 4, 0) == ("finish", 0))
+check("失敗（rc≠0）＝收尾，正式排程不會一直停著", D({"left": 9}, 4, 1) == ("finish", 0))
+check("沒有狀態檔（腳本中途掛掉）＝收尾", D({}, 4, 0) == ("finish", 0))
+check("chain 上限 6", D({"left": 9}, "99", 0) == ("continue", 5))
+check("chain 不是數字＝0＝收尾", D({"left": 9}, "abc", 0) == ("finish", 0))
+try:
+    D({"left": 0}, 0, 0, then_run="raw_writer_daily.yml")
+    check("then_run 只收 nightly_chain.yml", False)
+except ValueError:
+    check("then_run 只收 nightly_chain.yml", True)
+check("restore 名單：去空白、去重複", CR.parse_restore(" nightly_chain.yml, bc_tickets.yml,nightly_chain.yml ,")
+      == ["nightly_chain.yml", "bc_tickets.yml"])
+check("restore 空＝不開任何排程", CR.parse_restore("") == [])
+for bad in ("swing_exam_queue.yml", "bc_backtest_daily.yml", "raw_writer_daily.yml;rm", "../x.yml"):
+    try:
+        CR.parse_restore("bc_tickets.yml," + bad)
+        check("restore 拒絕名單外：%s" % bad, False)
+    except ValueError:
+        check("restore 拒絕名單外：%s" % bad, True)
+
 print("\n%d 通過，%d 失敗" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

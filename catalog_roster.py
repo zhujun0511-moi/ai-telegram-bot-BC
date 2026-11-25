@@ -39,6 +39,10 @@ EVENTS_DIR = "swing_ai/listing_events/events"
 SAVE_EVERY, YIELD_EVERY = 50, 5      # 2026-11-24：20→5，讓路延遲從約 11 分鐘縮到 3 分鐘內
 BULK_MAX_AGE_DAYS = 7
 GUARD = ("raw_writer_daily.yml", "nightly_chain.yml", "listing_events.yml", "bc_tickets.yml")
+# 2026-11-25 Jun「可以」：自動接力＋跑完自動開回暫停的排程（MongoDB_Standard_v3 名冊條 11-25 補登記）
+RESTORE_OK = GUARD + ("actions_minutes_watch.yml", "bc_refresh_models.yml")
+THEN_RUN_OK = ("nightly_chain.yml",)
+CHAIN_MAX = 6
 ID_COLS = ["entity_id", "source", "symbol", "from", "to", "evidence", "note", "table_version", "asset"]
 ROSTER_COLS = ["mpq_symbol", "asset", "entity_id", "name", "type", "primary_exchange", "delisted", "match", "table_version",
                "segment_from", "segment_to", "origin", "polygon_symbol", "market", "market_since", "cik", "share_class_figi",
@@ -386,14 +390,17 @@ def fetch_all(raw):
     return stk, otc, ina
 
 
-def run(raw, hf, now=None, busy=gh_busy, budget_min=300, force_bulk=False, publish=None, log=print):
-    """回 0＝正常（含讓路）、1＝失敗未寫。"""
+def run(raw, hf, now=None, busy=gh_busy, budget_min=300, force_bulk=False, publish=None, log=print, status=None):
+    """回 0＝正常（含讓路）、1＝失敗未寫。status（dict）會填 left／yielded／budget_out／published 給接力判斷。"""
+    status = {} if status is None else status
+    status.update(left=None, yielded=False, budget_out=False, published="")
     t0 = time.time()
     now = now or dt.datetime.now(dt.timezone.utc)
     today = now.date().isoformat()
     b = busy()
     if b:
         log("正式作業在跑（%s），這次讓路" % b)
+        status["yielded"] = True
         return 0
     files = set(hf.list_files())
     try:
@@ -440,6 +447,7 @@ def run(raw, hf, now=None, busy=gh_busy, budget_min=300, force_bulk=False, publi
                 break
         if time.time() - t0 > budget_min * 60:
             log("到時間上限，寫回進度")
+            status["budget_out"] = True
             break
         check_one(raw, r, today)
         done_n += 1
@@ -451,6 +459,7 @@ def run(raw, hf, now=None, busy=gh_busy, budget_min=300, force_bulk=False, publi
         save(rows, None, "roster check")
     log("本次逐支查 %d 列；%s" % (done_n, json.dumps(stats(rows), ensure_ascii=False)))
     left = sum(1 for r in rows if r["check_status"] in ("pending", "failed"))
+    status.update(left=left, yielded=yielded)
     want = publish if publish is not None else ((left == 0 or now.weekday() == 6) and not yielded)
     if want:
         adds, summ = plan_publish(set(hf.list_files()), hf.read, rows, tickers, inputs,
@@ -459,24 +468,81 @@ def run(raw, hf, now=None, busy=gh_busy, budget_min=300, force_bulk=False, publi
             hf.add(p, t)
         if adds:
             hf.flush("_roster_pub", summ)
+            status["published"] = summ
         log(summ)
+    return 0
+
+
+def parse_restore(text):
+    """restore 名單：逗號分隔、只收 RESTORE_OK；空＝不開任何排程。不認得的名字整份拒絕。"""
+    names = [x.strip() for x in (text or "").split(",") if x.strip()]
+    bad = [x for x in names if x not in RESTORE_OK]
+    if bad:
+        raise ValueError("restore 只收 %s，不收：%s" % ("／".join(RESTORE_OK), "、".join(bad)))
+    return list(dict.fromkeys(names))
+
+
+def chain_decision(status, chain, rc, then_run=""):
+    """→ ("continue", 下一次的 chain) 或 ("finish", 0)。
+    只有「正常結束、沒讓路、還有待查、chain>0」才接下一次；其餘（發布、查完、讓路、失敗、chain 用完）一律收尾，
+    收尾＝開回 restore 名單＋觸發 then_run，保證暫停的正式排程不會一直停著。"""
+    if then_run and then_run not in THEN_RUN_OK:
+        raise ValueError("then_run 只收 %s" % "／".join(THEN_RUN_OK))
+    try:
+        chain = int(chain)
+    except (TypeError, ValueError):
+        chain = 0
+    chain = max(0, min(chain, CHAIN_MAX))
+    st = status or {}
+    left = st.get("left")
+    if rc == 0 and not st.get("yielded") and isinstance(left, int) and left > 0 and chain > 0:
+        return "continue", chain - 1
+    return "finish", 0
+
+
+def decide_main(a):
+    """workflow 收尾步驟用：印出 shell 可讀的 ACTION／NEXT_CHAIN／RESTORE／THEN_RUN。"""
+    try:
+        st = json.loads(open(a.status_file, encoding="utf-8").read()) if a.status_file and os.path.exists(a.status_file) else {}
+    except ValueError:
+        st = {}
+    restore = parse_restore(a.restore)
+    action, nxt = chain_decision(st, a.chain, a.rc, a.then_run)
+    print("ACTION=%s" % action)
+    print("NEXT_CHAIN=%d" % nxt)
+    print("RESTORE=%s" % " ".join(restore))
+    print("THEN_RUN=%s" % (a.then_run if action == "finish" else ""))
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--status-out", default="", help="把 left／yielded／budget_out／published 寫成 JSON（給接力判斷）")
+    ap.add_argument("--decide", action="store_true", help="只做接力判斷，不跑名冊")
+    ap.add_argument("--status-file", default="")
+    ap.add_argument("--chain", default="0")
+    ap.add_argument("--restore", default="")
+    ap.add_argument("--then-run", default="")
+    ap.add_argument("--rc", type=int, default=0)
     ap.add_argument("--budget-min", type=int, default=300, help="逐支查最多跑幾分鐘")
     ap.add_argument("--force-bulk", action="store_true")
     ap.add_argument("--publish", choices=("auto", "yes", "no"), default="auto")
     ap.add_argument("--dry-run", action="store_true", help="不寫 dataset")
     a = ap.parse_args()
+    if a.decide:
+        return decide_main(a)
     from courier import keys
     from courier.dataset import RawHF
     from courier.polygon import RawPolygon
     repo = keys.env_strip("HF_REPO_ID") or "zhujun0511-AI/ai-telegram-bot-dataset"
     hf = RawHF(write=not a.dry_run, repo=repo, written_by="BC catalog_roster")
     pub = {"auto": None, "yes": True, "no": False}[a.publish]
-    return run(RawPolygon(print), hf, budget_min=a.budget_min, force_bulk=a.force_bulk, publish=pub)
+    status = {}
+    rc = run(RawPolygon(print), hf, budget_min=a.budget_min, force_bulk=a.force_bulk, publish=pub, status=status)
+    if a.status_out:
+        with open(a.status_out, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False)
+    return rc
 
 
 if __name__ == "__main__":
