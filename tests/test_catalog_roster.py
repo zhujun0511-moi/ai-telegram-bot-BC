@@ -134,6 +134,9 @@ check("新上市 ANT 以 listing 一列出現；已在名冊的 XETF 不重複",
 check("保留 v2 欄位（listing_events._scope 照讀）", all(c in CR.parse(hf.files["_catalog/symbols/v3/mpq.csv"])[0]
                                                    for c in ("mpq_symbol", "asset", "entity_id", "delisted")))
 check("上一版是舊格式＝全部算 added", man["changes"] == len(R))
+check("manifest 記 Polygon 總表抓取日與筆數（日後可一次找出同批來源）",
+      man["polygon_bulk_at"] == "2026-11-24" and man["polygon_rows"] == {"stocks": len(STK), "otc": len(OTC), "inactive": len(INA)}
+      and man["inputs"]["identity"] == "v6+p1" and man["inputs"]["splits"] == "v11+p1", man)
 check("不含價格欄", not any(c in CR.ROSTER_COLS for c in ("close", "price", "volume")))
 st = json.loads(hf.files[CR.WORK + "/state.json"])
 check("工作區有進度與統計", st["bulk_at"] == "2026-11-24" and st["stats"]["status_done"] == len(R), st)

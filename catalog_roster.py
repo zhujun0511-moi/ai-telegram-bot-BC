@@ -311,8 +311,8 @@ def stats(rows):
     return dict(sorted(s.items()))
 
 
-def plan_publish(files, read, rows, tickers, inputs):
-    """回 (adds, 摘要)；內容沒變回 ([], 摘要)。"""
+def plan_publish(files, read, rows, tickers, inputs, polygon=None):
+    """回 (adds, 摘要)；內容沒變回 ([], 摘要)。polygon＝{bulk_at, rows}：該版所用 Polygon 總表的抓取日與筆數（記進 manifest，不算進內容指紋）。"""
     pub = published(files, SYM_DIR)
     ver = (pub[-1] + 1) if pub else 1
     strip = lambda rs, cols: to_csv([{k: v for k, v in x.items() if k not in ("table_version", "checked_at")} for x in rs],
@@ -335,6 +335,7 @@ def plan_publish(files, read, rows, tickers, inputs):
            "files": {k: ({"sha256": _sha(v), "rows": max(v.count("\n") - 1, 0)} if k.endswith(".csv") else {"sha256": _sha(v)})
                      for k, v in f.items()},
            "identity_version": ID_VER, "splits_version": SPLIT_VER, "inputs": inputs, "content_sha256": csha,
+           "polygon_bulk_at": (polygon or {}).get("bulk_at", ""), "polygon_rows": (polygon or {}).get("rows", {}),
            "previous": pub[-1] if pub else None, "stats": stats(rows), "changes": len(ch)}
     base = "%s/v%d" % (SYM_DIR, ver)
     adds = [("%s/%s" % (base, k), v) for k, v in f.items()] + [(base + "/manifest.json", json.dumps(man, ensure_ascii=False, indent=1))]
@@ -452,7 +453,8 @@ def run(raw, hf, now=None, busy=gh_busy, budget_min=300, force_bulk=False, publi
     left = sum(1 for r in rows if r["check_status"] in ("pending", "failed"))
     want = publish if publish is not None else ((left == 0 or now.weekday() == 6) and not yielded)
     if want:
-        adds, summ = plan_publish(set(hf.list_files()), hf.read, rows, tickers, inputs)
+        adds, summ = plan_publish(set(hf.list_files()), hf.read, rows, tickers, inputs,
+                                  polygon={"bulk_at": state.get("bulk_at", ""), "rows": state.get("polygon_rows", {})})
         for p, t in adds:
             hf.add(p, t)
         if adds:
